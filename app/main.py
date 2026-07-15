@@ -3,6 +3,7 @@ from __future__ import annotations
 import warnings
 
 from app.api.tools.office_to_pdf.router import router as office_router
+from app.api.tools.render.router import router as render_router
 
 import os
 from contextlib import asynccontextmanager
@@ -70,7 +71,7 @@ async def ready() -> dict[str, str]:
 
 
 app.include_router(office_router)
-
+app.include_router(render_router)
 
 
 warnings.filterwarnings(
