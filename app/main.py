@@ -4,6 +4,7 @@ import warnings
 
 from app.api.tools.office_to_pdf.router import router as office_router
 from app.api.tools.render.router import router as render_router
+from app.api.tools.editor.router import router as editor_router
 
 import os
 from contextlib import asynccontextmanager
@@ -72,6 +73,7 @@ async def ready() -> dict[str, str]:
 
 app.include_router(office_router)
 app.include_router(render_router)
+app.include_router(editor_router)
 
 
 warnings.filterwarnings(

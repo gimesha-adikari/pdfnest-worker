@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from io import BytesIO
 
-import fitz  # PyMuPDF
+import pymupdf as fitz
 from PIL import Image
 
 
