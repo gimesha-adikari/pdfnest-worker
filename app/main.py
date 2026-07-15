@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import warnings
+
+from app.api.tools.office_to_pdf.router import router as office_router
+
 import os
 from contextlib import asynccontextmanager
 from typing import Any
@@ -64,6 +68,16 @@ async def live() -> dict[str, str]:
 async def ready() -> dict[str, str]:
     return {"status": "ready"}
 
+
+app.include_router(office_router)
+
+
+
+warnings.filterwarnings(
+    "ignore",
+    category=UserWarning,
+    module="camelot"
+)
 
 if __name__ == "__main__":
     import uvicorn
