@@ -1,18 +1,19 @@
 from __future__ import annotations
 
-import warnings
-
-from app.api.tools.office_to_pdf.router import router as office_router
-from app.api.tools.render.router import router as render_router
-from app.api.tools.editor.router import router as editor_router
-
 import os
+import warnings
 from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.core.broker import broker  # noqa: F401
+from app.jobs.router import router as jobs_router
+
+from app.api.tools.pdf_to_office.router import router as office_router
+from app.api.tools.render.router import router as render_router
+from app.api.tools.editor.router import router as editor_router
 
 APP_NAME = "PDFNest Worker"
 APP_VERSION = os.getenv("APP_VERSION", "0.1.0")
@@ -71,6 +72,7 @@ async def ready() -> dict[str, str]:
     return {"status": "ready"}
 
 
+app.include_router(jobs_router)
 app.include_router(office_router)
 app.include_router(render_router)
 app.include_router(editor_router)
@@ -79,8 +81,9 @@ app.include_router(editor_router)
 warnings.filterwarnings(
     "ignore",
     category=UserWarning,
-    module="camelot"
+    module="camelot",
 )
+
 
 if __name__ == "__main__":
     import uvicorn

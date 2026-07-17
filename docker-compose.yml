@@ -1,0 +1,30 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  api:
+    build: .
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      APP_ENV: development
+      ALLOWED_ORIGINS: http://localhost:8080
+    volumes:
+      - .:/app
+    ports:
+      - "8000:8000"
+    depends_on:
+      - redis
+
+  worker:
+    build: .
+    command: dramatiq app.jobs.actors
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      APP_ENV: development
+    volumes:
+      - .:/app
+    depends_on:
+      - redis

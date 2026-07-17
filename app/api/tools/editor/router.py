@@ -4,23 +4,27 @@ import json
 import os
 import shutil
 import tempfile
-import traceback
 from pathlib import Path
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse
+from starlette.background import BackgroundTask
 
-from .service import EditorService
+from app.jobs.actors import editor_compile_job, editor_extract_job
+from app.jobs.models import JobQueue, JobState
+from app.jobs.store import create_job, get_job
+
+from .models import JobSubmissionResponse
 from .utils import cleanup_paths, temp_file_path
 
 router = APIRouter(prefix="/api/v1/editor", tags=["editor"])
-service = EditorService()
 
 
 @router.post("/extract")
 async def extract_layout(
     file: UploadFile = File(...),
     file_password: str | None = Form(default=None),
+    source_tracker: str | None = Form(default=None),
 ):
     input_fd, input_path = tempfile.mkstemp(prefix="pdfnest-source-", suffix=".pdf")
     os.close(input_fd)
@@ -29,49 +33,94 @@ async def extract_layout(
         with open(input_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
-        try:
-            result = service.extract_layout(input_path, file_password)
-        except Exception:
-            traceback.print_exc()
-            raise
+        job = create_job(
+            "editor_extract",
+            queue_name=JobQueue.editor,
+            payload={
+                "input_path": input_path,
+                "has_password": bool(file_password),
+                "source_tracker": source_tracker or input_path,
+            },
+        )
 
-        result["source_tracker"] = input_path
-        return JSONResponse(content=result)
-    except HTTPException:
+        editor_extract_job.send(job.id, input_path, file_password, source_tracker)
+
+        return JobSubmissionResponse(
+            job_id=job.id,
+            status=job.status.value,
+            queue_name=job.queue_name.value,
+        )
+    except Exception:
         cleanup_paths(input_path)
         raise
-    except Exception as exc:
-        cleanup_paths(input_path)
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@router.post("/compile")
+@router.post("/compile", response_model=JobSubmissionResponse)
 async def compile_layout(
     file: UploadFile = File(...),
     payload: str = Form(...),
-):
+) -> JobSubmissionResponse:
     input_fd, input_path = tempfile.mkstemp(prefix="pdfnest-source-", suffix=".pdf")
     os.close(input_fd)
 
     pages_json_path = temp_file_path(prefix="pdfnest-layout-", suffix=".json")
-    output_pdf_path = temp_file_path(prefix="pdfnest-output-", suffix=".pdf")
 
     try:
+        try:
+            json.loads(payload)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=400, detail="Invalid JSON payload") from exc
+
         with open(input_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
         with open(pages_json_path, "w", encoding="utf-8") as f:
             f.write(payload)
 
-        service.compile_layout(input_path, output_pdf_path, pages_json_path)
-        return FileResponse(
-            output_pdf_path,
-            media_type="application/pdf",
-            filename="edited_" + Path(output_pdf_path).name,
+        job = create_job(
+            "editor_compile",
+            queue_name=JobQueue.editor,
+            payload={
+                "input_path": input_path,
+                "pages_json_path": pages_json_path,
+            },
+        )
+
+        editor_compile_job.send(job.id, input_path, pages_json_path)
+
+        return JobSubmissionResponse(
+            job_id=job.id,
+            status=job.status.value,
+            queue_name=job.queue_name.value,
         )
     except HTTPException:
-        cleanup_paths(input_path, pages_json_path, output_pdf_path)
+        cleanup_paths(input_path, pages_json_path)
         raise
-    except Exception as exc:
-        cleanup_paths(input_path, pages_json_path, output_pdf_path)
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except Exception:
+        cleanup_paths(input_path, pages_json_path)
+        raise
+
+
+@router.get("/jobs/{job_id}/download")
+async def download_compiled_pdf(job_id: str):
+    job = get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    if job.status != JobState.succeeded:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Job is not ready for download. Current status: {job.status.value}",
+        )
+
+    result = job.result or {}
+    artifact_path = result.get("artifact_path")
+    if not artifact_path or not os.path.exists(artifact_path):
+        raise HTTPException(status_code=404, detail="Compiled artifact not found")
+
+    return FileResponse(
+        artifact_path,
+        media_type="application/pdf",
+        filename="edited_" + Path(artifact_path).name,
+        background=BackgroundTask(cleanup_paths, artifact_path),
+    )

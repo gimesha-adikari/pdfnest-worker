@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -42,3 +42,9 @@ class CompileResponse(BaseModel):
     success: bool = True
     output_pdf_path: str | None = None
     error: str | None = None
+
+
+class JobSubmissionResponse(BaseModel):
+    job_id: str
+    status: str = "queued"
+    queue_name: str = "editor"
