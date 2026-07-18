@@ -5,6 +5,7 @@ import warnings
 from contextlib import asynccontextmanager
 from typing import Any
 
+from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -19,6 +20,11 @@ from app.api.tools.analyzer.router import router as analyzer_router
 from app.api.tools.metadata.router import router as metadata_router
 from app.api.tools.redact.router import router as redact_router
 from app.api.tools.sign.router import router as sign_router
+from app.api.landing.router import router as landing_router
+
+import os
+
+load_dotenv()
 
 APP_NAME = "PDFNest Worker"
 APP_VERSION = os.getenv("APP_VERSION", "0.1.0")
@@ -86,6 +92,7 @@ app.include_router(analyzer_router)
 app.include_router(metadata_router)
 app.include_router(redact_router)
 app.include_router(sign_router)
+app.include_router(landing_router)
 
 warnings.filterwarnings(
     "ignore",

@@ -1,0 +1,653 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ AppName }}</title>
+    <style>
+        :root{
+            --bg-0:#050816;
+            --bg-1:#08111f;
+            --bg-2:#0b1630;
+            --surface:rgba(10, 18, 34, .78);
+            --surface-2:rgba(14, 24, 44, .82);
+            --border:rgba(255,255,255,.08);
+            --border-strong:rgba(128, 205, 255, .20);
+            --text:#f8fbff;
+            --muted:#9fb0c7;
+            --cyan:#57e5ff;
+            --blue:#5ea8ff;
+            --green:#63f0a2;
+            --orange:#ffb15c;
+            --pink:#ff84d8;
+            --purple:#b28cff;
+            --shadow:0 30px 90px rgba(0,0,0,.50);
+        }
+
+        *{ box-sizing:border-box; margin:0; padding:0; }
+        html{ scroll-behavior:smooth; }
+        body{
+            min-height:100vh;
+            font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            color:var(--text);
+            background:
+                    radial-gradient(circle at 10% 15%, rgba(54, 220, 255, .20), transparent 12%),
+                    radial-gradient(circle at 85% 18%, rgba(181, 119, 255, .18), transparent 12%),
+                    radial-gradient(circle at 25% 88%, rgba(71, 255, 192, .11), transparent 15%),
+                    radial-gradient(circle at 75% 82%, rgba(255, 134, 220, .12), transparent 16%),
+                    linear-gradient(135deg, var(--bg-0), var(--bg-1) 50%, var(--bg-2));
+            overflow-x:hidden;
+        }
+
+        body::before{
+            content:"";
+            position:fixed;
+            inset:0;
+            background:
+                    linear-gradient(rgba(255,255,255,.04) 1px, transparent 1px),
+                    linear-gradient(90deg, rgba(255,255,255,.04) 1px, transparent 1px);
+            background-size: 58px 58px;
+            mask-image: radial-gradient(circle at center, black 45%, transparent 100%);
+            opacity:.18;
+            pointer-events:none;
+        }
+
+        .noise{
+            position:fixed;
+            inset:0;
+            pointer-events:none;
+            background-image:
+                    radial-gradient(circle at 20% 20%, rgba(96, 198, 255, .16) 0 1px, transparent 1px),
+                    radial-gradient(circle at 60% 40%, rgba(128, 88, 255, .15) 0 1px, transparent 1px),
+                    radial-gradient(circle at 80% 70%, rgba(90, 255, 194, .14) 0 1px, transparent 1px);
+            background-size: 220px 220px;
+            opacity:.75;
+            filter: blur(.2px);
+        }
+
+        .wrap{
+            width:min(1320px, calc(100% - 32px));
+            margin:0 auto;
+            min-height:100vh;
+            display:flex;
+            flex-direction:column;
+            justify-content:center;
+            padding:28px 0 36px;
+            position:relative;
+            z-index:1;
+        }
+
+        .topbar{
+            display:flex;
+            justify-content:space-between;
+            align-items:center;
+            gap:18px;
+            margin-bottom:22px;
+            flex-wrap:wrap;
+        }
+
+        .brand{
+            display:flex;
+            align-items:center;
+            gap:14px;
+        }
+
+        .brand-mark{
+            width:48px;
+            height:48px;
+            border-radius:16px;
+            background:
+                    radial-gradient(circle at 30% 30%, rgba(255,255,255,.35), transparent 32%),
+                    linear-gradient(135deg, rgba(89, 230, 255, .95), rgba(162, 110, 255, .9));
+            box-shadow:
+                    0 0 0 1px rgba(255,255,255,.10) inset,
+                    0 12px 32px rgba(82, 156, 255, .30);
+            display:grid;
+            place-items:center;
+            font-size:22px;
+        }
+
+        .brand-copy .eyebrow{
+            font-size:.76rem;
+            letter-spacing:.34em;
+            text-transform:uppercase;
+            color:#8fbefc;
+            margin-bottom:5px;
+        }
+
+        .brand-copy h2{
+            font-size:1.08rem;
+            letter-spacing:.02em;
+            margin-bottom:2px;
+        }
+
+        .brand-copy p{
+            color:var(--muted);
+            font-size:.86rem;
+        }
+
+        .pill{
+            display:inline-flex;
+            align-items:center;
+            gap:10px;
+            padding:10px 16px;
+            border-radius:999px;
+            background:rgba(14, 21, 36, .82);
+            border:1px solid rgba(120, 172, 255, .18);
+            color:#dbeafe;
+            box-shadow: 0 14px 36px rgba(0,0,0,.24);
+            font-size:.88rem;
+            white-space:nowrap;
+        }
+
+        .pill-dot{
+            width:10px;
+            height:10px;
+            border-radius:50%;
+            background:var(--green);
+            box-shadow:0 0 14px var(--green);
+        }
+
+        .shell{
+            position:relative;
+            border:1px solid var(--border);
+            background:
+                    radial-gradient(circle at top left, rgba(87,229,255,.10), transparent 34%),
+                    radial-gradient(circle at 88% 18%, rgba(178,140,255,.12), transparent 30%),
+                    linear-gradient(180deg, rgba(8,14,28,.88), rgba(7,12,24,.74));
+            box-shadow: var(--shadow), inset 0 1px 0 rgba(255,255,255,.05);
+            backdrop-filter: blur(22px);
+            border-radius:30px;
+            padding:34px;
+            overflow:hidden;
+        }
+
+        .shell::before{
+            content:"";
+            position:absolute;
+            inset:-2px;
+            background: linear-gradient(135deg, rgba(87,229,255,.20), transparent 25%, transparent 75%, rgba(178,140,255,.18));
+            opacity:.35;
+            pointer-events:none;
+            filter: blur(18px);
+        }
+
+        .hero{
+            position:relative;
+            z-index:1;
+            text-align:center;
+            padding:8px 0 12px;
+        }
+
+        .title{
+            font-size:clamp(3.5rem, 9vw, 7.6rem);
+            line-height:.90;
+            letter-spacing:.06em;
+            text-transform:uppercase;
+            font-weight:900;
+            text-shadow: 0 0 24px rgba(255,255,255,.15), 0 18px 40px rgba(0,0,0,.70);
+        }
+
+        .worker-line{
+            display:flex;
+            align-items:center;
+            justify-content:center;
+            gap:18px;
+            margin:14px 0 8px;
+            color:var(--cyan);
+            font-weight:800;
+            letter-spacing:.34em;
+            font-size:clamp(1.15rem, 2.4vw, 2rem);
+            text-transform:uppercase;
+        }
+
+        .worker-line::before,
+        .worker-line::after{
+            content:"";
+            height:2px;
+            width:min(90px, 12vw);
+            background: linear-gradient(90deg, transparent, rgba(87,229,255,.95), transparent);
+            box-shadow:0 0 18px rgba(87,229,255,.6);
+        }
+
+        .subtitle{
+            font-size:clamp(1rem, 2vw, 1.3rem);
+            color:#d9e8ff;
+            opacity:.92;
+            letter-spacing:.08em;
+            margin-bottom:28px;
+        }
+
+        .feature-row{
+            display:grid;
+            grid-template-columns:repeat(6, minmax(0, 1fr));
+            gap:16px;
+            margin: 28px auto 34px;
+            align-items:stretch;
+        }
+
+        .feature{
+            min-height:140px;
+            padding:18px 14px 16px;
+            border-radius:24px;
+            background: linear-gradient(180deg, rgba(17, 29, 54, .56), rgba(10, 16, 32, .44));
+            border:1px solid rgba(145, 182, 255, .12);
+            box-shadow: inset 0 1px 0 rgba(255,255,255,.04);
+            text-align:center;
+        }
+
+        .icon{
+            width:92px;
+            height:92px;
+            margin:0 auto 10px;
+            border-radius:28px;
+            display:grid;
+            place-items:center;
+            font-size:2.2rem;
+            position:relative;
+        }
+
+        .icon::before{
+            content:"";
+            position:absolute;
+            inset:0;
+            border-radius:inherit;
+            border:1px solid rgba(255,255,255,.12);
+            background: radial-gradient(circle at 50% 35%, rgba(255,255,255,.16), transparent 40%);
+            box-shadow: inset 0 0 26px rgba(255,255,255,.04);
+        }
+
+        .pdf    { color: #7dc0ff; text-shadow:0 0 18px rgba(125,192,255,.6); }
+        .image  { color: #9eff78; text-shadow:0 0 18px rgba(158,255,120,.6); }
+        .ocr    { color: #d6a5ff; text-shadow:0 0 18px rgba(214,165,255,.6); }
+        .edit   { color: #ffbe78; text-shadow:0 0 18px rgba(255,190,120,.6); }
+        .secure { color: #71f6ff; text-shadow:0 0 18px rgba(113,246,255,.6); }
+        .speed  { color: #ff84d8; text-shadow:0 0 18px rgba(255,132,216,.6); }
+
+        .feature h3{
+            font-size:1rem;
+            margin-bottom:6px;
+            font-weight:700;
+        }
+
+        .feature p{
+            font-size:.88rem;
+            color:var(--muted);
+            line-height:1.45;
+        }
+
+        .dashboard{
+            display:grid;
+            grid-template-columns: 1.1fr 1fr 1fr;
+            gap:16px;
+            margin-top:8px;
+            position:relative;
+            z-index:1;
+        }
+
+        .panel{
+            border-radius:24px;
+            background: linear-gradient(180deg, rgba(16, 25, 45, .76), rgba(10, 16, 29, .66));
+            border:1px solid var(--border-strong);
+            box-shadow: inset 0 1px 0 rgba(255,255,255,.04);
+            padding:20px;
+            min-height:280px;
+        }
+
+        .panel-head{
+            display:flex;
+            justify-content:space-between;
+            align-items:center;
+            gap:12px;
+            margin-bottom:18px;
+        }
+
+        .panel-head h4{
+            font-size:1rem;
+            letter-spacing:.08em;
+            text-transform:uppercase;
+        }
+
+        .live{
+            display:inline-flex;
+            align-items:center;
+            gap:8px;
+            padding:8px 12px;
+            border-radius:999px;
+            background: rgba(99, 240, 162, .12);
+            color:#8cf2ba;
+            border:1px solid rgba(99, 240, 162, .14);
+            font-size:.82rem;
+        }
+
+        .live .dot{
+            width:8px;
+            height:8px;
+            border-radius:50%;
+            background:var(--green);
+            box-shadow:0 0 14px var(--green);
+        }
+
+        .stat{
+            display:flex;
+            align-items:center;
+            justify-content:space-between;
+            padding:14px 14px;
+            margin-bottom:12px;
+            border-radius:16px;
+            background: rgba(255,255,255,.03);
+            border:1px solid rgba(255,255,255,.06);
+        }
+
+        .stat .label{
+            color:#dce7fb;
+            font-size:.92rem;
+        }
+
+        .stat .value{
+            font-variant-numeric: tabular-nums;
+            color:#8fe8ff;
+            font-weight:700;
+            white-space:nowrap;
+        }
+
+        .meta-list{
+            display:grid;
+            gap:12px;
+        }
+
+        .meta-item{
+            padding:14px 14px;
+            border-radius:16px;
+            background: rgba(255,255,255,.03);
+            border:1px solid rgba(255,255,255,.06);
+        }
+
+        .meta-label{
+            color:#a9b9d0;
+            font-size:.82rem;
+            margin-bottom:6px;
+            text-transform:uppercase;
+            letter-spacing:.12em;
+        }
+
+        .meta-value,
+        .meta-value a{
+            color:#eaf3ff;
+            font-size:.95rem;
+            word-break:break-word;
+            text-decoration:none;
+        }
+
+        .meta-value a:hover{
+            text-decoration:underline;
+        }
+
+        .chip-row{
+            display:flex;
+            flex-wrap:wrap;
+            gap:10px;
+        }
+
+        .chip{
+            padding:10px 12px;
+            border-radius:999px;
+            background: rgba(255,255,255,.04);
+            border:1px solid rgba(255,255,255,.08);
+            color:#dce7fb;
+            font-size:.84rem;
+        }
+
+        .footer{
+            display:flex;
+            justify-content:space-between;
+            align-items:center;
+            gap:14px;
+            flex-wrap:wrap;
+            margin-top:20px;
+            color:var(--muted);
+            font-size:.9rem;
+            position:relative;
+            z-index:1;
+        }
+
+        .footer strong{ color:#dce8ff; }
+
+        .actions{
+            display:flex;
+            gap:12px;
+            flex-wrap:wrap;
+            justify-content:center;
+            margin-top:24px;
+            position:relative;
+            z-index:1;
+        }
+
+        .btn{
+            display:inline-flex;
+            align-items:center;
+            justify-content:center;
+            gap:10px;
+            padding:14px 18px;
+            border-radius:14px;
+            text-decoration:none;
+            font-weight:700;
+            transition: transform .2s ease, box-shadow .2s ease, background .2s ease;
+            border:1px solid transparent;
+        }
+
+        .btn:hover{ transform: translateY(-2px); }
+
+        .btn-primary{
+            background: linear-gradient(135deg, rgba(87,229,255,.95), rgba(103,130,255,.95));
+            color:#03101a;
+            box-shadow: 0 18px 32px rgba(87,229,255,.20);
+        }
+
+        .btn-secondary{
+            background: rgba(255,255,255,.04);
+            color:var(--text);
+            border-color: rgba(255,255,255,.12);
+        }
+
+        @media (max-width: 1180px){
+            .feature-row{ grid-template-columns:repeat(3, minmax(0, 1fr)); }
+            .dashboard{ grid-template-columns:1fr; }
+        }
+
+        @media (max-width: 760px){
+            .wrap{ width:min(100% - 20px, 100%); padding-top:14px; }
+            .shell{ padding:20px; border-radius:24px; }
+            .title{ font-size:clamp(2.5rem, 14vw, 4.5rem); }
+            .worker-line{ letter-spacing:.22em; font-size:1rem; gap:12px; }
+            .worker-line::before,
+            .worker-line::after{ width:44px; }
+            .feature-row{ grid-template-columns:repeat(2, minmax(0, 1fr)); gap:12px; }
+            .feature{ min-height:124px; padding:16px 12px; }
+            .icon{ width:74px; height:74px; font-size:1.7rem; border-radius:22px; }
+            .panel{ min-height:auto; }
+            .footer{ flex-direction:column; align-items:flex-start; }
+            .btn{ width:100%; }
+        }
+    </style>
+</head>
+<body>
+<div class="noise"></div>
+
+<div class="wrap">
+    <div class="topbar">
+        <div class="brand">
+            <div class="brand-mark">⚙</div>
+            <div class="brand-copy">
+                <div class="eyebrow">{{ AppName }}</div>
+                <h2>{{ AppVersion }}</h2>
+                <p>{{ AppEnv }}</p>
+            </div>
+        </div>
+
+        {% if StatusLabel %}
+        <div class="pill">
+            <span class="pill-dot{% if StatusDotClass %} {{ StatusDotClass }}{% endif %}"></span>
+            {{ StatusLabel }}
+        </div>
+        {% endif %}
+    </div>
+
+    <main class="shell">
+        <section class="hero">
+            <div class="title">{{ AppName }}</div>
+            <div class="worker-line">WORKER</div>
+            <div class="subtitle">PDF Processing Engine</div>
+
+            <div class="feature-row">
+                <article class="feature">
+                    <div class="icon pdf">📄</div>
+                    <h3>PDF Tools</h3>
+                    <p>Analysis, metadata, redaction, signing, and markup workflows.</p>
+                </article>
+
+                <article class="feature">
+                    <div class="icon image">🖼</div>
+                    <h3>Image Processing</h3>
+                    <p>Page rasterization, image overlays, and document previews.</p>
+                </article>
+
+                <article class="feature">
+                    <div class="icon ocr">OCR</div>
+                    <h3>OCR Engine</h3>
+                    <p>Text extraction and layout-aware processing for scanned PDFs.</p>
+                </article>
+
+                <article class="feature">
+                    <div class="icon edit">✎</div>
+                    <h3>Document Editor</h3>
+                    <p>Extract, compile, and rebuild page layouts with precision.</p>
+                </article>
+
+                <article class="feature">
+                    <div class="icon secure">🛡</div>
+                    <h3>Secure Processing</h3>
+                    <p>Encrypted PDF handling, redaction, and secure output files.</p>
+                </article>
+
+                <article class="feature">
+                    <div class="icon speed">⚡</div>
+                    <h3>High Performance</h3>
+                    <p>Optimized for heavy document workloads and fast API responses.</p>
+                </article>
+            </div>
+
+            <section class="dashboard">
+                <div class="panel">
+                    <div class="panel-head">
+                        <h4>Runtime</h4>
+                        <div class="live"><span class="dot"></span>Running</div>
+                    </div>
+
+                    <div class="stat">
+                        <div class="label">Application</div>
+                        <div class="value">{{ AppName }}</div>
+                    </div>
+                    <div class="stat">
+                        <div class="label">Version</div>
+                        <div class="value">{{ AppVersion }}</div>
+                    </div>
+                    <div class="stat">
+                        <div class="label">Environment</div>
+                        <div class="value">{{ AppEnv }}</div>
+                    </div>
+                    <div class="stat">
+                        <div class="label">Uptime</div>
+                        <div class="value">{{ UptimeLabel }}</div>
+                    </div>
+                </div>
+
+                <div class="panel">
+                    <div class="panel-head">
+                        <h4>Endpoints</h4>
+                        <div class="live"><span class="dot"></span>HTTP</div>
+                    </div>
+
+                    <div class="meta-list">
+                        <div class="meta-item">
+                            <div class="meta-label">Frontend</div>
+                            <div class="meta-value">
+                                {% if FrontendURL %}
+                                <a href="{{ FrontendURL }}" target="_blank" rel="noreferrer">{{ FrontendURL }}</a>
+                                {% else %}
+                                Not configured
+                                {% endif %}
+                            </div>
+                        </div>
+
+                        <div class="meta-item">
+                            <div class="meta-label">Backend</div>
+                            <div class="meta-value">
+                                <a href="{{ BackendURL }}" target="_blank" rel="noreferrer">{{ BackendURL }}</a>
+                            </div>
+                        </div>
+
+                        <div class="meta-item">
+                            <div class="meta-label">Health</div>
+                            <div class="meta-value">
+                                <a href="{{ HealthURL }}" target="_blank" rel="noreferrer">{{ HealthURL }}</a>
+                            </div>
+                        </div>
+
+                        <div class="meta-item">
+                            <div class="meta-label">Checks</div>
+                            <div class="chip-row">
+                                <span class="chip">/health</span>
+                                <span class="chip">/health/live</span>
+                                <span class="chip">/health/ready</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="panel">
+                    <div class="panel-head">
+                        <h4>Worker Roles</h4>
+                        <div class="live"><span class="dot"></span>Tools</div>
+                    </div>
+
+                    <div class="meta-list">
+                        <div class="meta-item">
+                            <div class="meta-label">Document</div>
+                            <div class="meta-value">Analyzer, editor, and markup workflows</div>
+                        </div>
+                        <div class="meta-item">
+                            <div class="meta-label">Processing</div>
+                            <div class="meta-value">Metadata, redaction, and signing</div>
+                        </div>
+                        <div class="meta-item">
+                            <div class="meta-label">Output</div>
+                            <div class="meta-value">Synchronous PDFs and job-backed downloads</div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <div class="actions">
+                {% if FrontendURL %}
+                <a class="btn btn-primary" href="{{ FrontendURL }}" target="_blank" rel="noreferrer">
+                    Open PDFNest
+                </a>
+                {% endif %}
+                <a class="btn btn-secondary" href="{{ HealthURL }}" target="_blank" rel="noreferrer">
+                    Worker Health
+                </a>
+            </div>
+        </section>
+
+        <div class="footer">
+            <div>
+                <strong>{{ AppName }}</strong><br>
+                FastAPI PDF processing backend for the PDFNest platform
+            </div>
+            <div>© {{ CurrentYear }} PDFNest</div>
+        </div>
+    </main>
+</div>
+</body>
+</html>
