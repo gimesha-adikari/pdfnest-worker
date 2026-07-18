@@ -1,0 +1,17 @@
+camelot
+docx
+dramatiq
+fastapi
+fitz
+pandas
+pdf2docx
+pdfplumber
+Pillow
+psutil
+pydantic
+pymupdf
+pytesseract
+starlette
+uvicorn
+redis
+fastapi

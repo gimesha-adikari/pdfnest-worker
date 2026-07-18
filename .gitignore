@@ -6,3 +6,11 @@ __pycache__/
 /worker.txt
 /collect_text_and_tree.py
 /.env.local
+/.idea/inspectionProfiles/profiles_settings.xml
+/.idea/inspectionProfiles/Project_Default.xml
+/.idea/go.imports.xml
+/.idea/misc.xml
+/.idea/modules.xml
+/.idea/pdfnest-worker.iml
+/.idea/vcs.xml
+/pdfnest-worker.iml
