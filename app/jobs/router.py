@@ -19,6 +19,7 @@ QUEUE_TO_ACTOR = {
     JobQueue.default: test_job,
     JobQueue.office: editor_compile_job,
     JobQueue.render: editor_extract_job,
+    JobQueue.markup: test_job,
 }
 
 

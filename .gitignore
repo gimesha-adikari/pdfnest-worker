@@ -3,3 +3,6 @@ __pycache__/
 *.pyc
 .DS_Store
 .env
+/worker.txt
+/collect_text_and_tree.py
+/.env.local

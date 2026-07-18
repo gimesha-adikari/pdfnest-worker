@@ -5,7 +5,9 @@ from datetime import datetime, timezone
 from typing import Any
 
 import dramatiq
+import json
 
+from app.api.tools.markup.document import process_markup_pdf
 from app.api.tools.editor.document import compile_document, extract_document
 from app.api.tools.editor.utils import cleanup_paths, temp_file_path
 from app.core.broker import broker  # noqa: F401
@@ -144,3 +146,87 @@ def editor_compile_job(
         raise
     finally:
         cleanup_paths(input_path, pages_json_path)
+
+@dramatiq.actor(queue_name="markup", max_retries=3)
+def markup_highlight_job(job_id: str, input_path: str, payload_path: str) -> None:
+    _run_markup_job(job_id, input_path, payload_path, action="highlight")
+
+
+@dramatiq.actor(queue_name="markup", max_retries=3)
+def markup_underline_job(job_id: str, input_path: str, payload_path: str) -> None:
+    _run_markup_job(job_id, input_path, payload_path, action="underline")
+
+
+@dramatiq.actor(queue_name="markup", max_retries=3)
+def markup_strikeout_job(job_id: str, input_path: str, payload_path: str) -> None:
+    _run_markup_job(job_id, input_path, payload_path, action="strikeout")
+
+
+def _run_markup_job(job_id: str, input_path: str, payload_path: str, action: str) -> None:
+    job = get_job(job_id)
+    if job is None:
+        cleanup_paths(input_path, payload_path)
+        return
+
+    output_pdf_path = temp_file_path(prefix=f"pdfnest-{action}-output-", suffix=".pdf")
+
+    update_job(
+        job_id,
+        status=JobState.running,
+        started_at=datetime.now(timezone.utc),
+        progress=0,
+        message=f"{action.title()} job started",
+    )
+
+    try:
+        with open(payload_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+
+        boxes = payload.get("boxes", []) or []
+        mode = payload.get("mode", "smart")
+        file_password = payload.get("file_password")
+
+        def on_progress(done: int, total: int) -> None:
+            progress = int((done / max(1, total)) * 100)
+            update_job(
+                job_id,
+                progress=progress,
+                message=f"{action.title()} processing {done}/{total}",
+            )
+
+        process_markup_pdf(
+            input_path=input_path,
+            output_path=output_pdf_path,
+            boxes=boxes,
+            action=action,  # type: ignore[arg-type]
+            mode=mode,      # type: ignore[arg-type]
+            password=file_password,
+            progress_callback=on_progress,
+        )
+
+        update_job(
+            job_id,
+            status=JobState.succeeded,
+            finished_at=datetime.now(timezone.utc),
+            progress=100,
+            result={
+                "artifact_path": output_pdf_path,
+                "action": action,
+            },
+            message=f"{action.title()} job completed",
+        )
+
+    except Exception as exc:
+        cleanup_paths(output_pdf_path)
+        update_job(
+            job_id,
+            status=JobState.failed,
+            finished_at=datetime.now(timezone.utc),
+            error=str(exc),
+            message=f"{action.title()} job failed",
+        )
+        raise
+
+    finally:
+        cleanup_paths(input_path, payload_path)
+        cleanup_paths(input_path, payload_path)

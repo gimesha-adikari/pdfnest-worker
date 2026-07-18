@@ -13,7 +13,7 @@ class JobQueue(str, Enum):
     render = "render"
     editor = "editor"
     ocr = "ocr"
-
+    markup = "markup"
 
 class JobState(str, Enum):
     queued = "queued"
@@ -46,3 +46,8 @@ class TestJobRequest(BaseModel):
     queue_name: JobQueue = JobQueue.default
     steps: int = Field(default=10, ge=1, le=1000)
     duration_seconds: float = Field(default=5.0, ge=0.0, le=3600.0)
+
+class JobSubmissionResponse(BaseModel):
+    job_id: str
+    status: JobState
+    queue_name: JobQueue
