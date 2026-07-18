@@ -6,15 +6,28 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     UV_PROJECT_ENVIRONMENT=/opt/venv \
-    PATH="/opt/venv/bin:${PATH}"
+    PATH="/opt/venv/bin:${PATH}" \
+    PORT=8000
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     ca-certificates \
     curl \
+    tesseract-ocr \
+    ghostscript \
+    poppler-utils \
+    libreoffice \
+    chromium \
     libjpeg62-turbo \
     libopenjp2-7 \
     zlib1g \
+    fonts-dejavu-core \
+    libglib2.0-0 \
+    libnss3 \
+    libx11-6 \
+    libxext6 \
+    libxrender1 \
+    libfontconfig1 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -23,10 +36,6 @@ RUN pip install --no-cache-dir uv
 
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project
-
-RUN apt-get update && \
-    apt-get install -y tesseract-ocr && \
-    rm -rf /var/lib/apt/lists/*
 
 COPY . .
 
@@ -38,6 +47,6 @@ USER appuser
 EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD curl -fsS "http://127.0.0.1:8000/health" || exit 1
+  CMD curl -fsS "http://127.0.0.1:${PORT}/health" || exit 1
 
-CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT}"]
