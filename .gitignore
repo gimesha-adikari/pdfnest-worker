@@ -14,3 +14,4 @@ __pycache__/
 /.idea/pdfnest-worker.iml
 /.idea/vcs.xml
 /pdfnest-worker.iml
+/.env.rendar

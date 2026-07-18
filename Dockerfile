@@ -26,7 +26,7 @@ RUN uv sync --frozen --no-dev --no-install-project
 
 RUN apt-get update && \
     apt-get install -y tesseract-ocr && \
-    rm -rf /var/lib/apt/lists/* \
+    rm -rf /var/lib/apt/lists/*
 
 COPY . .
 
