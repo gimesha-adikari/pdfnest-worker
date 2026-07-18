@@ -16,6 +16,7 @@ from app.api.tools.render.router import router as render_router
 from app.api.tools.editor.router import router as editor_router
 from app.api.tools.markup.router import router as markup_router
 from app.api.tools.analyzer.router import router as analyzer_router
+from app.api.tools.metadata.router import router as metadata_router
 
 APP_NAME = "PDFNest Worker"
 APP_VERSION = os.getenv("APP_VERSION", "0.1.0")
@@ -80,6 +81,7 @@ app.include_router(render_router)
 app.include_router(editor_router)
 app.include_router(markup_router)
 app.include_router(analyzer_router)
+app.include_router(metadata_router)
 
 warnings.filterwarnings(
     "ignore",
