@@ -49,4 +49,4 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD curl -fsS "http://127.0.0.1:${PORT}/health" || exit 1
 
-CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT}"]
+CMD ["sh", "-c", "python - <<'PY'\nfrom app.core.config import settings\nprint('Redis URL:', settings.redis_url)\nfrom app.core.broker import broker\nprint('Broker OK')\nPY"]

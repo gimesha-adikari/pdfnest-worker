@@ -5,7 +5,6 @@ import warnings
 from contextlib import asynccontextmanager
 from typing import Any
 
-from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -24,7 +23,6 @@ from app.api.landing.router import router as landing_router
 
 import os
 
-load_dotenv()
 
 APP_NAME = "PDFNest Worker"
 APP_VERSION = os.getenv("APP_VERSION", "0.1.0")
