@@ -83,8 +83,8 @@ def editor_extract_job(
         result = extract_document(input_path, password)
 
         if isinstance(result, dict):
-            result["source_tracker"] = source_name or source_key
-            result["upright_tracker"] = result.get("upright_tracker") or source_name or source_key
+            result["source_tracker"] = source_key
+            result["upright_tracker"] = result.get("upright_tracker") or source_key
 
         update_job(
             job_id,
