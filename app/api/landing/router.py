@@ -51,6 +51,7 @@ def _build_context(request: Request) -> dict[str, object]:
         backend_url = _normalize_url(str(request.base_url))
 
     frontend_url = _env("FRONTEND_URL")
+    worker_url = _env("WORKER_URL")
 
     app_name = _env("APP_NAME", "PDFNest Worker")
     app_version = _env("APP_VERSION", "0.1.0")
@@ -69,9 +70,9 @@ def _build_context(request: Request) -> dict[str, object]:
         "AppEnv": app_env,
         "FrontendURL": frontend_url,
         "BackendURL": _normalize_url(backend_url),
-        "HealthURL": f"{_normalize_url(backend_url)}/health",
-        "LiveURL": f"{_normalize_url(backend_url)}/health/live",
-        "ReadyURL": f"{_normalize_url(backend_url)}/health/ready",
+        "HealthURL": f"{_normalize_url(worker_url)}/health",
+        "LiveURL": f"{_normalize_url(worker_url)}/health/live",
+        "ReadyURL": f"{_normalize_url(worker_url)}/health/ready",
         "CurrentYear": now.year,
         "UptimeLabel": _format_uptime(uptime_seconds),
         "StatusLabel": status_label or None,

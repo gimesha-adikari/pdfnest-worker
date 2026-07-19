@@ -16,3 +16,4 @@ __pycache__/
 /pdfnest-worker.iml
 /.env.rendar
 /.env.deploy
+/run_dev.sh
