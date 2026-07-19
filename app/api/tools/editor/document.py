@@ -293,53 +293,96 @@ def mask_and_rasterize_page(page: fitz.Page, elements: List[Dict[str, Any]]) -> 
     return page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0), alpha=False)
 
 
-def compile_document(original_pdf_path: str, output_pdf_path: str, pages_json_path: str) -> None:
+def compile_document(
+        original_pdf_path: str,
+        output_pdf_path: str,
+        pages_json_path: str,
+) -> None:
     with open(pages_json_path, "r", encoding="utf-8") as f:
         layout_data = json.load(f)
 
-    upright_path = layout_data.get("upright_tracker") or original_pdf_path
+    # We already downloaded the source PDF to original_pdf_path.
+    # Do NOT treat upright_tracker/source_tracker as local paths.
     orig_doc = fitz.open(original_pdf_path)
-    source_doc = fitz.open(upright_path)
+    source_doc = orig_doc
     output_doc = fitz.open()
 
     try:
         rotations = [p.rotation for p in orig_doc]
         pages = layout_data.get("pages", [])
+
         process = psutil.Process()
-        print(process.memory_info().rss / 1024 / 1024)
+        print(f"Memory: {process.memory_info().rss / 1024 / 1024:.2f} MB")
 
         for page_idx, page_data in enumerate(pages):
             if page_idx >= len(source_doc):
                 continue
+
             source_page = source_doc[page_idx]
             elements = page_data.get("elements", []) or []
+
             pix = mask_and_rasterize_page(source_page, elements)
-            new_page = output_doc.new_page(width=source_page.rect.width, height=source_page.rect.height)
+
+            new_page = output_doc.new_page(
+                width=source_page.rect.width,
+                height=source_page.rect.height,
+            )
+
             new_page.insert_image(new_page.rect, pixmap=pix)
 
             for element in elements:
                 text_val = str(element.get("text", "")).strip()
                 if not text_val:
                     continue
+
                 try:
                     x0 = float(element.get("x", 0))
                     y0 = float(element.get("y", 0))
                     w = float(element.get("width", 0))
                     h = float(element.get("height", 0))
                     font_size = float(element.get("size", 11))
+
                     text_color_hex = element.get("text_color", "#000000")
                     color_rgb = hex_to_rgb(text_color_hex)
-                    rect = fitz.Rect(x0, y0, x0 + w, y0 + h)
+
+                    rect = fitz.Rect(
+                        x0,
+                        y0,
+                        x0 + w,
+                        y0 + h,
+                        )
+
                     try:
-                        rc = new_page.insert_textbox(rect, text_val, fontsize=font_size, fontname="helv", color=color_rgb, align=0)
+                        rc = new_page.insert_textbox(
+                            rect,
+                            text_val,
+                            fontsize=font_size,
+                            fontname="helv",
+                            color=color_rgb,
+                            align=0,
+                        )
+
                         process = psutil.Process()
-                        print(process.memory_info().rss / 1024 / 1024)
+                        print(f"Memory: {process.memory_info().rss / 1024 / 1024:.2f} MB")
+
                         if rc < 0:
-                            pt = fitz.Point(x0, y0 + (h * 0.85))
-                            new_page.insert_text(pt, text_val, fontsize=font_size, fontname="helv", color=color_rgb)
+                            new_page.insert_text(
+                                fitz.Point(x0, y0 + h * 0.85),
+                                text_val,
+                                fontsize=font_size,
+                                fontname="helv",
+                                color=color_rgb,
+                            )
+
                     except Exception:
-                        pt = fitz.Point(x0, y0 + (h * 0.85))
-                        new_page.insert_text(pt, text_val, fontsize=font_size, fontname="helv", color=color_rgb)
+                        new_page.insert_text(
+                            fitz.Point(x0, y0 + h * 0.85),
+                            text_val,
+                            fontsize=font_size,
+                            fontname="helv",
+                            color=color_rgb,
+                        )
+
                 except Exception:
                     continue
 
@@ -347,7 +390,7 @@ def compile_document(original_pdf_path: str, output_pdf_path: str, pages_json_pa
                 new_page.set_rotation(rotations[page_idx])
 
         output_doc.save(output_pdf_path)
+
     finally:
         output_doc.close()
-        source_doc.close()
         orig_doc.close()
