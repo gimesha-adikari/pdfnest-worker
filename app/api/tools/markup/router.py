@@ -1,142 +1,74 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 
-from app.core.storage import build_key, stream_object, upload_fileobj, upload_text
+from app.core.storage import stream_object
 from app.jobs.actors import markup_highlight_job, markup_strikeout_job, markup_underline_job
-from app.jobs.models import JobQueue, JobState
+from app.jobs.models import JobQueue, JobState, JobSubmissionResponse
 from app.jobs.store import create_job, get_job
-from .models import MarkupMode
-from app.jobs.models import JobSubmissionResponse
 
 router = APIRouter(prefix="/api/v1/markup", tags=["markup"])
 
 
-async def _queue_markup_job(
-        *,
-        action: str,
-        file: UploadFile,
-        boxes: str,
-        file_password: str | None,
-        mode: MarkupMode,
-) -> JobSubmissionResponse:
-    source_name = file.filename or "document.pdf"
-    source_suffix = Path(source_name).suffix or ".pdf"
+class MarkupSubmitRequest(BaseModel):
+    source_key: str
+    payload_key: str
+    source_name: str | None = None
 
-    source_key = build_key("jobs/markup/source", suffix=source_suffix)
-    payload_key = build_key(f"jobs/markup/{action}/payload", suffix=".json")
 
-    try:
-        try:
-            parsed_boxes = json.loads(boxes)
-            if not isinstance(parsed_boxes, list):
-                raise ValueError("boxes must be a JSON array")
-        except Exception as exc:
-            raise HTTPException(status_code=400, detail="Invalid boxes JSON payload") from exc
+async def _queue_markup_job(action: str, payload: MarkupSubmitRequest) -> JobSubmissionResponse:
+    if not payload.source_key.strip():
+        raise HTTPException(status_code=400, detail="source_key is required")
+    if not payload.payload_key.strip():
+        raise HTTPException(status_code=400, detail="payload_key is required")
 
-        payload = {
-            "boxes": parsed_boxes,
-            "mode": mode,
-            "file_password": file_password,
+    source_name = payload.source_name or Path(payload.source_key).name or "document.pdf"
+
+    job = create_job(
+        f"markup_{action}",
+        queue_name=JobQueue.markup,
+        payload={
+            "source_key": payload.source_key,
+            "payload_key": payload.payload_key,
+            "source_name": source_name,
             "action": action,
-        }
+        },
+    )
 
-        await file.seek(0)
-        await run_in_threadpool(
-            upload_fileobj,
-            file.file,
-            source_key,
-            content_type=file.content_type or "application/pdf",
-        )
-        await run_in_threadpool(
-            upload_text,
-            json.dumps(payload),
-            payload_key,
-            content_type="application/json",
-        )
+    if action == "highlight":
+        markup_highlight_job.send(job.id, payload.source_key, payload.payload_key, source_name)
+    elif action == "underline":
+        markup_underline_job.send(job.id, payload.source_key, payload.payload_key, source_name)
+    elif action == "strikeout":
+        markup_strikeout_job.send(job.id, payload.source_key, payload.payload_key, source_name)
+    else:
+        raise HTTPException(status_code=400, detail=f"Unsupported action: {action}")
 
-        job = create_job(
-            f"markup_{action}",
-            queue_name=JobQueue.markup,
-            payload={
-                "source_key": source_key,
-                "payload_key": payload_key,
-                "action": action,
-                "source_name": source_name,
-            },
-        )
-
-        if action == "highlight":
-            markup_highlight_job.send(job.id, source_key, payload_key, source_name)
-        elif action == "underline":
-            markup_underline_job.send(job.id, source_key, payload_key, source_name)
-        elif action == "strikeout":
-            markup_strikeout_job.send(job.id, source_key, payload_key, source_name)
-        else:
-            raise HTTPException(status_code=400, detail=f"Unsupported action: {action}")
-
-        return JobSubmissionResponse(
-            job_id=job.id,
-            status=job.status.value,
-            queue_name=job.queue_name.value,
-        )
-    except HTTPException:
-        raise
-    except Exception:
-        raise
+    return JobSubmissionResponse(
+        job_id=job.id,
+        status=job.status.value,
+        queue_name=job.queue_name.value,
+    )
 
 
 @router.post("/highlight", response_model=JobSubmissionResponse)
-async def highlight_layout(
-        file: UploadFile = File(...),
-        boxes: str = Form(...),
-        file_password: str | None = Form(default=None),
-        mode: MarkupMode = Form(default="smart"),
-) -> JobSubmissionResponse:
-    return await _queue_markup_job(
-        action="highlight",
-        file=file,
-        boxes=boxes,
-        file_password=file_password,
-        mode=mode,
-    )
+async def highlight_layout(payload: MarkupSubmitRequest) -> JobSubmissionResponse:
+    return await _queue_markup_job("highlight", payload)
 
 
 @router.post("/underline", response_model=JobSubmissionResponse)
-async def underline_layout(
-        file: UploadFile = File(...),
-        boxes: str = Form(...),
-        file_password: str | None = Form(default=None),
-        mode: MarkupMode = Form(default="smart"),
-) -> JobSubmissionResponse:
-    return await _queue_markup_job(
-        action="underline",
-        file=file,
-        boxes=boxes,
-        file_password=file_password,
-        mode=mode,
-    )
+async def underline_layout(payload: MarkupSubmitRequest) -> JobSubmissionResponse:
+    return await _queue_markup_job("underline", payload)
 
 
 @router.post("/strikeout", response_model=JobSubmissionResponse)
-async def strikeout_layout(
-        file: UploadFile = File(...),
-        boxes: str = Form(...),
-        file_password: str | None = Form(default=None),
-        mode: MarkupMode = Form(default="smart"),
-) -> JobSubmissionResponse:
-    return await _queue_markup_job(
-        action="strikeout",
-        file=file,
-        boxes=boxes,
-        file_password=file_password,
-        mode=mode,
-    )
+async def strikeout_layout(payload: MarkupSubmitRequest) -> JobSubmissionResponse:
+    return await _queue_markup_job("strikeout", payload)
 
 
 @router.get("/jobs/{job_id}/download")
