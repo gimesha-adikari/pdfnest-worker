@@ -1,49 +1,53 @@
 from __future__ import annotations
 
 import json
-import os
-import shutil
-import tempfile
 from pathlib import Path
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse
-from starlette.background import BackgroundTask
+from fastapi.responses import StreamingResponse
+from starlette.concurrency import run_in_threadpool
 
+from app.core.storage import build_key, stream_object, upload_fileobj, upload_text
 from app.jobs.actors import editor_compile_job, editor_extract_job
 from app.jobs.models import JobQueue, JobState
 from app.jobs.store import create_job, get_job
 
 from .models import JobSubmissionResponse
-from .utils import cleanup_paths, temp_file_path
 
 router = APIRouter(prefix="/api/v1/editor", tags=["editor"])
 
 
 @router.post("/extract")
 async def extract_layout(
-    file: UploadFile = File(...),
-    file_password: str | None = Form(default=None),
-    source_tracker: str | None = Form(default=None),
+        file: UploadFile = File(...),
+        file_password: str | None = Form(default=None),
+        source_tracker: str | None = Form(default=None),
 ):
-    input_fd, input_path = tempfile.mkstemp(prefix="pdfnest-source-", suffix=".pdf")
-    os.close(input_fd)
+    source_name = file.filename or "document.pdf"
+    source_suffix = Path(source_name).suffix or ".pdf"
+    source_key = build_key("jobs/editor/source", suffix=source_suffix)
 
     try:
-        with open(input_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+        await file.seek(0)
+        await run_in_threadpool(
+            upload_fileobj,
+            file.file,
+            source_key,
+            content_type=file.content_type or "application/pdf",
+        )
 
         job = create_job(
             "editor_extract",
             queue_name=JobQueue.editor,
             payload={
-                "input_path": input_path,
+                "source_key": source_key,
                 "has_password": bool(file_password),
-                "source_tracker": source_tracker or input_path,
+                "source_name": source_name,
+                "source_tracker": source_tracker or source_name,
             },
         )
 
-        editor_extract_job.send(job.id, input_path, file_password, source_tracker)
+        editor_extract_job.send(job.id, source_key, file_password, source_name)
 
         return JobSubmissionResponse(
             job_id=job.id,
@@ -51,19 +55,18 @@ async def extract_layout(
             queue_name=job.queue_name.value,
         )
     except Exception:
-        cleanup_paths(input_path)
         raise
 
 
 @router.post("/compile", response_model=JobSubmissionResponse)
 async def compile_layout(
-    file: UploadFile = File(...),
-    payload: str = Form(...),
+        file: UploadFile = File(...),
+        payload: str = Form(...),
 ) -> JobSubmissionResponse:
-    input_fd, input_path = tempfile.mkstemp(prefix="pdfnest-source-", suffix=".pdf")
-    os.close(input_fd)
-
-    pages_json_path = temp_file_path(prefix="pdfnest-layout-", suffix=".json")
+    source_name = file.filename or "document.pdf"
+    source_suffix = Path(source_name).suffix or ".pdf"
+    source_key = build_key("jobs/editor/source", suffix=source_suffix)
+    pages_json_key = build_key("jobs/editor/layout", suffix=".json")
 
     try:
         try:
@@ -71,22 +74,31 @@ async def compile_layout(
         except json.JSONDecodeError as exc:
             raise HTTPException(status_code=400, detail="Invalid JSON payload") from exc
 
-        with open(input_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-
-        with open(pages_json_path, "w", encoding="utf-8") as f:
-            f.write(payload)
+        await file.seek(0)
+        await run_in_threadpool(
+            upload_fileobj,
+            file.file,
+            source_key,
+            content_type=file.content_type or "application/pdf",
+        )
+        await run_in_threadpool(
+            upload_text,
+            payload,
+            pages_json_key,
+            content_type="application/json",
+        )
 
         job = create_job(
             "editor_compile",
             queue_name=JobQueue.editor,
             payload={
-                "input_path": input_path,
-                "pages_json_path": pages_json_path,
+                "source_key": source_key,
+                "pages_json_key": pages_json_key,
+                "source_name": source_name,
             },
         )
 
-        editor_compile_job.send(job.id, input_path, pages_json_path)
+        editor_compile_job.send(job.id, source_key, pages_json_key, source_name)
 
         return JobSubmissionResponse(
             job_id=job.id,
@@ -94,10 +106,8 @@ async def compile_layout(
             queue_name=job.queue_name.value,
         )
     except HTTPException:
-        cleanup_paths(input_path, pages_json_path)
         raise
     except Exception:
-        cleanup_paths(input_path, pages_json_path)
         raise
 
 
@@ -114,13 +124,19 @@ async def download_compiled_pdf(job_id: str):
         )
 
     result = job.result or {}
-    artifact_path = result.get("artifact_path")
-    if not artifact_path or not os.path.exists(artifact_path):
+    artifact_key = result.get("artifact_key")
+    if not artifact_key:
         raise HTTPException(status_code=404, detail="Compiled artifact not found")
 
-    return FileResponse(
-        artifact_path,
-        media_type="application/pdf",
-        filename="edited_" + Path(artifact_path).name,
-        background=BackgroundTask(cleanup_paths, artifact_path),
+    source_name = str((job.payload or {}).get("source_name") or "document.pdf")
+    download_name = result.get("artifact_name") or f"edited_{Path(source_name).stem}.pdf"
+
+    stream, content_type = await run_in_threadpool(stream_object, artifact_key)
+
+    return StreamingResponse(
+        stream,
+        media_type=content_type or "application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="{download_name}"'
+        },
     )

@@ -21,5 +21,10 @@ class Settings:
         ]
     )
 
+    r2_bucket: str = os.getenv("R2_BUCKET", "")
+    r2_access_key: str = os.getenv("R2_ACCESS_KEY", "")
+    r2_secret_key: str = os.getenv("R2_SECRET_KEY", "")
+    r2_endpoint: str = os.getenv("R2_ENDPOINT", "")
+
 
 settings = Settings()
