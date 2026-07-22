@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 
 @dataclass(frozen=True)
 class Settings:
-    app_name: str = "PDFNest Worker"
+    app_name: str = "Platen PDF Worker"
     app_version: str = os.getenv("APP_VERSION", "0.1.0")
     app_env: str = os.getenv("APP_ENV", "development")
     host: str = os.getenv("HOST", "0.0.0.0")

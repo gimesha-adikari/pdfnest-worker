@@ -4,7 +4,7 @@ set -euo pipefail
 
 cleanup() {
     echo
-    echo "Stopping PDFNest Worker..."
+    echo "Stopping Platen PDF Worker..."
 
     kill "$UVICORN_PID" 2>/dev/null || true
     kill "$DRAMATIQ_PID" 2>/dev/null || true
@@ -24,7 +24,7 @@ if [ "$CPU_COUNT" -lt 1 ]; then
 fi
 
 echo "======================================"
-echo " PDFNest Worker"
+echo " Platen PDF Worker"
 echo "======================================"
 echo "CPU Cores : $CPU_COUNT"
 echo

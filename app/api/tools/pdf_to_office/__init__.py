@@ -1,1 +1,1 @@
-"""PDFNest office conversion tool."""
+"""Platen PDF office conversion tool."""

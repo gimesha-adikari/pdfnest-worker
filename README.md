@@ -1,8 +1,8 @@
 ![Project cover](cover.png)
 
-# PDFNest Worker
+# Platen PDF Worker
 
-PDFNest Worker is the FastAPI processing service behind PDFNest. It handles the heavier document operations that the Go backend delegates over HTTP, including PDF analysis, metadata read/write, redaction, signing, editor extraction/compile flows, and markup jobs. The worker app mounts its routers from `app/main.py` and exposes health endpoints for readiness and uptime checks. fileciteturn29file0L22-L45 fileciteturn29file0L63-L111
+Platen PDF Worker is the FastAPI processing service behind Platen PDF. It handles the heavier document operations that the Go backend delegates over HTTP, including PDF analysis, metadata read/write, redaction, signing, editor extraction/compile flows, and markup jobs. The worker app mounts its routers from `app/main.py` and exposes health endpoints for readiness and uptime checks. fileciteturn29file0L22-L45 fileciteturn29file0L63-L111
 
 ## What it does
 

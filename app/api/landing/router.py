@@ -53,7 +53,7 @@ def _build_context(request: Request) -> dict[str, object]:
     frontend_url = _env("FRONTEND_URL")
     worker_url = _env("WORKER_URL")
 
-    app_name = _env("APP_NAME", "PDFNest Worker")
+    app_name = _env("APP_NAME", "Platen PDF Worker")
     app_version = _env("APP_VERSION", "0.1.0")
     app_env = _env("APP_ENV", "development")
 

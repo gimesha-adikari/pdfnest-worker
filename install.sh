@@ -3,7 +3,7 @@
 set -euo pipefail
 
 echo "======================================"
-echo " Installing PDFNest Worker"
+echo " Installing Platen PDF Worker"
 echo "======================================"
 
 sudo apt update

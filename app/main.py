@@ -24,7 +24,7 @@ from app.api.landing.router import router as landing_router
 import os
 
 
-APP_NAME = "PDFNest Worker"
+APP_NAME = "Platen PDF Worker"
 APP_VERSION = os.getenv("APP_VERSION", "0.1.0")
 APP_ENV = os.getenv("APP_ENV", "development")
 ALLOWED_ORIGINS = [
