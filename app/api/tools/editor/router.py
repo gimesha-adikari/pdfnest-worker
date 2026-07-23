@@ -1,8 +1,7 @@
-from __future__ import annotations
-
+import logging
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
@@ -12,6 +11,7 @@ from app.jobs.actors import editor_compile_job, editor_extract_job
 from app.jobs.models import JobQueue, JobState, JobSubmissionResponse
 from app.jobs.store import create_job, get_job
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/editor", tags=["editor"])
 
 
@@ -27,10 +27,10 @@ class CompileRequest(BaseModel):
     source_name: str | None = None
 
 
-@router.post("/extract", response_model=JobSubmissionResponse)
+@router.post("/extract", response_model=JobSubmissionResponse, status_code=status.HTTP_202_ACCEPTED)
 async def extract_layout(payload: ExtractRequest) -> JobSubmissionResponse:
     if not payload.source_key.strip():
-        raise HTTPException(status_code=400, detail="source_key is required")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="source_key is required")
 
     source_name = payload.source_name or Path(payload.source_key).name or "document.pdf"
 
@@ -41,6 +41,7 @@ async def extract_layout(payload: ExtractRequest) -> JobSubmissionResponse:
     )
 
     editor_extract_job.send(job.id, payload.source_key, payload.file_password, source_name)
+    logger.info("Dispatched extract job %s for %s", job.id, source_name)
 
     return JobSubmissionResponse(
         job_id=job.id,
@@ -49,12 +50,12 @@ async def extract_layout(payload: ExtractRequest) -> JobSubmissionResponse:
     )
 
 
-@router.post("/compile", response_model=JobSubmissionResponse)
+@router.post("/compile", response_model=JobSubmissionResponse, status_code=status.HTTP_202_ACCEPTED)
 async def compile_layout(payload: CompileRequest) -> JobSubmissionResponse:
     if not payload.source_key.strip():
-        raise HTTPException(status_code=400, detail="source_key is required")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="source_key is required")
     if not payload.pages_json_key.strip():
-        raise HTTPException(status_code=400, detail="pages_json_key is required")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="pages_json_key is required")
 
     source_name = payload.source_name or Path(payload.source_key).name or "document.pdf"
 
@@ -65,6 +66,7 @@ async def compile_layout(payload: CompileRequest) -> JobSubmissionResponse:
     )
 
     editor_compile_job.send(job.id, payload.source_key, payload.pages_json_key, source_name)
+    logger.info("Dispatched compile job %s for %s", job.id, source_name)
 
     return JobSubmissionResponse(
         job_id=job.id,
@@ -76,19 +78,19 @@ async def compile_layout(payload: CompileRequest) -> JobSubmissionResponse:
 @router.get("/jobs/{job_id}/download")
 async def download_compiled_pdf(job_id: str):
     job = get_job(job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail="Job not found")
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
 
     if job.status != JobState.succeeded:
         raise HTTPException(
-            status_code=409,
+            status_code=status.HTTP_409_CONFLICT,
             detail=f"Job is not ready for download. Current status: {job.status.value}",
         )
 
     result = job.result or {}
     artifact_key = result.get("artifact_key")
     if not artifact_key:
-        raise HTTPException(status_code=404, detail="Compiled artifact not found")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Compiled artifact not found")
 
     source_name = str((job.payload or {}).get("source_name") or "document.pdf")
     download_name = result.get("artifact_name") or f"edited_{Path(source_name).stem}.pdf"

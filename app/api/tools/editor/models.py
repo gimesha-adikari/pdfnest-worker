@@ -1,11 +1,11 @@
-from __future__ import annotations
+from typing import Literal
 
-from typing import Any, Literal
-
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class ExtractPageElement(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     text: str
     x: float
     y: float
@@ -13,8 +13,8 @@ class ExtractPageElement(BaseModel):
     height: float
     size: float
     font: str
-    bg_color: str = Field(default="#ffffff")
-    text_color: str = Field(default="#000000")
+    bg_color: str = Field(default="#ffffff", description="Hex color for the background mask")
+    text_color: str = Field(default="#000000", description="Hex color for the text")
 
 
 class ExtractPage(BaseModel):
