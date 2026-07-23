@@ -1,6 +1,7 @@
 import io
 import json
 import logging
+import re
 from contextlib import suppress
 from statistics import median
 from typing import Any, Tuple
@@ -33,11 +34,66 @@ def pixmap_to_image(pix: fitz.Pixmap) -> Image.Image:
     return img if img.mode == "RGB" else img.convert("RGB")
 
 
+def sample_text_color_hex(image: Image.Image, rect: fitz.Rect, zoom: float = 2.0) -> str:
+    """
+    Samples the average color of the dark pixels (text) in a bounding box.
+    """
+    try:
+        crop_box = (
+            int(rect.x0 * zoom),
+            int(rect.y0 * zoom),
+            int(rect.x1 * zoom),
+            int(rect.y1 * zoom),
+        )
+        cropped = image.crop(crop_box).convert("RGB")
+        if cropped.width <= 0 or cropped.height <= 0:
+            return "#000000"
+
+        pixels = list(cropped.getdata())
+        dark_pixels = [p for p in pixels if sum(p) < 380]
+
+        if not dark_pixels:
+            return "#000000"
+
+        r = sum(p[0] for p in dark_pixels) // len(dark_pixels)
+        g = sum(p[1] for p in dark_pixels) // len(dark_pixels)
+        b = sum(p[2] for p in dark_pixels) // len(dark_pixels)
+
+        return f"#{r:02x}{g:02x}{b:02x}"
+    except Exception:
+        return "#000000"
+
+
+def analyze_font_attributes(image: Image.Image, rect: fitz.Rect, zoom: float = 2.0) -> Tuple[str, bool]:
+    """
+    Dynamically analyzes a cropped image region to determine font attributes.
+    """
+    try:
+        crop_box = (
+            int(rect.x0 * zoom),
+            int(rect.y0 * zoom),
+            int(rect.x1 * zoom),
+            int(rect.y1 * zoom),
+        )
+        cropped = image.crop(crop_box).convert("L")
+
+        if cropped.width <= 0 or cropped.height <= 0:
+            return "tiro", False
+
+        pixels = list(cropped.getdata())
+        dark_pixels = sum(1 for p in pixels if p < 120)
+        total_pixels = len(pixels)
+        density = dark_pixels / float(total_pixels) if total_pixels > 0 else 0
+
+        is_bold = density > 0.28
+        font_style = "tiro"
+
+        return font_style, is_bold
+    except Exception:
+        return "tiro", False
+
+
 def sample_background_hex(page: fitz.Page, rect: fitz.Rect) -> str:
-    """
-    Guarantees pure white backgrounds for document text elements.
-    Prevents grey bar overlays on frontend editors caused by table gridlines.
-    """
     samples: list[tuple[int, int, int]] = []
     pad = 3.0
     candidate_rects = [
@@ -68,7 +124,6 @@ def sample_background_hex(page: fitz.Page, rect: fitz.Rect) -> str:
     g = sum(c[1] for c in samples) // len(samples)
     b = sum(c[2] for c in samples) // len(samples)
 
-    # If color drifts toward dark grey (table border), force white
     if r < 235 or g < 235 or b < 235:
         return "#ffffff"
 
@@ -80,28 +135,58 @@ def group_words_by_line(word_items: list[dict[str, Any]]) -> list[dict[str, Any]
         return []
 
     heights = [max(1.0, float(w["rect"].height)) for w in word_items]
-    line_tol = max(2.5, median(heights) * 0.5)
+    med_height = median(heights)
+    y_tol = max(3.0, med_height * 0.45)
+    max_x_gap = 10.0
+
     lines: list[dict[str, Any]] = []
 
-    for item in sorted(word_items, key=lambda w: (w["rect"].y0, w["rect"].x0)):
+    sorted_words = sorted(
+        word_items,
+        key=lambda w: ((w["rect"].y0 + w["rect"].y1) / 2.0, w["rect"].x0)
+    )
+
+    for item in sorted_words:
         rect = item["rect"]
+        item_y_center = (rect.y0 + rect.y1) / 2.0
         placed = False
+
         for line in lines:
-            if abs(rect.y0 - line["y0"]) <= line_tol or abs(rect.y1 - line["y1"]) <= line_tol:
-                line["items"].append(item)
-                line["x0"] = min(line["x0"], rect.x0)
-                line["x1"] = max(line["x1"], rect.x1)
-                line["y0"] = min(line["y0"], rect.y0)
-                line["y1"] = max(line["y1"], rect.y1)
-                placed = True
-                break
+            line_y_center = (line["y0"] + line["y1"]) / 2.0
+            if abs(item_y_center - line_y_center) <= y_tol:
+                gap = rect.x0 - line["x1"]
+                if 0 <= gap <= max_x_gap:
+                    line["items"].append(item)
+                    line["x0"] = min(line["x0"], rect.x0)
+                    line["x1"] = max(line["x1"], rect.x1)
+                    line["y0"] = min(line["y0"], rect.y0)
+                    line["y1"] = max(line["y1"], rect.y1)
+                    placed = True
+                    break
+
         if not placed:
-            lines.append({"items": [item], "x0": rect.x0, "x1": rect.x1, "y0": rect.y0, "y1": rect.y1})
+            lines.append({
+                "items": [item],
+                "x0": rect.x0,
+                "x1": rect.x1,
+                "y0": rect.y0,
+                "y1": rect.y1,
+            })
 
     return lines
 
 
-def ocr_words_for_page(page: fitz.Page, zoom: float = 2.0, lang: str = "eng") -> list[dict[str, Any]]:
+def is_valid_ocr_word(text: str, conf: float) -> bool:
+    if conf < 30.0:
+        return False
+    if len(text) == 1 and not text.isalnum():
+        return False
+    if re.match(r"^[\-_\|\\/\.\,\;\:\'\"]+$", text):
+        return False
+    return True
+
+
+def ocr_words_for_page(page: fitz.Page, zoom: float = 2.0, lang: str = "eng") -> Tuple[list[dict[str, Any]], Image.Image]:
     pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
     image = pixmap_to_image(pix)
 
@@ -110,7 +195,7 @@ def ocr_words_for_page(page: fitz.Page, zoom: float = 2.0, lang: str = "eng") ->
 
     for i, text in enumerate(data.get("text", [])):
         text = str(text).strip()
-        if not text or len(text) == 1 and not text.isalnum():
+        if not text:
             continue
 
         try:
@@ -118,7 +203,7 @@ def ocr_words_for_page(page: fitz.Page, zoom: float = 2.0, lang: str = "eng") ->
         except (ValueError, TypeError, IndexError):
             conf = -1.0
 
-        if conf < 30.0:  # Higher threshold to filter OCR noise artifacts
+        if not is_valid_ocr_word(text, conf):
             continue
 
         left = float(data["left"][i]) / zoom
@@ -128,7 +213,7 @@ def ocr_words_for_page(page: fitz.Page, zoom: float = 2.0, lang: str = "eng") ->
         rect = fitz.Rect(left, top, left + width, top + height)
         items.append({"rect": rect, "text": text, "conf": conf})
 
-    return items
+    return items, image
 
 
 def deduplicate_elements(elements: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -138,7 +223,7 @@ def deduplicate_elements(elements: list[dict[str, Any]]) -> list[dict[str, Any]]
         is_dup = False
         for u in unique:
             r2 = fitz.Rect(u["x"], u["y"], u["x"] + u["width"], u["y"] + u["height"])
-            if el["text"] == u["text"] and (r1.intersects(r2) or abs(r1.y0 - r2.y0) < 2.0):
+            if el["text"] == u["text"] and (r1.intersects(r2) or abs(r1.y0 - r2.y0) < 1.2):
                 is_dup = True
                 break
         if not is_dup:
@@ -176,7 +261,7 @@ def extract_native_page(page: fitz.Page, page_number: int) -> dict[str, Any]:
                 continue
 
             line_text_parts = []
-            font_size = 10.0
+            font_size = 9.5
             font_name = "sans-serif"
             text_color_hex = "#000000"
 
@@ -193,10 +278,6 @@ def extract_native_page(page: fitz.Page, page_number: int) -> dict[str, Any]:
             if not line_text:
                 continue
 
-            # Strict Font Size Normalization: Force text to fit within bounding boxes
-            clamped_font_size = min(font_size, rect.height * 0.75)
-            clamped_font_size = max(8.0, min(14.0, clamped_font_size))
-
             elements.append({
                 "text": line_text,
                 "original_text": line_text,
@@ -204,10 +285,11 @@ def extract_native_page(page: fitz.Page, page_number: int) -> dict[str, Any]:
                 "y": rect.y0,
                 "width": rect.width,
                 "height": rect.height,
-                "size": round(clamped_font_size, 1),
+                "size": round(font_size, 1),
                 "font": font_name,
-                "bg_color": "#ffffff",  # Pure white default for UI editor cleanliness
+                "bg_color": "transparent",
                 "text_color": text_color_hex,
+                "transparent_bg": True,
             })
             text_block_count += 1
 
@@ -235,7 +317,7 @@ def extract_native_page(page: fitz.Page, page_number: int) -> dict[str, Any]:
 
 
 def extract_ocr_page(page: fitz.Page, page_number: int) -> dict[str, Any]:
-    word_items = ocr_words_for_page(page)
+    word_items, page_image = ocr_words_for_page(page)
     lines = group_words_by_line(word_items)
     elements: list[dict[str, Any]] = []
 
@@ -246,13 +328,25 @@ def extract_ocr_page(page: fitz.Page, page_number: int) -> dict[str, Any]:
             continue
 
         rect = fitz.Rect(line["x0"], line["y0"], line["x1"], line["y1"])
-        if rect.is_empty:
+        if rect.is_empty or rect.width < 3.0:
             continue
 
-        # Clamp OCR font sizes tightly using individual word dimensions
         word_heights = [w["rect"].height for w in items if w["rect"].height > 0]
-        med_height = median(word_heights) if word_heights else rect.height
-        font_size = max(8.0, min(13.5, med_height * 0.75))
+        # Use the maximum height (tallest letter) of the line to establish scale
+        max_height = max(word_heights) if word_heights else rect.height
+
+        # Bounding boxes map exactly to visual ink (Cap Height or Ascender Height).
+        # A true typographic point size (Em-Square) is always physically larger than the ink box.
+        # Multiplying by ~1.15 correctly scales an OCR height to standard font point size.
+        dynamic_font_size = max_height * 1.15
+
+        font_family, is_bold = analyze_font_attributes(page_image, rect)
+        sampled_color = sample_text_color_hex(page_image, rect)
+
+        if font_family == "tiro":
+            font_code = "tibo" if is_bold else "tiro"
+        else:
+            font_code = "hebo" if is_bold else "helv"
 
         elements.append({
             "text": text,
@@ -261,10 +355,11 @@ def extract_ocr_page(page: fitz.Page, page_number: int) -> dict[str, Any]:
             "y": rect.y0,
             "width": rect.width,
             "height": rect.height,
-            "size": round(font_size, 1),
-            "font": "OCR",
-            "bg_color": "#ffffff",
-            "text_color": "#000000",
+            "size": round(dynamic_font_size, 1),
+            "font": font_code,
+            "bg_color": "transparent",
+            "text_color": sampled_color,
+            "transparent_bg": True,
         })
 
     elements = deduplicate_elements(elements)
@@ -323,13 +418,11 @@ def compile_document(original_pdf_path: str, output_pdf_path: str, pages_json_pa
                 img = pixmap_to_image(pix)
                 draw = ImageDraw.Draw(img)
 
-                # Selective Masking: ONLY wipe out old text if the user actually edited/changed it
                 for element in elements:
                     try:
                         text_val = str(element.get("text", "")).strip()
                         orig_text = str(element.get("original_text", "")).strip()
 
-                        # Skip wiping if the text was untouched
                         if text_val == orig_text:
                             continue
 
@@ -343,6 +436,7 @@ def compile_document(original_pdf_path: str, output_pdf_path: str, pages_json_pa
                         w_scaled = w * zoom
                         h_scaled = h * zoom
                         bg_hex = element.get("bg_color", "#ffffff")
+                        bg_hex = "#ffffff" if bg_hex == "transparent" else bg_hex
 
                         draw.rectangle(
                             [x0 - 1, y0 - 1, x0 + w_scaled + 1, y0 + h_scaled + 1],
@@ -355,7 +449,8 @@ def compile_document(original_pdf_path: str, output_pdf_path: str, pages_json_pa
                 img.save(img_bytes, format="JPEG", quality=95)
 
                 for item in page.get_images():
-                    doc.xref_delete(item[0])
+                    with suppress(Exception):
+                        doc.delete_xref(item[0])
 
                 page.clean_contents()
                 page.insert_image(page.rect, stream=img_bytes.getvalue())
@@ -371,6 +466,7 @@ def compile_document(original_pdf_path: str, output_pdf_path: str, pages_json_pa
                         x0 = float(element.get("x", 0))
                         y0 = float(element.get("y", 0))
                         bg_hex = element.get("bg_color", "#ffffff")
+                        bg_hex = "#ffffff" if bg_hex == "transparent" else bg_hex
                         color_rgb = hex_to_rgb(bg_hex)
 
                         rect = fitz.Rect(x0 - 1, y0 - 1, x0 + w + 1, y0 + h + 1)
@@ -380,12 +476,10 @@ def compile_document(original_pdf_path: str, output_pdf_path: str, pages_json_pa
 
                 page.apply_redactions()
 
-            # Insert Text Elements
             for element in elements:
                 text_val = str(element.get("text", "")).strip()
                 orig_text = str(element.get("original_text", "")).strip()
 
-                # On OCR scanned pages, skip re-drawing text that wasn't edited to keep original scanned look
                 if is_ocr_page and text_val == orig_text:
                     continue
 
@@ -397,16 +491,27 @@ def compile_document(original_pdf_path: str, output_pdf_path: str, pages_json_pa
                     y0 = float(element.get("y", 0))
                     w = float(element.get("width", 0))
                     h = float(element.get("height", 0))
-                    font_size = float(element.get("size", 10.0))
+
+                    fallback_size = h * 1.15
+                    font_size = float(element.get("size", fallback_size))
+
+                    font_code = str(element.get("font", "tiro")).lower()
+                    valid_pdf_fonts = ["helv", "hebo", "tiro", "tibo", "cour", "cobo", "symb", "zadb"]
+                    if font_code not in valid_pdf_fonts:
+                        font_code = "tiro"
+
                     text_color_hex = element.get("text_color", "#000000")
                     color_rgb = hex_to_rgb(text_color_hex)
-                    rect = fitz.Rect(x0, y0, x0 + w, y0 + h)
+
+                    # Create an intentionally expanded rect for rendering.
+                    # If the rect is too tight, PyMuPDF will shrink the text to force fit it.
+                    expanded_render_rect = fitz.Rect(x0, y0 - (h * 0.1), x0 + w + 20, y0 + h * 1.5)
 
                     rc = page.insert_textbox(
-                        rect,
+                        expanded_render_rect,
                         text_val,
                         fontsize=font_size,
-                        fontname="helv",
+                        fontname=font_code,
                         color=color_rgb,
                         align=0,
                     )
@@ -416,7 +521,7 @@ def compile_document(original_pdf_path: str, output_pdf_path: str, pages_json_pa
                             fitz.Point(x0, y0 + h * 0.85),
                             text_val,
                             fontsize=font_size,
-                            fontname="helv",
+                            fontname=font_code,
                             color=color_rgb,
                         )
                 except (ValueError, TypeError, fitz.FitzError) as e:
