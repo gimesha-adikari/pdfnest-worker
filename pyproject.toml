@@ -23,4 +23,5 @@ dependencies = [
   "pydantic>=2.13.4",
   "boto3>=1.43.51",
   "boto3-stubs>=1.43.51",
+  "requests>=2.34.2",
 ]

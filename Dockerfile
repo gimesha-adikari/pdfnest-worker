@@ -7,12 +7,12 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     UV_PROJECT_ENVIRONMENT=/opt/venv \
     PATH="/opt/venv/bin:${PATH}" \
-    PORT=8000
+    PORT=8000 \
+    TESSDATA_PREFIX=/usr/share/tesseract-ocr/5/tessdata
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     ca-certificates \
-    curl \
     tesseract-ocr \
     ghostscript \
     poppler-utils \
@@ -39,8 +39,10 @@ RUN uv sync --frozen --no-dev --no-install-project
 
 COPY . .
 
+COPY .cache/tesseract/tessdata/ ${TESSDATA_PREFIX}/
+
 RUN useradd --system --uid 10001 --create-home appuser && \
-    chown -R appuser:appuser /app /opt/venv
+    chown -R appuser:appuser /app /opt/venv /usr/share/tesseract-ocr/5/tessdata
 
 USER appuser
 
