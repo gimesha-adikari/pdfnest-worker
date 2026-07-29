@@ -4,6 +4,7 @@ import os
 import re
 import subprocess
 import tempfile
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Sequence
@@ -12,9 +13,19 @@ import pymupdf as fitz
 import pytesseract
 from PIL import Image, ImageOps
 
+from app.core.storage import download_to_path
+
 _LANG_TOKEN_RE = re.compile(r"^[A-Za-z0-9_+-]+$")
 _DEFAULT_TESSDATA_PREFIX = "/usr/share/tesseract-ocr/5/tessdata"
 _DEFAULT_PSM = "6"  # Better for dense printed pages than psm 1
+
+
+@dataclass(frozen=True)
+class R2ImageRef:
+    key: str
+    name: str = ""
+    content_type: str = ""
+    size: int = 0
 
 
 def _get_tessdata_prefix() -> Path:
@@ -188,7 +199,6 @@ def extract_text_from_pdf(
                 ocr_text = page_to_ocr_text(page, lang=lang)
                 if ocr_text.strip():
                     out.write(f"--- START OF PAGE {i + 1} ---\n")
-                    out.write(f"--- START OF PAGE {i + 1} ---\n")
                     out.write(ocr_text.rstrip() + "\n")
                     out.write("--- END OF PAGE ---\n\n")
     finally:
@@ -305,6 +315,35 @@ def build_searchable_pdf_from_images(
         out_doc.save(output_path, garbage=4, clean=True, deflate=True)
     finally:
         out_doc.close()
+
+
+def build_searchable_pdf_from_r2_images(
+        image_refs: Sequence[R2ImageRef],
+        output_path: str,
+        lang: str = "eng",
+) -> None:
+    lang = normalize_lang_spec(lang)
+    validate_lang_spec(lang)
+
+    if not image_refs:
+        raise ValueError("no images provided")
+
+    with tempfile.TemporaryDirectory(prefix="pdfnest-ocr-r2-") as tmpdir:
+        tmpdir_path = Path(tmpdir)
+        temp_paths: list[str] = []
+
+        for index, ref in enumerate(image_refs, start=1):
+            key = (ref.key or "").strip()
+            if not key:
+                raise ValueError(f"missing R2 object key for image #{index}")
+
+            suffix = safe_suffix(ref.name or ref.key, ".img")
+            local_path = tmpdir_path / f"image-{index:03d}{suffix}"
+
+            download_to_path(key, str(local_path))
+            temp_paths.append(str(local_path))
+
+        build_searchable_pdf_from_images(temp_paths, output_path, lang=lang)
 
 
 def safe_suffix(filename: str | None, fallback: str = ".bin") -> str:

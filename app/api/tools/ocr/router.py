@@ -4,15 +4,17 @@ import logging
 import os
 import shutil
 import tempfile
-import traceback
 from pathlib import Path
 
 from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
+from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
 from .document import (
+    R2ImageRef,
     build_searchable_pdf_from_images,
+    build_searchable_pdf_from_r2_images,
     extract_text_from_pdf,
     get_installed_tesseract_languages,
     normalize_lang_spec,
@@ -22,6 +24,21 @@ from .languages import language_name
 
 router = APIRouter(prefix="/api/v1/ocr", tags=["ocr"])
 logger = logging.getLogger(__name__)
+
+
+class OCRR2Image(BaseModel):
+    key: str = Field(..., min_length=1)
+    name: str = ""
+    type: str = ""
+    size: int = 0
+
+
+class OCRR2JobRequest(BaseModel):
+    tool: str = "image_to_text_pdf"
+    lang: str = "eng"
+    sessionId: str | None = None
+    files: list[OCRR2Image] = Field(default_factory=list)
+
 
 def _cleanup_paths(*paths: str) -> None:
     for path in paths:
@@ -112,7 +129,7 @@ async def extract_text_from_pdf_route(
 
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-    except Exception as exc:
+    except Exception:
         logger.exception("OCR failed")
         raise
     finally:
@@ -178,3 +195,53 @@ async def images_to_searchable_pdf_route(
                 os.remove(path)
             except FileNotFoundError:
                 pass
+
+
+@router.post("/to-text-pdf-r2")
+async def images_to_searchable_pdf_from_r2_route(
+        background_tasks: BackgroundTasks,
+        payload: OCRR2JobRequest,
+):
+    if not payload.files:
+        raise HTTPException(status_code=400, detail="No images provided")
+
+    output_fd, output_path = tempfile.mkstemp(
+        prefix="pdfnest-ocr-out-",
+        suffix=".pdf",
+    )
+    os.close(output_fd)
+
+    try:
+        lang = normalize_lang_spec(payload.lang)
+
+        refs = [
+            R2ImageRef(
+                key=item.key,
+                name=item.name,
+                content_type=item.type,
+                size=item.size,
+            )
+            for item in payload.files
+        ]
+
+        await run_in_threadpool(
+            build_searchable_pdf_from_r2_images,
+            refs,
+            output_path,
+            lang,
+        )
+
+        background_tasks.add_task(os.remove, output_path)
+
+        return FileResponse(
+            output_path,
+            filename="ocr_searchable.pdf",
+            media_type="application/pdf",
+            background=background_tasks,
+        )
+
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.exception("Searchable PDF generation from R2 failed")
+        raise HTTPException(status_code=500, detail=str(exc))
