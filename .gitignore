@@ -17,3 +17,4 @@ __pycache__/
 /.env.rendar
 /.env.deploy
 /run_dev.sh
+/txt/

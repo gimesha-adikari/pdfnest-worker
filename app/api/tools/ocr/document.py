@@ -1,4 +1,3 @@
-# file: app/api/tools/ocr/document.py
 from __future__ import annotations
 
 import os
@@ -15,33 +14,11 @@ from PIL import Image, ImageOps
 
 _LANG_TOKEN_RE = re.compile(r"^[A-Za-z0-9_+-]+$")
 _DEFAULT_TESSDATA_PREFIX = "/usr/share/tesseract-ocr/5/tessdata"
+_DEFAULT_PSM = "6"  # Better for dense printed pages than psm 1
 
 
 def _get_tessdata_prefix() -> Path:
     return Path(os.environ.get("TESSDATA_PREFIX", _DEFAULT_TESSDATA_PREFIX)).expanduser()
-
-
-def _require_pdf_support(tessdata_prefix: Path) -> None:
-    pdf_config = tessdata_prefix / "configs" / "pdf"
-    pdf_font = tessdata_prefix / "pdf.ttf"
-
-    if not tessdata_prefix.exists():
-        raise RuntimeError(
-            f"Tesseract tessdata directory not found: {tessdata_prefix}. "
-            f"Set TESSDATA_PREFIX correctly or install the tessdata files."
-        )
-
-    if not pdf_config.is_file():
-        raise RuntimeError(
-            f"Tesseract PDF config not found: {pdf_config}. "
-            f"Your tessdata directory must include configs/pdf for searchable PDF output."
-        )
-
-    if not pdf_font.is_file():
-        raise RuntimeError(
-            f"Tesseract PDF font not found: {pdf_font}. "
-            f"Your tessdata directory must include pdf.ttf for searchable PDF output."
-        )
 
 
 def normalize_tesseract_lang_code(raw: str) -> str:
@@ -173,6 +150,7 @@ def page_to_ocr_text(page: fitz.Page, lang: str = "eng", dpi: int = 300) -> str:
 
     zoom = float(dpi) / 72.0
     pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+
     image = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
     if image.mode != "RGB":
         image = image.convert("RGB")
@@ -180,7 +158,7 @@ def page_to_ocr_text(page: fitz.Page, lang: str = "eng", dpi: int = 300) -> str:
     return pytesseract.image_to_string(
         image,
         lang=lang,
-        config="--oem 1 --psm 1",
+        config=f"--oem 1 --psm {_DEFAULT_PSM}",
     )
 
 
@@ -210,6 +188,7 @@ def extract_text_from_pdf(
                 ocr_text = page_to_ocr_text(page, lang=lang)
                 if ocr_text.strip():
                     out.write(f"--- START OF PAGE {i + 1} ---\n")
+                    out.write(f"--- START OF PAGE {i + 1} ---\n")
                     out.write(ocr_text.rstrip() + "\n")
                     out.write("--- END OF PAGE ---\n\n")
     finally:
@@ -220,8 +199,8 @@ def _image_to_searchable_pdf_bytes(image_path: str, lang: str = "eng") -> bytes:
     """
     Generate searchable PDF bytes using the Tesseract CLI.
 
-    This requires a complete tessdata directory that includes:
-      - traineddata files
+    This expects a complete tessdata directory that includes:
+      - *.traineddata
       - configs/pdf
       - pdf.ttf
     """
@@ -229,7 +208,19 @@ def _image_to_searchable_pdf_bytes(image_path: str, lang: str = "eng") -> bytes:
     validate_lang_spec(lang)
 
     tessdata_prefix = _get_tessdata_prefix()
-    _require_pdf_support(tessdata_prefix)
+
+    pdf_config = tessdata_prefix / "configs" / "pdf"
+    pdf_font = tessdata_prefix / "pdf.ttf"
+    if not pdf_config.is_file():
+        raise RuntimeError(
+            f"Missing Tesseract PDF config: {pdf_config}. "
+            "Your tessdata directory must include configs/pdf."
+        )
+    if not pdf_font.is_file():
+        raise RuntimeError(
+            f"Missing Tesseract PDF font: {pdf_font}. "
+            "Your tessdata directory must include pdf.ttf."
+        )
 
     with tempfile.TemporaryDirectory(prefix="pdfnest-ocr-") as tmpdir:
         tmpdir_path = Path(tmpdir)
@@ -238,7 +229,7 @@ def _image_to_searchable_pdf_bytes(image_path: str, lang: str = "eng") -> bytes:
 
         with Image.open(image_path) as img:
             img = ImageOps.exif_transpose(img).convert("RGB")
-            img.save(input_file, "PNG")
+            img.save(input_file, "PNG", dpi=(300, 300))
 
         cmd = [
             "tesseract",
@@ -249,7 +240,7 @@ def _image_to_searchable_pdf_bytes(image_path: str, lang: str = "eng") -> bytes:
             "--oem",
             "1",
             "--psm",
-            "1",
+            _DEFAULT_PSM,
             "pdf",
         ]
 
