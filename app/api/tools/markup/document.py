@@ -1,3 +1,4 @@
+# file: app/api/tools/markup/document.py
 from __future__ import annotations
 
 from typing import Callable, Literal
@@ -5,7 +6,6 @@ from typing import Callable, Literal
 import fitz
 
 from app.api.tools.editor.document import group_words_by_line, ocr_words_for_page, sample_background_hex
-
 from .utils import native_words_in_rect, normalize_hex, open_document
 
 
@@ -13,7 +13,12 @@ MarkupAction = Literal["highlight", "underline", "strikeout"]
 MarkupMode = Literal["manual", "smart", "text", "ocr"]
 
 
-def _draw_highlight_rect(page: fitz.Page, rect: fitz.Rect, color: tuple[float, float, float], opacity: float = 0.35) -> None:
+def _draw_highlight_rect(
+        page: fitz.Page,
+        rect: fitz.Rect,
+        color: tuple[float, float, float],
+        opacity: float = 0.35,
+) -> None:
     shape = page.new_shape()
     shape.draw_rect(rect)
     shape.finish(color=None, fill=color, fill_opacity=opacity, width=0)
@@ -85,17 +90,34 @@ def _underline_words(page: fitz.Page, word_items: list[dict], color: tuple[float
 
 
 def _selection_word_items(page: fitz.Page, selection_rect: fitz.Rect, mode: MarkupMode) -> list[dict]:
-    mode = (mode or "smart").strip().lower()  # type: ignore[assignment]
+    mode = (mode or "smart").strip().lower()
 
-    if mode in ("text", "smart"):
+    if mode == "text":
+        return native_words_in_rect(page, selection_rect)
+
+    if mode == "ocr":
+        ocr_items, _ = ocr_words_for_page(page)
+        return [
+            item
+            for item in ocr_items
+            if isinstance(item, dict)
+               and "rect" in item
+               and item["rect"].intersects(selection_rect)
+        ]
+
+    if mode == "smart":
         native = native_words_in_rect(page, selection_rect)
         if native:
             return native
-        return []
 
-    if mode == "ocr":
-        ocr_items = ocr_words_for_page(page)
-        return [item for item in ocr_items if item["rect"].intersects(selection_rect)]
+        ocr_items, _ = ocr_words_for_page(page)
+        return [
+            item
+            for item in ocr_items
+            if isinstance(item, dict)
+               and "rect" in item
+               and item["rect"].intersects(selection_rect)
+        ]
 
     return []
 
@@ -108,7 +130,7 @@ def apply_markup(
         progress_callback: Callable[[int, int], None] | None = None,
 ) -> None:
     total = max(1, len(boxes))
-    mode = (mode or "smart").strip().lower()  # type: ignore[assignment]
+    mode = (mode or "smart").strip().lower()
 
     for index, box in enumerate(boxes, start=1):
         page_num = int(box.get("page", 0))
