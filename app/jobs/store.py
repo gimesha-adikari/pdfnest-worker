@@ -44,6 +44,18 @@ def create_job(
     return job
 
 
+def prune_expired_job_index() -> None:
+    """
+    Removes job IDs from pdfnest:jobs:index created older than JOB_TTL_SECONDS (24h).
+    Executed opportunistically during save_job and list_jobs to prevent memory growth.
+    """
+    try:
+        cutoff = utcnow().timestamp() - settings.job_ttl_seconds
+        redis_client.zremrangebyscore(JOB_INDEX_KEY, "-inf", cutoff)
+    except Exception:
+        pass
+
+
 def save_job(job: JobRecord) -> None:
     job.updated_at = utcnow()
     redis_client.set(
@@ -52,6 +64,7 @@ def save_job(job: JobRecord) -> None:
         ex=settings.job_ttl_seconds,
     )
     redis_client.zadd(JOB_INDEX_KEY, {job.id: job.created_at.timestamp()})
+    prune_expired_job_index()
 
 
 def get_job(job_id: str) -> JobRecord | None:
@@ -65,6 +78,7 @@ def list_jobs(limit: int = 50) -> list[JobRecord]:
     if limit <= 0:
         return []
 
+    prune_expired_job_index()
     job_ids = redis_client.zrevrange(JOB_INDEX_KEY, 0, limit - 1)
     jobs: list[JobRecord] = []
 

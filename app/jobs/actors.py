@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import dramatiq
+import pymupdf as fitz
 
 from app.api.tools.editor.document import compile_document, extract_document
 from app.api.tools.editor.utils import cleanup_paths, temp_file_path
@@ -15,6 +17,23 @@ from app.core.broker import broker  # noqa: F401
 from app.core.storage import build_key, download_to_path, upload_path
 from app.jobs.models import JobState
 from app.jobs.store import get_job, update_job
+
+logger = logging.getLogger(__name__)
+
+NON_RETRYABLE_ERRORS = (
+    fitz.FileDataError,
+    fitz.EmptyFileError,
+)
+
+
+def is_non_retryable_error(exc: Exception) -> bool:
+    """
+    Returns True if the exception represents a verified permanent PDF input error.
+    Strictly limited to PyMuPDF's native FileDataError (corrupt/password) and EmptyFileError (0 bytes).
+    Generic ValueError or RuntimeError exceptions are NOT classified as non-retryable to prevent
+    silently suppressing unexpected internal/programming errors.
+    """
+    return isinstance(exc, NON_RETRYABLE_ERRORS)
 
 
 @dramatiq.actor(queue_name="default", max_retries=3)
@@ -102,6 +121,9 @@ def editor_extract_job(
             error=str(exc),
             message="Editor extraction failed",
         )
+        if is_non_retryable_error(exc):
+            logger.warning("Non-retryable PDF error in job %s: %s", job_id, exc)
+            return
         raise
     finally:
         cleanup_paths(input_path)
@@ -161,6 +183,9 @@ def editor_compile_job(
             error=str(exc),
             message="Editor compile failed",
         )
+        if is_non_retryable_error(exc):
+            logger.warning("Non-retryable PDF error in job %s: %s", job_id, exc)
+            return
         raise
     finally:
         cleanup_paths(input_path, pages_json_path, output_pdf_path)
@@ -259,6 +284,9 @@ def _run_markup_job(
             error=str(exc),
             message=f"{action.title()} job failed",
         )
+        if is_non_retryable_error(exc):
+            logger.warning("Non-retryable PDF error in markup job %s: %s", job_id, exc)
+            return
         raise
     finally:
         cleanup_paths(input_path, payload_path, output_pdf_path)
