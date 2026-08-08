@@ -35,9 +35,13 @@ ALLOWED_ORIGINS = [
 ]
 
 
+from app.core.janitor import start_worker_janitor
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print(f"[{APP_NAME}] starting in {APP_ENV} mode")
+    start_worker_janitor()
     yield
     print(f"[{APP_NAME}] shutting down")
 

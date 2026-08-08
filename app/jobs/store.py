@@ -74,6 +74,13 @@ def save_job(job: JobRecord) -> None:
                         if existing.status != job.status:
                             pipe.unwatch()
                             return
+
+                    # Preserve cancellation request state (queued/running -> cancel_requested -> cancelled)
+                    if existing.cancel_requested or existing.status == JobState.cancel_requested:
+                        if job.status not in (JobState.cancelled, JobState.cancel_requested):
+                            job.cancel_requested = True
+                            job.status = JobState.cancel_requested
+
                     # Monotonic progress check for running -> running
                     if existing.status == JobState.running and job.status == JobState.running:
                         if job.progress < existing.progress:
@@ -91,11 +98,10 @@ def save_job(job: JobRecord) -> None:
 
 
 def get_job(job_id: str) -> JobRecord | None:
-    key = job_key(job_id)
-    raw = redis_client.get(key)
-    if not raw:
+    key = redis_client.get(job_key(job_id))
+    if not key:
         return None
-    job = JobRecord.model_validate_json(raw)
+    job = JobRecord.model_validate_json(key)
 
     if job.status == JobState.running and job.status not in TERMINAL_STATES:
         elapsed = (utcnow() - job.updated_at).total_seconds()
@@ -103,8 +109,9 @@ def get_job(job_id: str) -> JobRecord | None:
             with redis_client.pipeline() as pipe:
                 while True:
                     try:
-                        pipe.watch(key)
-                        current_raw = pipe.get(key)
+                        k = job_key(job_id)
+                        pipe.watch(k)
+                        current_raw = pipe.get(k)
                         if not current_raw:
                             pipe.unwatch()
                             return None
@@ -121,7 +128,7 @@ def get_job(job_id: str) -> JobRecord | None:
                             current_job.updated_at = utcnow()
 
                             pipe.multi()
-                            pipe.set(key, current_job.model_dump_json(), ex=settings.job_ttl_seconds)
+                            pipe.set(k, current_job.model_dump_json(), ex=settings.job_ttl_seconds)
                             pipe.execute()
                             return current_job
                         else:
@@ -186,20 +193,22 @@ def update_job(
     return job
 
 
-def request_cancel(job_id: str) -> JobRecord | None:
+def request_cancel(job_id: str, owner_identity: str | None = None) -> JobRecord | None:
     job = get_job(job_id)
     if job is None:
         return None
+
+    if owner_identity and owner_identity.strip():
+        job_owner = (job.payload or {}).get("ownerIdentity") or ""
+        if job_owner and job_owner.strip() and job_owner.strip() != owner_identity.strip():
+            raise PermissionError("You are not authorized to cancel this job")
 
     if job.status in TERMINAL_STATES:
         return job
 
     job.cancel_requested = True
-    if job.status == JobState.queued:
-        job.status = JobState.cancel_requested
-        job.message = "Cancellation requested"
-    else:
-        job.message = "Cancellation requested"
+    job.status = JobState.cancel_requested
+    job.message = "Cancellation requested"
 
     save_job(job)
     return job

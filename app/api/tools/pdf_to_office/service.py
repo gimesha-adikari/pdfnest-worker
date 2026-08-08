@@ -7,6 +7,7 @@ from fastapi import HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from starlette.background import BackgroundTask
 
+from app.core.disk import check_disk_space
 from .converters import convert_to_excel, convert_to_powerpoint, convert_to_word
 from .models import OfficeOutputFormat
 from .utils import cleanup_paths, create_temp_paths
@@ -15,6 +16,10 @@ from .utils import cleanup_paths, create_temp_paths
 class OfficeConversionService:
     @staticmethod
     async def convert(format: OfficeOutputFormat, file: UploadFile) -> FileResponse:
+        file_size = getattr(file, "size", 0) or 10 * 1024 * 1024
+        required_bytes = (file_size * 5) + (50 * 1024 * 1024)
+        check_disk_space(required_bytes)
+
         temp_paths = create_temp_paths(f".{format}")
         input_path = temp_paths.input_path
         output_path = temp_paths.output_path

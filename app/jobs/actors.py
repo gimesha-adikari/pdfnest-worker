@@ -16,6 +16,7 @@ from app.api.tools.editor.utils import cleanup_paths, temp_file_path
 from app.api.tools.markup.document import process_markup_pdf
 from app.core.broker import broker  # noqa: F401
 from app.core.storage import build_key, download_to_path, upload_path
+from app.jobs.cancellation import JobCancelledException, check_cancellation
 from app.jobs.limiter import acquire_lease, release_lease
 from app.jobs.models import JobState
 from app.jobs.store import get_job, update_job
@@ -43,6 +44,8 @@ def test_job(job_id: str, payload: dict[str, Any] | None = None) -> None:
     job = get_job(job_id)
     if job is None:
         return
+
+    check_cancellation(job_id)
 
     update_job(
         job_id,
@@ -88,6 +91,13 @@ def editor_extract_job(
     if job is None:
         return
 
+    try:
+        check_cancellation(job_id)
+    except JobCancelledException as exc:
+        logger.info("Editor extract job %s cancelled before start: %s", job_id, exc)
+        update_job(job_id, status=JobState.cancelled, finished_at=datetime.now(timezone.utc), message="Job cancelled")
+        return
+
     owner_identity = (job.payload or {}).get("ownerIdentity") or "guest:anonymous"
     acquired, reason = acquire_lease(job_id, owner_identity)
     if not acquired:
@@ -106,8 +116,11 @@ def editor_extract_job(
     )
 
     try:
+        check_cancellation(job_id)
         download_to_path(source_key, input_path)
-        result = extract_document(input_path, password)
+        check_cancellation(job_id)
+        result = extract_document(input_path, password, cancellation_check=lambda: check_cancellation(job_id))
+        check_cancellation(job_id)
 
         if isinstance(result, dict):
             result["source_tracker"] = source_key
@@ -121,6 +134,15 @@ def editor_extract_job(
             result=result,
             message="Editor extraction completed",
         )
+    except JobCancelledException as exc:
+        logger.info("Editor extract job %s cancelled: %s", job_id, exc)
+        update_job(
+            job_id,
+            status=JobState.cancelled,
+            finished_at=datetime.now(timezone.utc),
+            message="Editor extraction cancelled",
+        )
+        return
     except Exception as exc:
         update_job(
             job_id,
@@ -149,6 +171,13 @@ def editor_compile_job(
     if job is None:
         return
 
+    try:
+        check_cancellation(job_id)
+    except JobCancelledException as exc:
+        logger.info("Editor compile job %s cancelled before start: %s", job_id, exc)
+        update_job(job_id, status=JobState.cancelled, finished_at=datetime.now(timezone.utc), message="Job cancelled")
+        return
+
     owner_identity = (job.payload or {}).get("ownerIdentity") or "guest:anonymous"
     acquired, reason = acquire_lease(job_id, owner_identity)
     if not acquired:
@@ -169,10 +198,13 @@ def editor_compile_job(
     )
 
     try:
+        check_cancellation(job_id)
         download_to_path(source_key, input_path)
         download_to_path(pages_json_key, pages_json_path)
+        check_cancellation(job_id)
 
-        compile_document(input_path, output_pdf_path, pages_json_path)
+        compile_document(input_path, output_pdf_path, pages_json_path, cancellation_check=lambda: check_cancellation(job_id))
+        check_cancellation(job_id)
 
         output_key = build_key("jobs/editor/output", suffix=".pdf")
         upload_path(output_pdf_path, output_key, content_type="application/pdf")
@@ -190,6 +222,15 @@ def editor_compile_job(
             },
             message="Editor compile completed",
         )
+    except JobCancelledException as exc:
+        logger.info("Editor compile job %s cancelled: %s", job_id, exc)
+        update_job(
+            job_id,
+            status=JobState.cancelled,
+            finished_at=datetime.now(timezone.utc),
+            message="Editor compile cancelled",
+        )
+        return
     except Exception as exc:
         update_job(
             job_id,
@@ -233,6 +274,13 @@ def _run_markup_job(
     if job is None:
         return
 
+    try:
+        check_cancellation(job_id)
+    except JobCancelledException as exc:
+        logger.info("Markup job %s cancelled before start: %s", job_id, exc)
+        update_job(job_id, status=JobState.cancelled, finished_at=datetime.now(timezone.utc), message="Job cancelled")
+        return
+
     owner_identity = (job.payload or {}).get("ownerIdentity") or "guest:anonymous"
     acquired, reason = acquire_lease(job_id, owner_identity)
     if not acquired:
@@ -253,8 +301,10 @@ def _run_markup_job(
     )
 
     try:
+        check_cancellation(job_id)
         download_to_path(source_key, input_path)
         download_to_path(payload_key, payload_path)
+        check_cancellation(job_id)
 
         with open(payload_path, "r", encoding="utf-8") as f:
             payload = json.load(f)
@@ -264,6 +314,7 @@ def _run_markup_job(
         file_password = payload.get("file_password")
 
         def on_progress(done: int, total: int) -> None:
+            check_cancellation(job_id)
             progress = int((done / max(1, total)) * 100)
             update_job(
                 job_id,
@@ -280,6 +331,7 @@ def _run_markup_job(
             password=file_password,
             progress_callback=on_progress,
         )
+        check_cancellation(job_id)
 
         output_key = build_key(f"jobs/markup/{action}/output", suffix=".pdf")
         upload_path(output_pdf_path, output_key, content_type="application/pdf")
@@ -298,6 +350,15 @@ def _run_markup_job(
             },
             message=f"{action.title()} job completed",
         )
+    except JobCancelledException as exc:
+        logger.info("Markup job %s cancelled: %s", job_id, exc)
+        update_job(
+            job_id,
+            status=JobState.cancelled,
+            finished_at=datetime.now(timezone.utc),
+            message=f"{action.title()} job cancelled",
+        )
+        return
     except Exception as exc:
         update_job(
             job_id,

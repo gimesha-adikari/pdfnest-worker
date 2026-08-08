@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Body, HTTPException
+from fastapi import APIRouter, Body, Header, HTTPException
 
 from app.jobs.actors import (
     test_job,
@@ -53,8 +53,11 @@ def read_job(job_id: str) -> JobRecord:
 
 
 @router.post("/{job_id}/cancel", response_model=JobRecord)
-def cancel_job(job_id: str) -> JobRecord:
-    job = request_cancel(job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail="Job not found")
-    return job
+def cancel_job(job_id: str, x_owner_identity: str | None = Header(None)) -> JobRecord:
+    try:
+        job = request_cancel(job_id, owner_identity=x_owner_identity)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Job not found")
+        return job
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))

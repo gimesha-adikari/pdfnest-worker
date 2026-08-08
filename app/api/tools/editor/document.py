@@ -4,7 +4,7 @@ import logging
 import re
 from contextlib import suppress
 from statistics import median
-from typing import Any, Tuple
+from typing import Any, Callable, Tuple
 
 import pymupdf as fitz
 import pytesseract
@@ -189,6 +189,7 @@ def is_valid_ocr_word(text: str, conf: float) -> bool:
 def ocr_words_for_page(page: fitz.Page, zoom: float = 2.0, lang: str = "eng") -> Tuple[list[dict[str, Any]], Image.Image]:
     pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
     image = pixmap_to_image(pix)
+    del pix
 
     data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT, lang=lang)
     items: list[dict[str, Any]] = []
@@ -363,6 +364,8 @@ def extract_ocr_page(page: fitz.Page, page_number: int) -> dict[str, Any]:
         })
 
     elements = deduplicate_elements(elements)
+    page_image.close()
+    del page_image
 
     return {
         "page_num": page_number,
@@ -378,7 +381,11 @@ def extract_ocr_page(page: fitz.Page, page_number: int) -> dict[str, Any]:
     }
 
 
-def extract_document(input_path: str, password: str | None = None) -> dict[str, Any]:
+def extract_document(
+    input_path: str,
+    password: str | None = None,
+    cancellation_check: Callable[[], None] | None = None,
+) -> dict[str, Any]:
     with fitz.open(input_path) as doc:
         if doc.needs_pass:
             if not password:
@@ -388,6 +395,8 @@ def extract_document(input_path: str, password: str | None = None) -> dict[str, 
 
         pages: list[dict[str, Any]] = []
         for i in range(doc.page_count):
+            if cancellation_check is not None:
+                cancellation_check()
             page = doc[i]
             if len(page.get_text("words") or []) > 0:
                 pages.append(extract_native_page(page, i + 1))
@@ -397,7 +406,12 @@ def extract_document(input_path: str, password: str | None = None) -> dict[str, 
         return {"success": True, "pages": pages}
 
 
-def compile_document(original_pdf_path: str, output_pdf_path: str, pages_json_path: str) -> None:
+def compile_document(
+    original_pdf_path: str,
+    output_pdf_path: str,
+    pages_json_path: str,
+    cancellation_check: Callable[[], None] | None = None,
+) -> None:
     with open(pages_json_path, "r", encoding="utf-8") as f:
         layout_data = json.load(f)
 
@@ -405,6 +419,8 @@ def compile_document(original_pdf_path: str, output_pdf_path: str, pages_json_pa
 
     with fitz.open(original_pdf_path) as doc:
         for page_idx, page_data in enumerate(pages):
+            if cancellation_check is not None:
+                cancellation_check()
             if page_idx >= len(doc):
                 continue
 

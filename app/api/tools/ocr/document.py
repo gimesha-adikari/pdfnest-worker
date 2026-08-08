@@ -15,6 +15,7 @@ import pytesseract
 from PIL import Image, ImageOps
 
 from app.core.storage import download_to_path
+from app.core.subprocess_runner import run_hardened_subprocess
 
 _LANG_TOKEN_RE = re.compile(r"^[A-Za-z0-9_+-]+$")
 _DEFAULT_TESSDATA_PREFIX = "/usr/share/tesseract-ocr/5/tessdata"
@@ -618,14 +619,11 @@ def _image_to_searchable_pdf_bytes(image_path: str, lang: str = "eng") -> bytes:
         env.setdefault("TESSDATA_PREFIX", str(tessdata_prefix))
 
         try:
-            result = subprocess.run(
+            result = run_hardened_subprocess(
                 cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
                 env=env,
                 cwd=str(tmpdir_path),
-                timeout=300,
+                timeout=300.0,
             )
         except subprocess.TimeoutExpired as exc:
             raise ValueError("Tesseract OCR execution timed out after 5 minutes") from exc
