@@ -56,7 +56,7 @@ def test_job(job_id: str, payload: dict[str, Any] | None = None) -> None:
         raise
 
 
-@dramatiq.actor(queue_name="editor", max_retries=3)
+@dramatiq.actor(queue_name="editor", max_retries=3, time_limit=600_000)
 def editor_extract_job(
         job_id: str,
         source_key: str,
@@ -107,7 +107,7 @@ def editor_extract_job(
         cleanup_paths(input_path)
 
 
-@dramatiq.actor(queue_name="editor", max_retries=3)
+@dramatiq.actor(queue_name="editor", max_retries=3, time_limit=600_000)
 def editor_compile_job(
         job_id: str,
         source_key: str,
@@ -166,17 +166,17 @@ def editor_compile_job(
         cleanup_paths(input_path, pages_json_path, output_pdf_path)
 
 
-@dramatiq.actor(queue_name="markup", max_retries=3)
+@dramatiq.actor(queue_name="markup", max_retries=3, time_limit=900_000)
 def markup_highlight_job(job_id: str, source_key: str, payload_key: str, source_name: str | None = None) -> None:
     _run_markup_job(job_id, source_key, payload_key, source_name, action="highlight")
 
 
-@dramatiq.actor(queue_name="markup", max_retries=3)
+@dramatiq.actor(queue_name="markup", max_retries=3, time_limit=900_000)
 def markup_underline_job(job_id: str, source_key: str, payload_key: str, source_name: str | None = None) -> None:
     _run_markup_job(job_id, source_key, payload_key, source_name, action="underline")
 
 
-@dramatiq.actor(queue_name="markup", max_retries=3)
+@dramatiq.actor(queue_name="markup", max_retries=3, time_limit=900_000)
 def markup_strikeout_job(job_id: str, source_key: str, payload_key: str, source_name: str | None = None) -> None:
     _run_markup_job(job_id, source_key, payload_key, source_name, action="strikeout")
 

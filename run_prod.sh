@@ -17,16 +17,12 @@ trap cleanup EXIT INT TERM
 
 export APP_ENV=production
 
-CPU_COUNT=$(( $(nproc) - 1 ))
-
-if [ "$CPU_COUNT" -lt 1 ]; then
-    CPU_COUNT=1
-fi
+PROCESS_COUNT="${DRAMATIQ_PROCESSES:-2}"
 
 echo "======================================"
 echo " Platen PDF Worker"
 echo "======================================"
-echo "CPU Cores : $CPU_COUNT"
+echo "Dramatiq Processes : $PROCESS_COUNT"
 echo
 
 uv run uvicorn app.main:app \
@@ -37,7 +33,7 @@ UVICORN_PID=$!
 sleep 2
 
 uv run dramatiq app.jobs.actors \
-    --processes "$CPU_COUNT" \
+    --processes "$PROCESS_COUNT" \
     --threads 1 &
 DRAMATIQ_PID=$!
 

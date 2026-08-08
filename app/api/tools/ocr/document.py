@@ -617,14 +617,18 @@ def _image_to_searchable_pdf_bytes(image_path: str, lang: str = "eng") -> bytes:
         env = os.environ.copy()
         env.setdefault("TESSDATA_PREFIX", str(tessdata_prefix))
 
-        result = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            env=env,
-            cwd=str(tmpdir_path),
-        )
+        try:
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=env,
+                cwd=str(tmpdir_path),
+                timeout=300,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise ValueError("Tesseract OCR execution timed out after 5 minutes") from exc
 
         pdf_path = output_base.with_suffix(".pdf")
 
