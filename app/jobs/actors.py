@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import dramatiq
+from dramatiq.errors import Retry
 import pymupdf as fitz
 
 from app.api.tools.editor.document import compile_document, extract_document
@@ -15,6 +16,7 @@ from app.api.tools.editor.utils import cleanup_paths, temp_file_path
 from app.api.tools.markup.document import process_markup_pdf
 from app.core.broker import broker  # noqa: F401
 from app.core.storage import build_key, download_to_path, upload_path
+from app.jobs.limiter import acquire_lease, release_lease
 from app.jobs.models import JobState
 from app.jobs.store import get_job, update_job
 
@@ -86,6 +88,12 @@ def editor_extract_job(
     if job is None:
         return
 
+    owner_identity = (job.payload or {}).get("ownerIdentity") or "guest:anonymous"
+    acquired, reason = acquire_lease(job_id, owner_identity)
+    if not acquired:
+        logger.warning("Execution capacity full (%s) for job %s. Retrying...", reason, job_id)
+        raise Retry(message=f"Execution capacity full: {reason}", delay=5000)
+
     input_suffix = Path(source_name or source_key).suffix or ".pdf"
     input_path = temp_file_path(prefix="pdfnest-source-", suffix=input_suffix)
 
@@ -126,6 +134,7 @@ def editor_extract_job(
             return
         raise
     finally:
+        release_lease(job_id, owner_identity)
         cleanup_paths(input_path)
 
 
@@ -139,6 +148,12 @@ def editor_compile_job(
     job = get_job(job_id)
     if job is None:
         return
+
+    owner_identity = (job.payload or {}).get("ownerIdentity") or "guest:anonymous"
+    acquired, reason = acquire_lease(job_id, owner_identity)
+    if not acquired:
+        logger.warning("Execution capacity full (%s) for job %s. Retrying...", reason, job_id)
+        raise Retry(message=f"Execution capacity full: {reason}", delay=5000)
 
     input_suffix = Path(source_name or source_key).suffix or ".pdf"
     input_path = temp_file_path(prefix="pdfnest-source-", suffix=input_suffix)
@@ -188,6 +203,7 @@ def editor_compile_job(
             return
         raise
     finally:
+        release_lease(job_id, owner_identity)
         cleanup_paths(input_path, pages_json_path, output_pdf_path)
 
 
@@ -216,6 +232,12 @@ def _run_markup_job(
     job = get_job(job_id)
     if job is None:
         return
+
+    owner_identity = (job.payload or {}).get("ownerIdentity") or "guest:anonymous"
+    acquired, reason = acquire_lease(job_id, owner_identity)
+    if not acquired:
+        logger.warning("Execution capacity full (%s) for job %s. Retrying...", reason, job_id)
+        raise Retry(message=f"Execution capacity full: {reason}", delay=5000)
 
     input_suffix = Path(source_name or source_key).suffix or ".pdf"
     input_path = temp_file_path(prefix="pdfnest-source-", suffix=input_suffix)
@@ -289,4 +311,5 @@ def _run_markup_job(
             return
         raise
     finally:
+        release_lease(job_id, owner_identity)
         cleanup_paths(input_path, payload_path, output_pdf_path)
