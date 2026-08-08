@@ -1,3 +1,4 @@
+from datetime import timedelta
 import fitz
 import pytest
 from app.jobs.actors import (
@@ -9,7 +10,7 @@ from app.jobs.actors import (
     markup_underline_job,
 )
 from app.jobs.models import JobState
-from app.jobs.store import create_job, get_job, prune_expired_job_index, save_job
+from app.jobs.store import create_job, get_job, prune_expired_job_index, save_job, update_job, utcnow
 from app.core.redis import redis_client
 
 
@@ -29,7 +30,6 @@ def test_is_non_retryable_error_classification():
     assert is_non_retryable_error(ValueError("Password required")) is False
     assert is_non_retryable_error(RuntimeError("Invalid state")) is False
     assert is_non_retryable_error(OSError("Disk full")) is False
-    assert is_non_retryable_error(ConnectionError("R2 socket closed")) is False
     assert is_non_retryable_error(ConnectionError("R2 socket closed")) is False
 
 
@@ -52,3 +52,50 @@ def test_job_index_pruning():
     # Verify active job was preserved
     active_score = redis_client.zscore("pdfnest:jobs:index", job.id)
     assert active_score is not None
+
+
+def test_stale_job_detection_on_read():
+    job = create_job("test_stale")
+    job.status = JobState.running
+    job.updated_at = utcnow() - timedelta(minutes=25)
+    redis_client.set(f"pdfnest:jobs:{job.id}", job.model_dump_json(), ex=86400)
+
+    read_job = get_job(job.id)
+    assert read_job is not None
+    assert read_job.status == JobState.failed
+    assert "Worker process terminated unexpectedly" in (read_job.error or "")
+
+
+def test_healthy_long_running_job_not_stale():
+    job = create_job("test_healthy_long")
+    job.status = JobState.running
+    job.updated_at = utcnow() - timedelta(minutes=2)
+    save_job(job)
+
+    read_job = get_job(job.id)
+    assert read_job is not None
+    assert read_job.status == JobState.running
+
+
+def test_terminal_state_immutability():
+    job = create_job("test_terminal")
+    update_job(job.id, status=JobState.failed, error="Initial failure")
+
+    # Late worker attempts to mark succeeded
+    update_job(job.id, status=JobState.succeeded)
+
+    read_job = get_job(job.id)
+    assert read_job is not None
+    assert read_job.status == JobState.failed
+
+
+def test_monotonic_progress():
+    job = create_job("test_monotonic")
+    update_job(job.id, status=JobState.running, progress=60)
+
+    # Attempt to regress progress to 30
+    update_job(job.id, status=JobState.running, progress=30)
+
+    read_job = get_job(job.id)
+    assert read_job is not None
+    assert read_job.progress == 60

@@ -13,6 +13,7 @@ class Settings:
     port: int = int(os.getenv("PORT", "8000"))
     redis_url: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
     job_ttl_seconds: int = int(os.getenv("JOB_TTL_SECONDS", "86400"))
+    stuck_job_timeout_seconds: int = int(os.getenv("STUCK_JOB_TIMEOUT_SECONDS", "1200"))
     allowed_origins: list[str] = field(
         default_factory=lambda: [
             origin.strip()

@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
+from redis.exceptions import WatchError
 
 from app.core.config import settings
 from app.core.redis import redis_client
@@ -58,20 +59,78 @@ def prune_expired_job_index() -> None:
 
 def save_job(job: JobRecord) -> None:
     job.updated_at = utcnow()
-    redis_client.set(
-        job_key(job.id),
-        job.model_dump_json(),
-        ex=settings.job_ttl_seconds,
-    )
-    redis_client.zadd(JOB_INDEX_KEY, {job.id: job.created_at.timestamp()})
+    key = job_key(job.id)
+    ttl = settings.job_ttl_seconds
+
+    with redis_client.pipeline() as pipe:
+        while True:
+            try:
+                pipe.watch(key)
+                raw = pipe.get(key)
+                if raw:
+                    existing = JobRecord.model_validate_json(raw)
+                    # Terminal states are immutable
+                    if existing.status in TERMINAL_STATES:
+                        if existing.status != job.status:
+                            pipe.unwatch()
+                            return
+                    # Monotonic progress check for running -> running
+                    if existing.status == JobState.running and job.status == JobState.running:
+                        if job.progress < existing.progress:
+                            job.progress = existing.progress
+
+                pipe.multi()
+                pipe.set(key, job.model_dump_json(), ex=ttl)
+                pipe.zadd(JOB_INDEX_KEY, {job.id: job.created_at.timestamp()})
+                pipe.execute()
+                break
+            except WatchError:
+                continue
+
     prune_expired_job_index()
 
 
 def get_job(job_id: str) -> JobRecord | None:
-    raw = redis_client.get(job_key(job_id))
+    key = job_key(job_id)
+    raw = redis_client.get(key)
     if not raw:
         return None
-    return JobRecord.model_validate_json(raw)
+    job = JobRecord.model_validate_json(raw)
+
+    if job.status == JobState.running and job.status not in TERMINAL_STATES:
+        elapsed = (utcnow() - job.updated_at).total_seconds()
+        if elapsed > settings.stuck_job_timeout_seconds:
+            with redis_client.pipeline() as pipe:
+                while True:
+                    try:
+                        pipe.watch(key)
+                        current_raw = pipe.get(key)
+                        if not current_raw:
+                            pipe.unwatch()
+                            return None
+                        current_job = JobRecord.model_validate_json(current_raw)
+                        if current_job.status in TERMINAL_STATES:
+                            pipe.unwatch()
+                            return current_job
+
+                        current_elapsed = (utcnow() - current_job.updated_at).total_seconds()
+                        if current_elapsed > settings.stuck_job_timeout_seconds:
+                            current_job.status = JobState.failed
+                            current_job.error = "Worker process terminated unexpectedly or job timed out."
+                            current_job.finished_at = utcnow()
+                            current_job.updated_at = utcnow()
+
+                            pipe.multi()
+                            pipe.set(key, current_job.model_dump_json(), ex=settings.job_ttl_seconds)
+                            pipe.execute()
+                            return current_job
+                        else:
+                            pipe.unwatch()
+                            return current_job
+                    except WatchError:
+                        continue
+
+    return job
 
 
 def list_jobs(limit: int = 50) -> list[JobRecord]:
