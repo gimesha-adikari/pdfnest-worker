@@ -67,6 +67,10 @@ async def root() -> dict[str, Any]:
     }
 
 
+from fastapi.responses import JSONResponse
+import shutil
+import redis
+
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -78,8 +82,43 @@ async def live() -> dict[str, str]:
 
 
 @app.get("/health/ready")
-async def ready() -> dict[str, str]:
-    return {"status": "ready"}
+async def ready() -> JSONResponse:
+    redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+    redis_healthy = False
+    try:
+        r = redis.Redis.from_url(redis_url, socket_connect_timeout=2)
+        redis_healthy = bool(r.ping())
+    except Exception:
+        redis_healthy = False
+
+    binaries = {
+        "tesseract": shutil.which("tesseract") is not None,
+        "ghostscript": shutil.which("gs") is not None,
+        "libreoffice": (
+            shutil.which("soffice") is not None
+            or shutil.which("libreoffice") is not None
+        ),
+    }
+
+    if not redis_healthy:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "not_ready",
+                "redis": False,
+                "binaries": binaries,
+                "reason": "Redis is unreachable",
+            },
+        )
+
+    return JSONResponse(
+        status_code=200,
+        content={
+            "status": "ready",
+            "redis": True,
+            "binaries": binaries,
+        },
+    )
 
 
 app.include_router(jobs_router)

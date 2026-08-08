@@ -82,6 +82,11 @@ async def sign_document(
         )
 
     except Exception as e:
+        if os.path.exists(output_path):
+            try:
+                os.remove(output_path)
+            except OSError:
+                pass
         raise HTTPException(
             status_code=500,
             detail=str(e),
