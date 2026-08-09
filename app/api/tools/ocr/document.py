@@ -1,5 +1,4 @@
-from __future__ import annotations
-
+import logging
 import os
 import re
 import subprocess
@@ -8,14 +7,15 @@ import unicodedata
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence
 
 import pymupdf as fitz
-import pytesseract
 from PIL import Image, ImageOps
 
 from app.core.storage import download_to_path
 from app.core.subprocess_runner import run_hardened_subprocess
+
+logger = logging.getLogger(__name__)
 
 _LANG_TOKEN_RE = re.compile(r"^[A-Za-z0-9_+-]+$")
 _DEFAULT_TESSDATA_PREFIX = "/usr/share/tesseract-ocr/5/tessdata"
@@ -386,34 +386,115 @@ def _lang_spec_from_scripts(scripts: Sequence[str]) -> str:
     return _auto_candidate_lang_specs()[0]
 
 
-def _ocr_text_with_confidence(image: Image.Image, lang: str) -> tuple[str, float]:
-    text = pytesseract.image_to_string(
+def run_hardened_tesseract_ocr(
+        image: Image.Image | str,
+        lang: str = "eng",
+        psm: str = _DEFAULT_PSM,
+        output_format: str = "txt",
+        cancellation_check: Callable[[], None] | None = None,
+        timeout: float = 300.0,
+) -> str | tuple[str, float]:
+    """
+    Executes Tesseract CLI via run_hardened_subprocess in an isolated process group (start_new_session=True).
+    Supports cooperative cancellation via cancellation_check.
+    """
+    tessdata_prefix = _get_tessdata_prefix()
+    env = os.environ.copy()
+    env.setdefault("TESSDATA_PREFIX", str(tessdata_prefix))
+
+    with tempfile.TemporaryDirectory(prefix="pdfnest-ocr-tess-") as tmpdir:
+        tmpdir_path = Path(tmpdir)
+        output_base = tmpdir_path / "tess_out"
+
+        if isinstance(image, str):
+            input_file_path = image
+        else:
+            input_file_path = str(tmpdir_path / "input.png")
+            prepared_img = ImageOps.exif_transpose(image).convert("RGB")
+            prepared_img.save(input_file_path, "PNG", dpi=(300, 300))
+
+        cmd = [
+            "tesseract",
+            input_file_path,
+            str(output_base),
+            "-l",
+            lang,
+            "--oem",
+            "1",
+            "--psm",
+            str(psm),
+            output_format,
+        ]
+
+        logger.info("[OCR SUBPROCESS] Starting Tesseract CLI (format: %s, lang: %s)...", output_format, lang)
+        result = run_hardened_subprocess(
+            cmd,
+            env=env,
+            cwd=str(tmpdir_path),
+            cancellation_check=cancellation_check,
+            timeout=timeout,
+        )
+
+        if result.returncode != 0:
+            logger.error("[OCR SUBPROCESS] Tesseract failed with returncode %d: %s", result.returncode, result.stderr)
+            raise RuntimeError(f"Tesseract OCR failed ({result.returncode}): {result.stderr}")
+
+        if output_format == "txt":
+            out_file = output_base.with_suffix(".txt")
+            if not out_file.exists():
+                return ""
+            return out_file.read_text(encoding="utf-8", errors="replace")
+
+        elif output_format == "tsv":
+            out_file = output_base.with_suffix(".tsv")
+            if not out_file.exists():
+                return "", -1.0
+
+            content = out_file.read_text(encoding="utf-8", errors="replace")
+            lines = content.splitlines()
+            if not lines:
+                return "", -1.0
+
+            text_words: list[str] = []
+            confs: list[float] = []
+
+            for line in lines[1:]:
+                parts = line.split("\t")
+                if len(parts) >= 12:
+                    raw_conf = parts[10]
+                    word_text = parts[11].strip()
+                    try:
+                        conf = float(raw_conf)
+                        if conf >= 0:
+                            confs.append(conf)
+                            if word_text:
+                                text_words.append(word_text)
+                    except ValueError:
+                        pass
+
+            extracted_text = " ".join(text_words)
+            avg_conf = (sum(confs) / len(confs)) if confs else -1.0
+            return extracted_text, avg_conf
+
+        else:
+            raise ValueError(f"Unsupported output format: {output_format}")
+
+
+def _ocr_text_with_confidence(
+        image: Image.Image,
+        lang: str,
+        cancellation_check: Callable[[], None] | None = None,
+) -> tuple[str, float]:
+    result = run_hardened_tesseract_ocr(
         image,
         lang=lang,
-        config=f"--oem 1 --psm {_DEFAULT_PSM}",
+        psm=_DEFAULT_PSM,
+        output_format="tsv",
+        cancellation_check=cancellation_check,
     )
-
-    try:
-        data = pytesseract.image_to_data(
-            image,
-            lang=lang,
-            config=f"--oem 1 --psm {_DEFAULT_PSM}",
-            output_type=pytesseract.Output.DICT,
-        )
-    except Exception:
-        return text, -1.0
-
-    confs: list[float] = []
-    for raw_conf in data.get("conf", []):
-        try:
-            conf = float(raw_conf)
-        except (TypeError, ValueError):
-            continue
-        if conf >= 0:
-            confs.append(conf)
-
-    avg_conf = sum(confs) / len(confs) if confs else -1.0
-    return text, avg_conf
+    if isinstance(result, tuple):
+        return result
+    return str(result), -1.0
 
 
 def _text_quality_score(text: str) -> float:
@@ -439,6 +520,7 @@ def _resolve_auto_lang_spec_from_text_and_image(
         *,
         text_hint: str = "",
         image: Image.Image | None = None,
+        cancellation_check: Callable[[], None] | None = None,
 ) -> str:
     """
     Conservative auto mode:
@@ -461,7 +543,9 @@ def _resolve_auto_lang_spec_from_text_and_image(
     best_score = (float("-inf"), float("-inf"), float("-inf"), float("-inf"))
 
     for index, spec in enumerate(candidates):
-        text, conf = _ocr_text_with_confidence(prepared, spec)
+        if cancellation_check:
+            cancellation_check()
+        text, conf = _ocr_text_with_confidence(prepared, spec, cancellation_check=cancellation_check)
         score = (
             conf if conf >= 0 else -100.0,
             _text_quality_score(text),
@@ -508,7 +592,12 @@ def validate_lang_spec(lang: str) -> None:
         )
 
 
-def page_to_ocr_text(page: fitz.Page, lang: str = "eng", dpi: int = 300) -> str:
+def page_to_ocr_text(
+        page: fitz.Page,
+        lang: str = "eng",
+        dpi: int = 300,
+        cancellation_check: Callable[[], None] | None = None,
+) -> str:
     lang = normalize_lang_spec(lang)
     validate_lang_spec(lang)
 
@@ -520,18 +609,25 @@ def page_to_ocr_text(page: fitz.Page, lang: str = "eng", dpi: int = 300) -> str:
         resolved_lang = _resolve_auto_lang_spec_from_text_and_image(
             text_hint=page.get_text("text") or "",
             image=preview,
+            cancellation_check=cancellation_check,
         )
-        return pytesseract.image_to_string(
+        res = run_hardened_tesseract_ocr(
             prepared,
             lang=resolved_lang,
-            config=f"--oem 1 --psm {_DEFAULT_PSM}",
+            psm=_DEFAULT_PSM,
+            output_format="txt",
+            cancellation_check=cancellation_check,
         )
+        return str(res)
 
-    return pytesseract.image_to_string(
+    res = run_hardened_tesseract_ocr(
         prepared,
         lang=lang,
-        config=f"--oem 1 --psm {_DEFAULT_PSM}",
+        psm=_DEFAULT_PSM,
+        output_format="txt",
+        cancellation_check=cancellation_check,
     )
+    return str(res)
 
 
 def extract_text_from_pdf(
@@ -539,6 +635,7 @@ def extract_text_from_pdf(
         output_path: str,
         lang: str = "eng",
         password: str | None = None,
+        cancellation_check: Callable[[], None] | None = None,
 ) -> None:
     lang = normalize_lang_spec(lang)
     validate_lang_spec(lang)
@@ -548,6 +645,9 @@ def extract_text_from_pdf(
     try:
         with open(output_path, "w", encoding="utf-8") as out:
             for i in range(doc.page_count):
+                if cancellation_check:
+                    cancellation_check()
+
                 page = doc[i]
 
                 native_text = (page.get_text("text") or "").strip()
@@ -557,7 +657,7 @@ def extract_text_from_pdf(
                     out.write("--- END OF PAGE ---\n\n")
                     continue
 
-                ocr_text = page_to_ocr_text(page, lang=lang)
+                ocr_text = page_to_ocr_text(page, lang=lang, cancellation_check=cancellation_check)
                 if ocr_text.strip():
                     out.write(f"--- START OF PAGE {i + 1} ---\n")
                     out.write(ocr_text.rstrip() + "\n")
@@ -566,7 +666,11 @@ def extract_text_from_pdf(
         doc.close()
 
 
-def _image_to_searchable_pdf_bytes(image_path: str, lang: str = "eng") -> bytes:
+def _image_to_searchable_pdf_bytes(
+        image_path: str,
+        lang: str = "eng",
+        cancellation_check: Callable[[], None] | None = None,
+) -> bytes:
     lang = normalize_lang_spec(lang)
     validate_lang_spec(lang)
 
@@ -600,6 +704,7 @@ def _image_to_searchable_pdf_bytes(image_path: str, lang: str = "eng") -> bytes:
             resolved_lang = _resolve_auto_lang_spec_from_text_and_image(
                 text_hint="",
                 image=preview,
+                cancellation_check=cancellation_check,
             )
 
         cmd = [
@@ -623,6 +728,7 @@ def _image_to_searchable_pdf_bytes(image_path: str, lang: str = "eng") -> bytes:
                 cmd,
                 env=env,
                 cwd=str(tmpdir_path),
+                cancellation_check=cancellation_check,
                 timeout=300.0,
             )
         except subprocess.TimeoutExpired as exc:
@@ -652,6 +758,7 @@ def build_searchable_pdf_from_images(
         image_paths: Sequence[str],
         output_path: str,
         lang: str = "eng",
+        cancellation_check: Callable[[], None] | None = None,
 ) -> None:
     lang = normalize_lang_spec(lang)
     validate_lang_spec(lang)
@@ -663,10 +770,12 @@ def build_searchable_pdf_from_images(
 
     try:
         for img_path in image_paths:
+            if cancellation_check:
+                cancellation_check()
             if not Path(img_path).exists():
                 raise FileNotFoundError(f"image not found: {img_path}")
 
-            pdf_bytes = _image_to_searchable_pdf_bytes(img_path, lang=lang)
+            pdf_bytes = _image_to_searchable_pdf_bytes(img_path, lang=lang, cancellation_check=cancellation_check)
             page_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
 
             try:
@@ -683,6 +792,7 @@ def build_searchable_pdf_from_r2_images(
         image_refs: Sequence[R2ImageRef],
         output_path: str,
         lang: str = "eng",
+        cancellation_check: Callable[[], None] | None = None,
 ) -> None:
     lang = normalize_lang_spec(lang)
     validate_lang_spec(lang)
@@ -695,6 +805,8 @@ def build_searchable_pdf_from_r2_images(
         temp_paths: list[str] = []
 
         for index, ref in enumerate(image_refs, start=1):
+            if cancellation_check:
+                cancellation_check()
             key = (ref.key or "").strip()
             if not key:
                 raise ValueError(f"missing R2 object key for image #{index}")
@@ -705,7 +817,7 @@ def build_searchable_pdf_from_r2_images(
             download_to_path(key, str(local_path))
             temp_paths.append(str(local_path))
 
-        build_searchable_pdf_from_images(temp_paths, output_path, lang=lang)
+        build_searchable_pdf_from_images(temp_paths, output_path, lang=lang, cancellation_check=cancellation_check)
 
 
 def safe_suffix(filename: str | None, fallback: str = ".bin") -> str:

@@ -1,16 +1,18 @@
-from __future__ import annotations
-
+import asyncio
 import logging
 import os
 import shutil
 import tempfile
+import threading
 from pathlib import Path
+from typing import Callable
 
-from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
+from app.jobs.cancellation import JobCancelledException
 from .document import (
     R2ImageRef,
     build_searchable_pdf_from_images,
@@ -24,6 +26,35 @@ from .languages import language_name
 
 router = APIRouter(prefix="/api/v1/ocr", tags=["ocr"])
 logger = logging.getLogger(__name__)
+
+
+def create_route_cancellation_checker(request: Request) -> tuple[Callable[[], None], Callable[[], None]]:
+    cancel_event = threading.Event()
+    loop = asyncio.get_running_loop()
+
+    async def _monitor():
+        while not cancel_event.is_set():
+            try:
+                if await request.is_disconnected():
+                    logger.info("[OCR CANCELLATION] Client disconnect detected on route %s", request.url.path)
+                    cancel_event.set()
+                    break
+            except Exception:
+                pass
+            await asyncio.sleep(0.1)
+
+    task = loop.create_task(_monitor())
+
+    def check():
+        if cancel_event.is_set():
+            logger.info("[OCR CANCELLATION] Triggering cancellation check for disconnected client")
+            raise JobCancelledException("Request cancelled by client disconnect")
+
+    def cleanup():
+        cancel_event.set()
+        task.cancel()
+
+    return check, cleanup
 
 
 class OCRR2Image(BaseModel):
@@ -86,11 +117,14 @@ async def get_languages():
 
 @router.post("/extract-text")
 async def extract_text_from_pdf_route(
+        request: Request,
         background_tasks: BackgroundTasks,
         file: UploadFile = File(...),
         file_password: str | None = Form(None),
         lang: str = Form("eng"),
 ):
+    check_cancel, cleanup_cancel = create_route_cancellation_checker(request)
+
     input_fd, input_path = tempfile.mkstemp(
         prefix="pdfnest-ocr-in-",
         suffix=".pdf",
@@ -115,6 +149,7 @@ async def extract_text_from_pdf_route(
             output_path,
             lang,
             file_password,
+            cancellation_check=check_cancel,
         )
 
         background_tasks.add_task(os.remove, output_path)
@@ -127,23 +162,30 @@ async def extract_text_from_pdf_route(
             background=background_tasks,
         )
 
+    except JobCancelledException as exc:
+        logger.info("[OCR CANCELLATION] extract-text route request cancelled: %s", exc)
+        raise HTTPException(status_code=499, detail="Client Disconnected")
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception:
         logger.exception("OCR failed")
         raise
     finally:
-        _cleanup_paths(input_path)
+        cleanup_cancel()
+        _cleanup_paths(input_path, output_path)
 
 
 @router.post("/to-text-pdf")
 async def images_to_searchable_pdf_route(
+        request: Request,
         background_tasks: BackgroundTasks,
         images: list[UploadFile] = File(...),
         lang: str = Form("eng"),
 ):
     if not images:
         raise HTTPException(status_code=400, detail="No images provided")
+
+    check_cancel, cleanup_cancel = create_route_cancellation_checker(request)
 
     temp_paths: list[str] = []
 
@@ -173,6 +215,7 @@ async def images_to_searchable_pdf_route(
             temp_paths,
             output_path,
             lang,
+            cancellation_check=check_cancel,
         )
 
         background_tasks.add_task(os.remove, output_path)
@@ -184,12 +227,17 @@ async def images_to_searchable_pdf_route(
             background=background_tasks,
         )
 
+    except JobCancelledException as exc:
+        logger.info("[OCR CANCELLATION] to-text-pdf route request cancelled: %s", exc)
+        raise HTTPException(status_code=499, detail="Client Disconnected")
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception:
         logger.exception("Searchable PDF generation failed")
         raise
     finally:
+        cleanup_cancel()
+        _cleanup_paths(output_path)
         for path in temp_paths:
             try:
                 os.remove(path)
@@ -199,11 +247,14 @@ async def images_to_searchable_pdf_route(
 
 @router.post("/to-text-pdf-r2")
 async def images_to_searchable_pdf_from_r2_route(
+        request: Request,
         background_tasks: BackgroundTasks,
         payload: OCRR2JobRequest,
 ):
     if not payload.files:
         raise HTTPException(status_code=400, detail="No images provided")
+
+    check_cancel, cleanup_cancel = create_route_cancellation_checker(request)
 
     output_fd, output_path = tempfile.mkstemp(
         prefix="pdfnest-ocr-out-",
@@ -229,6 +280,7 @@ async def images_to_searchable_pdf_from_r2_route(
             refs,
             output_path,
             lang,
+            cancellation_check=check_cancel,
         )
 
         background_tasks.add_task(os.remove, output_path)
@@ -240,8 +292,14 @@ async def images_to_searchable_pdf_from_r2_route(
             background=background_tasks,
         )
 
+    except JobCancelledException as exc:
+        logger.info("[OCR CANCELLATION] to-text-pdf-r2 route request cancelled: %s", exc)
+        raise HTTPException(status_code=499, detail="Client Disconnected")
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
         logger.exception("Searchable PDF generation from R2 failed")
         raise HTTPException(status_code=500, detail=str(exc))
+    finally:
+        cleanup_cancel()
+        _cleanup_paths(output_path)
