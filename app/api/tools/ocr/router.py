@@ -199,6 +199,7 @@ async def images_to_searchable_pdf_route(
     )
     os.close(output_fd)
 
+    success = False
     try:
         lang = normalize_lang_spec(lang)
 
@@ -224,12 +225,14 @@ async def images_to_searchable_pdf_route(
 
         background_tasks.add_task(os.remove, output_path)
 
-        return FileResponse(
+        res = FileResponse(
             output_path,
             filename="ocr_searchable.pdf",
             media_type="application/pdf",
             background=background_tasks,
         )
+        success = True
+        return res
 
     except JobCancelledException as exc:
         logger.info("[OCR CANCELLATION] to-text-pdf route request cancelled: %s", exc)
@@ -241,7 +244,8 @@ async def images_to_searchable_pdf_route(
         raise
     finally:
         cleanup_cancel()
-        _cleanup_paths(output_path)
+        if not success:
+            _cleanup_paths(output_path)
         for path in temp_paths:
             try:
                 os.remove(path)
@@ -266,6 +270,7 @@ async def images_to_searchable_pdf_from_r2_route(
     )
     os.close(output_fd)
 
+    success = False
     try:
         lang = normalize_lang_spec(payload.lang)
 
@@ -289,12 +294,14 @@ async def images_to_searchable_pdf_from_r2_route(
 
         background_tasks.add_task(os.remove, output_path)
 
-        return FileResponse(
+        res = FileResponse(
             output_path,
             filename="ocr_searchable.pdf",
             media_type="application/pdf",
             background=background_tasks,
         )
+        success = True
+        return res
 
     except JobCancelledException as exc:
         logger.info("[OCR CANCELLATION] to-text-pdf-r2 route request cancelled: %s", exc)
@@ -306,4 +313,5 @@ async def images_to_searchable_pdf_from_r2_route(
         raise HTTPException(status_code=500, detail=str(exc))
     finally:
         cleanup_cancel()
-        _cleanup_paths(output_path)
+        if not success:
+            _cleanup_paths(output_path)
