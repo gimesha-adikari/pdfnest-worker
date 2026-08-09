@@ -120,12 +120,35 @@ def build_key(prefix: str, *, suffix: str = "") -> str:
 
     return f"{clean_prefix}/{uuid4().hex}{clean_suffix}"
 
-def upload_fileobj(fileobj: BinaryIO, key: str, *, content_type: str | None = None) -> str:
-    client = get_r2_client()
+LOCAL_STORAGE_DIR = os.environ.get("LOCAL_STORAGE_DIR", "/tmp/pdfnest-storage")
 
-    # Read, Encrypt, and wrap back into a stream
+def _get_local_file_path(key: str, for_write: bool = False) -> str:
+    primary = os.path.join(LOCAL_STORAGE_DIR, key.lstrip("/"))
+    if for_write:
+        os.makedirs(os.path.dirname(primary), exist_ok=True)
+        return primary
+    if os.path.exists(primary):
+        return primary
+    alt1 = os.path.join("/tmp", key.lstrip("/"))
+    if os.path.exists(alt1):
+        return alt1
+    alt2 = os.path.join("/tmp", os.path.basename(key))
+    if os.path.exists(alt2):
+        return alt2
+    os.makedirs(os.path.dirname(primary), exist_ok=True)
+    return primary
+
+def upload_fileobj(fileobj: BinaryIO, key: str, *, content_type: str | None = None) -> str:
     data = fileobj.read()
     encrypted_data = encrypt_data(data)
+
+    if not settings.r2_bucket:
+        local_path = _get_local_file_path(key, for_write=True)
+        with open(local_path, "wb") as f:
+            f.write(encrypted_data)
+        return key
+
+    client = get_r2_client()
     encrypted_stream = BytesIO(encrypted_data)
 
     extra_args: dict[str, str] = {}
@@ -147,6 +170,15 @@ def upload_text(text: str, key: str, *, content_type: str = "application/json") 
     return upload_fileobj(BytesIO(text.encode("utf-8")), key, content_type=content_type)
 
 def download_to_path(key: str, path: str) -> str:
+    if not settings.r2_bucket:
+        local_path = _get_local_file_path(key)
+        with open(local_path, "rb") as f:
+            encrypted_data = f.read()
+        decrypted_data = decrypt_data(encrypted_data)
+        with open(path, "wb") as f:
+            f.write(decrypted_data)
+        return path
+
     client = get_r2_client()
     buffer = BytesIO()
 
@@ -159,11 +191,23 @@ def download_to_path(key: str, path: str) -> str:
     return path
 
 def stream_object(key: str, *, chunk_size: int = 1024 * 1024) -> tuple[Iterator[bytes], str]:
+    if not settings.r2_bucket:
+        local_path = _get_local_file_path(key)
+        with open(local_path, "rb") as f:
+            encrypted_data = f.read()
+        decrypted_data = decrypt_data(encrypted_data)
+        content_type = mimetypes.guess_type(key)[0] or "application/octet-stream"
+
+        def iterator():
+            for i in range(0, len(decrypted_data), chunk_size):
+                yield decrypted_data[i:i + chunk_size]
+
+        return iterator(), content_type
+
     client = get_r2_client()
     response = client.get_object(Bucket=settings.r2_bucket, Key=key)
     content_type = response.get("ContentType") or mimetypes.guess_type(key)[0] or "application/octet-stream"
 
-    # Read the full ciphertext payload and decrypt
     encrypted_data = response["Body"].read()
     decrypted_data = decrypt_data(encrypted_data)
 

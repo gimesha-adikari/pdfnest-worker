@@ -7,9 +7,10 @@ import threading
 from pathlib import Path
 from typing import Callable
 
-from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, Request, UploadFile
+from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
+from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 
 from app.jobs.cancellation import JobCancelledException
@@ -152,14 +153,17 @@ async def extract_text_from_pdf_route(
             cancellation_check=check_cancel,
         )
 
-        background_tasks.add_task(os.remove, output_path)
+        with open(output_path, "rb") as out_f:
+            content = out_f.read()
+
+        if os.path.exists(output_path):
+            os.remove(output_path)
 
         download_name = f"{Path(file.filename or 'document').stem}_ocr.txt"
-        return FileResponse(
-            output_path,
-            filename=download_name,
+        return Response(
+            content=content,
             media_type="text/plain",
-            background=background_tasks,
+            headers={"Content-Disposition": f'attachment; filename="{download_name}"'},
         )
 
     except JobCancelledException as exc:

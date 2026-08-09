@@ -1,7 +1,8 @@
-from __future__ import annotations
-
 import os
 from dataclasses import dataclass, field
+from dotenv import load_dotenv
+
+load_dotenv()
 
 
 @dataclass(frozen=True)
@@ -25,10 +26,10 @@ class Settings:
         ]
     )
 
-    r2_bucket: str = os.getenv("R2_BUCKET", "")
-    r2_access_key: str = os.getenv("R2_ACCESS_KEY", "")
-    r2_secret_key: str = os.getenv("R2_SECRET_KEY", "")
-    r2_endpoint: str = os.getenv("R2_ENDPOINT", "")
+    r2_bucket: str = os.getenv("R2_BUCKET", "").strip('\'" ')
+    r2_access_key: str = os.getenv("R2_ACCESS_KEY", "").strip('\'" ')
+    r2_secret_key: str = os.getenv("R2_SECRET_KEY", "").strip('\'" ')
+    r2_endpoint: str = os.getenv("R2_ENDPOINT", "").strip('\'" ')
 
 
 settings = Settings()
