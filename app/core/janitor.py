@@ -55,12 +55,12 @@ def sweep_worker_temp_files(file_ttl_seconds: int = 3600) -> int:
             except OSError:
                 continue
 
-    # 1. Sweep dedicated worker workspace
+    # Sweep the dedicated workspace before the shared system temp directory.
     dedicated = get_temp_dir()
     if dedicated != tempfile.gettempdir():
         _sweep_directory(dedicated, check_prefix=False)
 
-    # 2. Sweep system temp directory for PDFNest/Tesseract prefixes
+    # In the shared directory, delete only worker-owned prefixes.
     _sweep_directory(tempfile.gettempdir(), check_prefix=True)
 
     if eviction_count > 0:

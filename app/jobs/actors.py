@@ -30,12 +30,7 @@ NON_RETRYABLE_ERRORS = (
 
 
 def is_non_retryable_error(exc: Exception) -> bool:
-    """
-    Returns True if the exception represents a verified permanent PDF input error.
-    Strictly limited to PyMuPDF's native FileDataError (corrupt/password) and EmptyFileError (0 bytes).
-    Generic ValueError or RuntimeError exceptions are NOT classified as non-retryable to prevent
-    silently suppressing unexpected internal/programming errors.
-    """
+    """Classify only PyMuPDF's verified permanent input errors as non-retryable."""
     return isinstance(exc, NON_RETRYABLE_ERRORS)
 
 

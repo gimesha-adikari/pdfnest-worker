@@ -46,10 +46,7 @@ def create_job(
 
 
 def prune_expired_job_index() -> None:
-    """
-    Removes job IDs from pdfnest:jobs:index created older than JOB_TTL_SECONDS (24h).
-    Executed opportunistically during save_job and list_jobs to prevent memory growth.
-    """
+    """Prune expired index entries opportunistically to bound Redis memory."""
     try:
         cutoff = utcnow().timestamp() - settings.job_ttl_seconds
         redis_client.zremrangebyscore(JOB_INDEX_KEY, "-inf", cutoff)
@@ -69,19 +66,19 @@ def save_job(job: JobRecord) -> None:
                 raw = pipe.get(key)
                 if raw:
                     existing = JobRecord.model_validate_json(raw)
-                    # Terminal states are immutable
+                    # A late worker update must not overwrite a terminal outcome.
                     if existing.status in TERMINAL_STATES:
                         if existing.status != job.status:
                             pipe.unwatch()
                             return
 
-                    # Preserve cancellation request state (queued/running -> cancel_requested -> cancelled)
+                    # Cancellation remains sticky until the actor records cancellation.
                     if existing.cancel_requested or existing.status == JobState.cancel_requested:
                         if job.status not in (JobState.cancelled, JobState.cancel_requested):
                             job.cancel_requested = True
                             job.status = JobState.cancel_requested
 
-                    # Monotonic progress check for running -> running
+                    # Concurrent worker updates may arrive out of order.
                     if existing.status == JobState.running and job.status == JobState.running:
                         if job.progress < existing.progress:
                             job.progress = existing.progress

@@ -13,7 +13,7 @@ from botocore.config import Config
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from dotenv import load_dotenv
 
-# Force load the .env file for background workers!
+# Dramatiq workers run outside FastAPI's startup path and need the same environment.
 load_dotenv()
 
 from app.core.config import settings
@@ -22,8 +22,6 @@ logger = logging.getLogger(__name__)
 
 class R2StorageError(RuntimeError):
     pass
-
-# --- ENCRYPTION LOGIC ---
 
 def get_encryption_key() -> bytes | None:
     key = os.environ.get("FILE_ENCRYPTION_KEY", "").strip()
@@ -53,27 +51,26 @@ def decrypt_data(data: bytes) -> bytes:
 
     key = get_encryption_key()
 
-    # Check for known unencrypted file signatures (PDF, JSON, JPEG, PNG, WEBP, GIF, TIFF)
+    # Legacy plaintext is accepted only when its format can be identified safely.
     is_unencrypted = (
             data.startswith(b"%PDF-") or
             data.startswith(b"{") or
             data.startswith(b"[") or
-            data.startswith(b"\xff\xd8\xff") or     # JPEG
-            data.startswith(b"\x89PNG\r\n\x1a\n") or # PNG
-            data.startswith(b"RIFF") or              # WEBP (starts with RIFF)
-            data.startswith(b"GIF8") or              # GIF
-            data.startswith(b"II*\x00") or           # TIFF
-            data.startswith(b"MM\x00*")              # TIFF
+            data.startswith(b"\xff\xd8\xff") or
+            data.startswith(b"\x89PNG\r\n\x1a\n") or
+            data.startswith(b"RIFF") or
+            data.startswith(b"GIF8") or
+            data.startswith(b"II*\x00") or
+            data.startswith(b"MM\x00*")
     )
 
-    # If no key is found, but the file is not a known unencrypted format, fail.
     if not key:
         if is_unencrypted:
             return data
         raise RuntimeError("DECRYPTION FAILED: Python worker does not have FILE_ENCRYPTION_KEY set, but the downloaded file is encrypted. Ensure your Dramatiq worker loads the .env file.")
 
     if len(data) < 12:
-        return data  # Too short to be encrypted data
+        return data
 
     try:
         aesgcm = AESGCM(key)
@@ -81,12 +78,10 @@ def decrypt_data(data: bytes) -> bytes:
         ciphertext = data[12:]
         return aesgcm.decrypt(nonce, ciphertext, None)
     except Exception as e:
-        # Graceful fallback ONLY if the file is clearly an unencrypted known format
+        # Do not conceal a key mismatch or corrupt ciphertext as a successful download.
         if is_unencrypted:
             return data
         raise RuntimeError(f"DECRYPTION FAILED: Key mismatch or corrupted data. Ensure FILE_ENCRYPTION_KEY is identical in Go and Python. Error: {e}")
-
-# --- STORE LOGIC ---
 
 @lru_cache(maxsize=1)
 def get_r2_client():

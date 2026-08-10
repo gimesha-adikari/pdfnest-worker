@@ -21,9 +21,6 @@ def redact_pdf(
 
             page_number = page.number + 1
 
-            #
-            # Keyword redactions
-            #
             for keyword in keywords:
                 keyword = keyword.strip()
 
@@ -36,9 +33,6 @@ def redact_pdf(
                         fill=(0, 0, 0),
                     )
 
-            #
-            # Manual rectangles
-            #
             page_rect = page.rect
 
             page_width = page_rect.width

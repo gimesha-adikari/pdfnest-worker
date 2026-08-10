@@ -35,9 +35,7 @@ def pixmap_to_image(pix: fitz.Pixmap) -> Image.Image:
 
 
 def sample_text_color_hex(image: Image.Image, rect: fitz.Rect, zoom: float = 2.0) -> str:
-    """
-    Samples the average color of the dark pixels (text) in a bounding box.
-    """
+    """Estimate text color from dark pixels in an extracted bounding box."""
     try:
         crop_box = (
             int(rect.x0 * zoom),
@@ -65,9 +63,7 @@ def sample_text_color_hex(image: Image.Image, rect: fitz.Rect, zoom: float = 2.0
 
 
 def analyze_font_attributes(image: Image.Image, rect: fitz.Rect, zoom: float = 2.0) -> Tuple[str, bool]:
-    """
-    Dynamically analyzes a cropped image region to determine font attributes.
-    """
+    """Estimate the fallback font style from the cropped image region."""
     try:
         crop_box = (
             int(rect.x0 * zoom),
@@ -333,12 +329,9 @@ def extract_ocr_page(page: fitz.Page, page_number: int) -> dict[str, Any]:
             continue
 
         word_heights = [w["rect"].height for w in items if w["rect"].height > 0]
-        # Use the maximum height (tallest letter) of the line to establish scale
         max_height = max(word_heights) if word_heights else rect.height
 
-        # Bounding boxes map exactly to visual ink (Cap Height or Ascender Height).
-        # A true typographic point size (Em-Square) is always physically larger than the ink box.
-        # Multiplying by ~1.15 correctly scales an OCR height to standard font point size.
+        # OCR boxes measure ink height, while PDF font sizes use the larger em square.
         dynamic_font_size = max_height * 1.15
 
         font_family, is_bold = analyze_font_attributes(page_image, rect)
@@ -519,8 +512,7 @@ def compile_document(
                     text_color_hex = element.get("text_color", "#000000")
                     color_rgb = hex_to_rgb(text_color_hex)
 
-                    # Create an intentionally expanded rect for rendering.
-                    # If the rect is too tight, PyMuPDF will shrink the text to force fit it.
+                    # A tight textbox makes PyMuPDF shrink the requested font size to fit.
                     expanded_render_rect = fitz.Rect(x0, y0 - (h * 0.1), x0 + w + 20, y0 + h * 1.5)
 
                     rc = page.insert_textbox(

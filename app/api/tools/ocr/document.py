@@ -25,7 +25,7 @@ _OCR_CONFIDENCE_THRESHOLD = 65.0
 _OCR_MIN_PREVIEW_DPI = 120
 _OCR_MAX_PREVIEW_EDGE = 1600
 
-# Small, practical candidate order for auto mode.
+# Prefer likely local language bundles before broader OCR fallback candidates.
 _AUTO_BUNDLE_PRIORITY: tuple[tuple[str, ...], ...] = (
     ("eng", "sin", "tam"),
     ("eng", "sin"),
@@ -110,9 +110,7 @@ def normalize_tesseract_lang_code(raw: str) -> str:
 
 @lru_cache(maxsize=1)
 def get_installed_tesseract_languages() -> set[str]:
-    """
-    Returns installed Tesseract language codes, normalized.
-    """
+    """Return normalized language codes reported by the local Tesseract installation."""
     try:
         result = subprocess.run(
             ["tesseract", "--list-langs"],

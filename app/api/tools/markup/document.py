@@ -1,4 +1,3 @@
-# file: app/api/tools/markup/document.py
 from __future__ import annotations
 
 from typing import Callable, Literal

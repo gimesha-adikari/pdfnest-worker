@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 
 
 def kill_process_group(pgid: int, term_grace_seconds: float = 1.0) -> None:
-    """Safely terminates an entire Linux process group using SIGTERM -> grace -> SIGKILL."""
+    """Terminate a process group so child processes do not outlive the job."""
     if pgid <= 1:
         return
 
@@ -24,7 +24,6 @@ def kill_process_group(pgid: int, term_grace_seconds: float = 1.0) -> None:
     deadline = time.time() + term_grace_seconds
     while time.time() < deadline:
         try:
-            # Check if process group is still alive
             os.killpg(pgid, 0)
             time.sleep(0.05)
         except (ProcessLookupError, OSError):
@@ -47,10 +46,7 @@ def run_hardened_subprocess(
     cwd: str | None = None,
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    """
-    Executes an external CLI command inside an independent Linux process group (`start_new_session=True`).
-    Supports cooperative mid-execution cancellation and process-group SIGTERM -> SIGKILL cleanup.
-    """
+    """Run a command in its own process group for cancellation and timeout cleanup."""
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -75,7 +71,6 @@ def run_hardened_subprocess(
                 stderr=stderr,
             )
 
-        # 1. Cooperative Cancellation Check mid-execution
         if cancellation_check is not None:
             try:
                 cancellation_check()
@@ -85,7 +80,6 @@ def run_hardened_subprocess(
                 proc.communicate()
                 raise exc
 
-        # 2. Timeout Check
         if time.time() > deadline:
             logger.warning("[SUBPROCESS HARDENING] Timeout (%fs) exceeded for %s (PGID: %d)", timeout, cmd[0], pgid)
             kill_process_group(pgid, term_grace_seconds=term_grace_seconds)
