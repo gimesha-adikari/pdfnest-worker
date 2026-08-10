@@ -1,29 +1,44 @@
+from __future__ import annotations
+
 import logging
+import mimetypes
 import os
 import re
 import subprocess
 import tempfile
 import unicodedata
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Sequence
 
 import pymupdf as fitz
-from PIL import Image, ImageOps
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps, ImageStat
 
+from app.api.tools.ocr.languages import (
+    get_installed_tesseract_languages,
+    normalize_tesseract_lang_code,
+)
+from app.api.tools.ocr.schemas import R2ImageRef
 from app.core.storage import download_to_path
 from app.core.subprocess_runner import run_hardened_subprocess
+from app.core.tesseract_capacity import acquire_tesseract_capacity
 
 logger = logging.getLogger(__name__)
 
-_LANG_TOKEN_RE = re.compile(r"^[A-Za-z0-9_+-]+$")
-_DEFAULT_TESSDATA_PREFIX = "/usr/share/tesseract-ocr/5/tessdata"
 _DEFAULT_PSM = "6"
-_AUTO_LANG_ALIASES = {"auto", "detect", "auto-detect", "auto detect"}
 _OCR_CONFIDENCE_THRESHOLD = 65.0
 _OCR_MIN_PREVIEW_DPI = 120
 _OCR_MAX_PREVIEW_EDGE = 1600
+
+# Maximum number of candidate language bundles to try during auto-detection.
+# Each candidate spawns a Tesseract process, so this directly caps the
+# subprocess multiplier for auto-mode OCR.
+_OCR_MAX_AUTO_CANDIDATES = int(os.environ.get("OCR_MAX_AUTO_CANDIDATES", "5"))
+
+# Maximum concurrent page workers per document. The Global Tesseract Capacity Governor
+# (app/core/tesseract_capacity.py) strictly enforces MAX 2 active Tesseract processes globally.
+_OCR_PAGE_WORKERS = int(os.environ.get("OCR_PAGE_WORKERS", "2"))
 
 # Prefer likely local language bundles before broader OCR fallback candidates.
 _AUTO_BUNDLE_PRIORITY: tuple[tuple[str, ...], ...] = (
@@ -31,199 +46,117 @@ _AUTO_BUNDLE_PRIORITY: tuple[tuple[str, ...], ...] = (
     ("eng", "sin"),
     ("eng", "tam"),
     ("sin", "tam"),
-    ("eng", "hin"),
+    ("eng", "deu", "fra", "spa"),
+    ("eng", "deu"),
+    ("eng", "fra"),
+    ("eng", "spa"),
+    ("eng", "ita"),
+    ("eng", "por"),
+    ("eng", "nld"),
+    ("eng", "rus"),
     ("eng", "ara"),
-    ("eng",),
-    ("sin",),
-    ("tam",),
-    ("hin",),
-    ("ara",),
-    ("rus",),
-    ("ell",),
-    ("heb",),
-    ("ben",),
-    ("mya",),
-    ("tha",),
-    ("chi_sim",),
-    ("chi_tra",),
-    ("kor",),
-    ("jpn",),
+    ("eng", "hin"),
+    ("eng", "ben"),
+    ("eng", "chi_sim", "chi_tra"),
+    ("eng", "chi_sim"),
+    ("eng", "chi_tra"),
+    ("eng", "jpn"),
+    ("eng", "kor"),
 )
 
 _SCRIPT_TO_LANGS: dict[str, tuple[str, ...]] = {
-    "latin": ("eng",),
-    "sinhala": ("sin",),
-    "tamil": ("tam",),
-    "devanagari": ("hin",),
-    "arabic": ("ara",),
-    "cyrillic": ("rus",),
-    "greek": ("ell",),
-    "hebrew": ("heb",),
-    "bengali": ("ben",),
-    "burmese": ("mya",),
-    "thai": ("tha",),
-    "hangul": ("kor",),
-    "han": ("chi_sim",),
-    "hiragana": ("jpn",),
-    "katakana": ("jpn",),
+    "SINHALA": ("sin", "eng"),
+    "TAMIL": ("tam", "eng"),
+    "LATIN": ("eng", "deu", "fra", "spa"),
+    "DEVANAGARI": ("hin", "eng"),
+    "BENGALI": ("ben", "eng"),
+    "CYRILLIC": ("rus", "eng"),
+    "ARABIC": ("ara", "eng"),
+    "HAN": ("chi_sim", "chi_tra", "eng"),
+    "HIRAGANA": ("jpn", "eng"),
+    "KATAKANA": ("jpn", "eng"),
+    "HANGUL": ("kor", "eng"),
 }
 
 
-@dataclass(frozen=True)
-class R2ImageRef:
-    key: str
-    name: str = ""
-    content_type: str = ""
-    size: int = 0
-
-
-def _get_tessdata_prefix() -> Path:
-    return Path(os.environ.get("TESSDATA_PREFIX", _DEFAULT_TESSDATA_PREFIX)).expanduser()
-
-
-def _is_auto_lang_spec(lang: str | None) -> bool:
-    return bool(lang and lang.strip().lower() in _AUTO_LANG_ALIASES)
-
-
-def normalize_tesseract_lang_code(raw: str) -> str:
-    """
-    Convert values like:
-      - "afr"
-      - "tessdata/afr"
-      - "tessdata\\afr"
-      - "afr.traineddata"
-    into a clean language code:
-      - "afr"
-    """
-    value = (raw or "").strip().replace("\\", "/")
-    if not value:
-        return value
-
-    if value.endswith(".traineddata"):
-        value = Path(value).stem
-
-    if "/" in value:
-        value = value.rsplit("/", 1)[-1]
-
-    return value
-
-
-@lru_cache(maxsize=1)
-def get_installed_tesseract_languages() -> set[str]:
-    """Return normalized language codes reported by the local Tesseract installation."""
-    try:
-        result = subprocess.run(
-            ["tesseract", "--list-langs"],
-            capture_output=True,
-            text=True,
-            check=True,
-            env=os.environ.copy(),
-        )
-    except Exception:
-        return set()
-
-    langs: set[str] = set()
-    for line in result.stdout.splitlines():
-        line = normalize_tesseract_lang_code(line)
-        if not line:
-            continue
-        if line.lower().startswith("list of available languages"):
-            continue
-        langs.add(line)
-
-    return langs
-
-
-def normalize_lang_spec(lang: str | None) -> str:
-    """
-    Accepts values like:
-      "eng"
-      "eng+sin"
-      "eng, sin, tam"
-      " eng + sin + tam "
-      "auto"
-    and returns a clean Tesseract language spec:
-      "eng+sin+tam"
-      or "auto"
-    """
-    if not lang:
-        return "eng"
-
-    raw = lang.strip()
-    if raw.lower() in _AUTO_LANG_ALIASES:
-        return "auto"
-
-    raw = raw.replace(",", "+").replace(" ", "+").strip("+").strip()
-    parts = [p.strip() for p in raw.split("+") if p.strip()]
-
-    if not parts:
-        return "eng"
-
-    cleaned: list[str] = []
-    seen: set[str] = set()
-
-    for part in parts:
-        part = normalize_tesseract_lang_code(part)
-        if part.lower() in _AUTO_LANG_ALIASES:
-            return "auto"
-        if not _LANG_TOKEN_RE.match(part):
-            raise ValueError(
-                f"Invalid OCR language token: {part!r}. Use Tesseract language codes like eng, sin, tam, or eng+sin."
-            )
-        if part not in seen:
-            seen.add(part)
-            cleaned.append(part)
-
-    return "+".join(cleaned)
-
-
-def validate_lang_spec(lang: str) -> None:
-    """
-    If Tesseract is installed, make sure all requested languages exist.
-    """
-    if _is_auto_lang_spec(lang):
-        return
-
-    installed = get_installed_tesseract_languages()
-    if not installed:
-        return
-
-    requested = [
-        normalize_tesseract_lang_code(token)
-        for token in lang.split("+")
-        if token.strip()
-    ]
-    missing = [token for token in requested if token and token not in installed]
-    if missing:
-        raise ValueError(
-            "Requested OCR language pack(s) are not installed: "
-            + ", ".join(missing)
-            + ". Install the matching Tesseract traineddata files or choose from the available packs."
-        )
-
-
 def open_document(input_path: str, password: str | None = None) -> fitz.Document:
-    doc = fitz.open(input_path)
+    if not Path(input_path).exists():
+        raise FileNotFoundError(f"PDF file not found: {input_path}")
 
-    if doc.needs_pass:
+    try:
+        doc = fitz.open(input_path)
+    except Exception as exc:
+        raise ValueError(f"Failed to open PDF document: {exc}") from exc
+
+    if doc.is_encrypted:
         if not password:
             doc.close()
-            raise RuntimeError("PDF is password protected but no password was provided")
+            raise ValueError("PDF is password-protected. Password is required.")
 
-        if doc.authenticate(password) <= 0:
+        success = doc.authenticate(password)
+        if not success:
             doc.close()
-            raise RuntimeError("Invalid PDF password")
+            raise ValueError("Invalid password provided for encrypted PDF.")
 
     return doc
 
 
+def normalize_lang_spec(lang: str | None) -> str:
+    if not lang or not lang.strip():
+        return "eng"
+
+    cleaned = lang.strip().lower()
+    if cleaned in ("auto", "automatic", "detect"):
+        return "auto"
+
+    raw_tokens = [t.strip() for t in re.split(r"[\s,+]|%2b|%20", cleaned) if t.strip()]
+    normalized: list[str] = []
+
+    for token in raw_tokens:
+        code = normalize_tesseract_lang_code(token)
+        if code and code not in normalized:
+            normalized.append(code)
+
+    if not normalized:
+        return "eng"
+
+    return "+".join(normalized)
+
+
+def _is_auto_lang_spec(lang: str) -> bool:
+    return normalize_lang_spec(lang) == "auto"
+
+
+@lru_cache(maxsize=1)
+def _get_tessdata_prefix() -> Path:
+    prefix_env = os.environ.get("TESSDATA_PREFIX")
+    if prefix_env:
+        p = Path(prefix_env)
+        if p.exists():
+            return p
+
+    candidates = [
+        Path("/usr/share/tesseract-ocr/5/tessdata"),
+        Path("/usr/share/tesseract-ocr/4.00/tessdata"),
+        Path("/usr/share/tessdata"),
+        Path("/usr/local/share/tessdata"),
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+
+    return Path("/usr/share/tesseract-ocr/5/tessdata")
+
+
+def is_tesseract_available() -> bool:
+    tessdata_prefix = _get_tessdata_prefix()
+    return (tessdata_prefix / "eng.traineddata").is_file()
+
+
 def _render_page_image(page: fitz.Page, dpi: int = 300) -> Image.Image:
-    zoom = float(dpi) / 72.0
-    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
-    image = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-    if image.mode != "RGB":
-        image = image.convert("RGB")
-    return image
+    matrix = fitz.Matrix(dpi / 72.0, dpi / 72.0)
+    pix = page.get_pixmap(matrix=matrix, alpha=False)
+    return Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
 
 
 def _render_page_preview(page: fitz.Page) -> Image.Image:
@@ -231,146 +164,78 @@ def _render_page_preview(page: fitz.Page) -> Image.Image:
     if max(image.size) <= _OCR_MAX_PREVIEW_EDGE:
         return image
 
-    preview = image.copy()
-    preview.thumbnail((_OCR_MAX_PREVIEW_EDGE, _OCR_MAX_PREVIEW_EDGE), Image.Resampling.LANCZOS)
-    return preview
+    image.thumbnail((_OCR_MAX_PREVIEW_EDGE, _OCR_MAX_PREVIEW_EDGE), Image.Resampling.LANCZOS)
+    return image
 
 
 def _load_image_preview(image_path: str) -> Image.Image:
     with Image.open(image_path) as img:
-        img = ImageOps.exif_transpose(img).convert("RGB")
-        if max(img.size) <= _OCR_MAX_PREVIEW_EDGE:
-            return img.copy()
+        preview = ImageOps.exif_transpose(img).convert("RGB")
+        if max(preview.size) <= _OCR_MAX_PREVIEW_EDGE:
+            return preview.copy()
 
-        preview = img.copy()
         preview.thumbnail((_OCR_MAX_PREVIEW_EDGE, _OCR_MAX_PREVIEW_EDGE), Image.Resampling.LANCZOS)
-        return preview
+        return preview.copy()
 
 
 def _prepare_image_for_text_ocr(image: Image.Image) -> Image.Image:
-    image = ImageOps.exif_transpose(image).convert("RGB")
-    gray = ImageOps.grayscale(image)
-    gray = ImageOps.autocontrast(gray)
+    img = ImageOps.exif_transpose(image).convert("RGB")
+
+    gray = ImageOps.grayscale(img)
+    stat = ImageStat.Stat(gray)
+    mean_val = stat.mean[0] if stat.mean else 128.0
+    std_val = stat.stddev[0] if stat.stddev else 50.0
+
+    if std_val < 35.0:
+        gray = ImageEnhance.Contrast(gray).enhance(1.8)
+
+    if mean_val < 100.0:
+        gray = ImageOps.autocontrast(gray, cutoff=1)
+
     return gray
 
 
-def _detect_scripts_from_text(text: str) -> list[str]:
-    found: list[str] = []
-    seen: set[str] = set()
-
-    for ch in text:
-        if ch.isspace() or ch.isdigit():
-            continue
-
-        script = _script_for_char(ch)
-        if script and script not in seen:
-            seen.add(script)
-            found.append(script)
-
-    return found
-
-
-def _script_for_char(ch: str) -> str | None:
-    code = ord(ch)
-
-    if "A" <= ch <= "Z" or "a" <= ch <= "z":
-        return "latin"
-    if 0x0D80 <= code <= 0x0DFF:
-        return "sinhala"
-    if 0x0B80 <= code <= 0x0BFF:
-        return "tamil"
-    if 0x0900 <= code <= 0x097F:
-        return "devanagari"
-    if 0x0600 <= code <= 0x06FF or 0x0750 <= code <= 0x077F or 0x08A0 <= code <= 0x08FF:
-        return "arabic"
-    if 0x0400 <= code <= 0x04FF or 0x0500 <= code <= 0x052F:
-        return "cyrillic"
-    if 0x0370 <= code <= 0x03FF:
-        return "greek"
-    if 0x0590 <= code <= 0x05FF:
-        return "hebrew"
-    if 0x0980 <= code <= 0x09FF:
-        return "bengali"
-    if 0x1000 <= code <= 0x109F:
-        return "burmese"
-    if 0x0E00 <= code <= 0x0E7F:
-        return "thai"
-    if 0xAC00 <= code <= 0xD7AF:
-        return "hangul"
-    if 0x4E00 <= code <= 0x9FFF or 0x3400 <= code <= 0x4DBF:
-        return "han"
-    if 0x3040 <= code <= 0x309F:
-        return "hiragana"
-    if 0x30A0 <= code <= 0x30FF:
-        return "katakana"
-
-    category = unicodedata.category(ch)
-    if category.startswith(("P", "S", "Z", "C")):
-        return None
-
-    return None
-
-
-def _auto_candidate_lang_specs() -> list[str]:
-    installed = get_installed_tesseract_languages()
-    if not installed:
-        return ["eng"]
-
-    candidates: list[str] = []
-    seen: set[str] = set()
-
-    def add(spec: str | None) -> None:
-        if not spec:
-            return
-        normalized = normalize_lang_spec(spec)
-        if not normalized or normalized == "auto" or normalized in seen:
-            return
-
-        parts = [
-            normalize_tesseract_lang_code(token)
-            for token in normalized.split("+")
-            if token.strip()
-        ]
-        if not parts:
-            return
-        if any(part not in installed for part in parts):
-            return
-
-        seen.add(normalized)
-        candidates.append(normalized)
-
-    env_value = os.getenv("OCR_AUTO_FALLBACK_LANGS", "").strip()
-    if env_value:
-        try:
-            add(env_value)
-        except Exception:
-            pass
+@lru_cache(maxsize=1)
+def _auto_candidate_lang_specs() -> tuple[str, ...]:
+    installed = set(get_installed_tesseract_languages())
+    specs: list[str] = []
 
     for bundle in _AUTO_BUNDLE_PRIORITY:
-        spec = "+".join(code for code in bundle if code in installed)
-        add(spec)
+        available = [code for code in bundle if code in installed]
+        if available:
+            spec = "+".join(available)
+            if spec not in specs:
+                specs.append(spec)
 
-    if not candidates:
-        if "eng" in installed:
-            candidates.append("eng")
-        else:
-            candidates.append(sorted(installed)[0])
+    if not specs and "eng" in installed:
+        specs.append("eng")
 
-    return candidates
+    if not specs and installed:
+        specs.append(sorted(installed)[0])
+
+    return tuple(specs)
+
+
+def _detect_scripts_from_text(text: str) -> tuple[str, ...]:
+    counts: dict[str, int] = {}
+    for ch in text:
+        if not ch.isprintable() or ch.isspace() or ch.isdigit():
+            continue
+        try:
+            script = unicodedata.name(ch).split()[0]
+        except (ValueError, IndexError):
+            continue
+
+        counts[script] = counts.get(script, 0) + 1
+
+    sorted_scripts = sorted(counts.keys(), key=lambda s: counts[s], reverse=True)
+    return tuple(sorted_scripts)
 
 
 def _lang_spec_from_scripts(scripts: Sequence[str]) -> str:
-    installed = get_installed_tesseract_languages()
-    if not installed:
-        return "eng"
-
+    installed = set(get_installed_tesseract_languages())
     ordered_codes: list[str] = []
     seen: set[str] = set()
-
-    # Mixed pages and Latin-heavy pages usually work best with English included.
-    if ("latin" in scripts or len(scripts) > 1) and "eng" in installed:
-        ordered_codes.append("eng")
-        seen.add("eng")
 
     for script in scripts:
         for code in _SCRIPT_TO_LANGS.get(script, ()):
@@ -385,16 +250,18 @@ def _lang_spec_from_scripts(scripts: Sequence[str]) -> str:
 
 
 def run_hardened_tesseract_ocr(
-        image: Image.Image | str,
-        lang: str = "eng",
-        psm: str = _DEFAULT_PSM,
-        output_format: str = "txt",
-        cancellation_check: Callable[[], None] | None = None,
-        timeout: float = 300.0,
+    image: Image.Image | str,
+    lang: str = "eng",
+    psm: str = _DEFAULT_PSM,
+    output_format: str = "txt",
+    cancellation_check: Callable[[], None] | None = None,
+    timeout: float = 300.0,
 ) -> str | tuple[str, float]:
     """
-    Executes Tesseract CLI via run_hardened_subprocess in an isolated process group (start_new_session=True).
-    Supports cooperative cancellation via cancellation_check.
+    Executes Tesseract CLI via run_hardened_subprocess in an isolated process group.
+    Acquires global Tesseract capacity token (acquire_tesseract_capacity) to ensure
+    active concurrent Tesseract processes never exceed GLOBAL_TESSERACT_CAPACITY across
+    the entire Python worker.
     """
     tessdata_prefix = _get_tessdata_prefix()
     env = os.environ.copy()
@@ -425,13 +292,16 @@ def run_hardened_tesseract_ocr(
         ]
 
         logger.info("[OCR SUBPROCESS] Starting Tesseract CLI (format: %s, lang: %s)...", output_format, lang)
-        result = run_hardened_subprocess(
-            cmd,
-            env=env,
-            cwd=str(tmpdir_path),
-            cancellation_check=cancellation_check,
-            timeout=timeout,
-        )
+
+        # Acquire global capacity token to protect CPU/RAM invariant (active Tesseract processes <= 2)
+        with acquire_tesseract_capacity(cancellation_check=cancellation_check, timeout=timeout):
+            result = run_hardened_subprocess(
+                cmd,
+                env=env,
+                cwd=str(tmpdir_path),
+                cancellation_check=cancellation_check,
+                timeout=timeout,
+            )
 
         if result.returncode != 0:
             logger.error("[OCR SUBPROCESS] Tesseract failed with returncode %d: %s", result.returncode, result.stderr)
@@ -479,9 +349,9 @@ def run_hardened_tesseract_ocr(
 
 
 def _ocr_text_with_confidence(
-        image: Image.Image,
-        lang: str,
-        cancellation_check: Callable[[], None] | None = None,
+    image: Image.Image,
+    lang: str,
+    cancellation_check: Callable[[], None] | None = None,
 ) -> tuple[str, float]:
     result = run_hardened_tesseract_ocr(
         image,
@@ -506,26 +376,20 @@ def _text_quality_score(text: str) -> float:
     words = len(text.split())
 
     return (
-            letters * 1.0
-            + digits * 0.2
-            + spaces * 0.05
-            + min(words, 40) * 0.8
-            - weird * 1.5
+        letters * 1.0
+        + digits * 0.2
+        + spaces * 0.05
+        + min(words, 40) * 0.8
+        - weird * 1.5
     )
 
 
 def _resolve_auto_lang_spec_from_text_and_image(
-        *,
-        text_hint: str = "",
-        image: Image.Image | None = None,
-        cancellation_check: Callable[[], None] | None = None,
+    *,
+    text_hint: str = "",
+    image: Image.Image | None = None,
+    cancellation_check: Callable[[], None] | None = None,
 ) -> str:
-    """
-    Conservative auto mode:
-    - If native text exists, infer scripts from that first.
-    - Otherwise try a few likely bundles on a preview.
-    - Pick the best confidence/quality combo.
-    """
     if text_hint.strip():
         scripts = _detect_scripts_from_text(text_hint)
         if scripts:
@@ -536,6 +400,7 @@ def _resolve_auto_lang_spec_from_text_and_image(
 
     prepared = _prepare_image_for_text_ocr(image)
     candidates = _auto_candidate_lang_specs()
+    candidates = candidates[:_OCR_MAX_AUTO_CANDIDATES]
 
     best_spec = candidates[0]
     best_score = (float("-inf"), float("-inf"), float("-inf"), float("-inf"))
@@ -554,7 +419,6 @@ def _resolve_auto_lang_spec_from_text_and_image(
             best_score = score
             best_spec = spec
 
-        # If a candidate is clearly good, stop early.
         if score[0] >= 88 and len(text.strip()) >= 40:
             return spec
 
@@ -566,9 +430,6 @@ def _get_auto_fallback_lang_spec() -> str:
 
 
 def validate_lang_spec(lang: str) -> None:
-    """
-    If Tesseract is installed, make sure all requested languages exist.
-    """
     if _is_auto_lang_spec(lang):
         return
 
@@ -591,10 +452,10 @@ def validate_lang_spec(lang: str) -> None:
 
 
 def page_to_ocr_text(
-        page: fitz.Page,
-        lang: str = "eng",
-        dpi: int = 300,
-        cancellation_check: Callable[[], None] | None = None,
+    page: fitz.Page,
+    lang: str = "eng",
+    dpi: int = 300,
+    cancellation_check: Callable[[], None] | None = None,
 ) -> str:
     lang = normalize_lang_spec(lang)
     validate_lang_spec(lang)
@@ -628,46 +489,84 @@ def page_to_ocr_text(
     return str(res)
 
 
-def extract_text_from_pdf(
-        input_path: str,
-        output_path: str,
-        lang: str = "eng",
-        password: str | None = None,
-        cancellation_check: Callable[[], None] | None = None,
-) -> None:
-    lang = normalize_lang_spec(lang)
-    validate_lang_spec(lang)
+def _process_page_for_text_extraction(
+    input_path: str,
+    page_num: int,
+    password: str | None,
+    lang: str,
+    cancellation_check: Callable[[], None] | None,
+) -> tuple[int, str]:
+    """Helper for page worker tasks. Opens document independently per worker thread."""
+    if cancellation_check:
+        cancellation_check()
 
     doc = open_document(input_path, password=password)
-
     try:
-        with open(output_path, "w", encoding="utf-8") as out:
-            for i in range(doc.page_count):
-                if cancellation_check:
-                    cancellation_check()
+        page = doc[page_num]
+        native_text = (page.get_text("text") or "").strip()
+        if native_text:
+            return page_num, native_text
 
-                page = doc[i]
-
-                native_text = (page.get_text("text") or "").strip()
-                if native_text:
-                    out.write(f"--- START OF PAGE {i + 1} ---\n")
-                    out.write(native_text.rstrip() + "\n")
-                    out.write("--- END OF PAGE ---\n\n")
-                    continue
-
-                ocr_text = page_to_ocr_text(page, lang=lang, cancellation_check=cancellation_check)
-                if ocr_text.strip():
-                    out.write(f"--- START OF PAGE {i + 1} ---\n")
-                    out.write(ocr_text.rstrip() + "\n")
-                    out.write("--- END OF PAGE ---\n\n")
+        ocr_text = page_to_ocr_text(page, lang=lang, cancellation_check=cancellation_check)
+        return page_num, ocr_text
     finally:
         doc.close()
 
 
+def extract_text_from_pdf(
+    input_path: str,
+    output_path: str,
+    lang: str = "eng",
+    password: str | None = None,
+    cancellation_check: Callable[[], None] | None = None,
+) -> None:
+    """
+    Extracts text from a PDF file using native vector text where present,
+    or page-level parallel OCR via ThreadPoolExecutor.
+
+    Page output ordering is 100% preserved via indexed array assignment.
+    Active Tesseract processes are strictly guarded by acquire_tesseract_capacity.
+    """
+    lang = normalize_lang_spec(lang)
+    validate_lang_spec(lang)
+
+    doc = open_document(input_path, password=password)
+    total_pages = doc.page_count
+    doc.close()
+
+    if total_pages <= 0:
+        with open(output_path, "w", encoding="utf-8") as out:
+            pass
+        return
+
+    page_results: list[str | None] = [None] * total_pages
+
+    if total_pages == 1 or _OCR_PAGE_WORKERS <= 1:
+        for i in range(total_pages):
+            _, text = _process_page_for_text_extraction(input_path, i, password, lang, cancellation_check)
+            page_results[i] = text
+    else:
+        with ThreadPoolExecutor(max_workers=_OCR_PAGE_WORKERS) as executor:
+            futures = {
+                executor.submit(_process_page_for_text_extraction, input_path, i, password, lang, cancellation_check): i
+                for i in range(total_pages)
+            }
+            for future in as_completed(futures):
+                idx, text = future.result()
+                page_results[idx] = text
+
+    with open(output_path, "w", encoding="utf-8") as out:
+        for i, text in enumerate(page_results):
+            if text and text.strip():
+                out.write(f"--- START OF PAGE {i + 1} ---\n")
+                out.write(text.rstrip() + "\n")
+                out.write("--- END OF PAGE ---\n\n")
+
+
 def _image_to_searchable_pdf_bytes(
-        image_path: str,
-        lang: str = "eng",
-        cancellation_check: Callable[[], None] | None = None,
+    image_path: str,
+    lang: str = "eng",
+    cancellation_check: Callable[[], None] | None = None,
 ) -> bytes:
     lang = normalize_lang_spec(lang)
     validate_lang_spec(lang)
@@ -722,13 +621,14 @@ def _image_to_searchable_pdf_bytes(
         env.setdefault("TESSDATA_PREFIX", str(tessdata_prefix))
 
         try:
-            result = run_hardened_subprocess(
-                cmd,
-                env=env,
-                cwd=str(tmpdir_path),
-                cancellation_check=cancellation_check,
-                timeout=300.0,
-            )
+            with acquire_tesseract_capacity(cancellation_check=cancellation_check, timeout=300.0):
+                result = run_hardened_subprocess(
+                    cmd,
+                    env=env,
+                    cwd=str(tmpdir_path),
+                    cancellation_check=cancellation_check,
+                    timeout=300.0,
+                )
         except subprocess.TimeoutExpired as exc:
             raise ValueError("Tesseract OCR execution timed out after 5 minutes") from exc
 
@@ -752,11 +652,26 @@ def _image_to_searchable_pdf_bytes(
         return pdf_path.read_bytes()
 
 
+def _process_single_image_to_pdf_bytes(
+    img_path: str,
+    index: int,
+    lang: str,
+    cancellation_check: Callable[[], None] | None,
+) -> tuple[int, bytes]:
+    if cancellation_check:
+        cancellation_check()
+    if not Path(img_path).exists():
+        raise FileNotFoundError(f"image not found: {img_path}")
+
+    pdf_bytes = _image_to_searchable_pdf_bytes(img_path, lang=lang, cancellation_check=cancellation_check)
+    return index, pdf_bytes
+
+
 def build_searchable_pdf_from_images(
-        image_paths: Sequence[str],
-        output_path: str,
-        lang: str = "eng",
-        cancellation_check: Callable[[], None] | None = None,
+    image_paths: Sequence[str],
+    output_path: str,
+    lang: str = "eng",
+    cancellation_check: Callable[[], None] | None = None,
 ) -> None:
     lang = normalize_lang_spec(lang)
     validate_lang_spec(lang)
@@ -764,22 +679,32 @@ def build_searchable_pdf_from_images(
     if not image_paths:
         raise ValueError("no images provided")
 
+    total_images = len(image_paths)
+    pdf_bytes_list: list[bytes | None] = [None] * total_images
+
+    if total_images == 1 or _OCR_PAGE_WORKERS <= 1:
+        for idx, img_path in enumerate(image_paths):
+            _, b = _process_single_image_to_pdf_bytes(img_path, idx, lang, cancellation_check)
+            pdf_bytes_list[idx] = b
+    else:
+        with ThreadPoolExecutor(max_workers=_OCR_PAGE_WORKERS) as executor:
+            futures = {
+                executor.submit(_process_single_image_to_pdf_bytes, img_path, idx, lang, cancellation_check): idx
+                for idx, img_path in enumerate(image_paths)
+            }
+            for future in as_completed(futures):
+                idx, b = future.result()
+                pdf_bytes_list[idx] = b
+
     out_doc = fitz.open()
-
     try:
-        for img_path in image_paths:
-            if cancellation_check:
-                cancellation_check()
-            if not Path(img_path).exists():
-                raise FileNotFoundError(f"image not found: {img_path}")
-
-            pdf_bytes = _image_to_searchable_pdf_bytes(img_path, lang=lang, cancellation_check=cancellation_check)
-            page_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-
-            try:
-                out_doc.insert_pdf(page_doc)
-            finally:
-                page_doc.close()
+        for pdf_bytes in pdf_bytes_list:
+            if pdf_bytes:
+                page_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+                try:
+                    out_doc.insert_pdf(page_doc)
+                finally:
+                    page_doc.close()
 
         out_doc.save(output_path, garbage=4, clean=True, deflate=True)
     finally:
@@ -787,10 +712,10 @@ def build_searchable_pdf_from_images(
 
 
 def build_searchable_pdf_from_r2_images(
-        image_refs: Sequence[R2ImageRef],
-        output_path: str,
-        lang: str = "eng",
-        cancellation_check: Callable[[], None] | None = None,
+    image_refs: Sequence[R2ImageRef],
+    output_path: str,
+    lang: str = "eng",
+    cancellation_check: Callable[[], None] | None = None,
 ) -> None:
     lang = normalize_lang_spec(lang)
     validate_lang_spec(lang)
@@ -822,5 +747,23 @@ def safe_suffix(filename: str | None, fallback: str = ".bin") -> str:
     if not filename:
         return fallback
 
-    suffix = Path(filename).suffix
-    return suffix if suffix else fallback
+    ext = Path(filename).suffix.lower()
+    if ext in (
+        ".pdf",
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".tif",
+        ".tiff",
+        ".bmp",
+        ".webp",
+        ".txt",
+        ".json",
+    ):
+        return ext
+
+    guess = mimetypes.guess_extension(filename)
+    if guess:
+        return guess
+
+    return fallback

@@ -28,6 +28,12 @@ from .languages import language_name
 router = APIRouter(prefix="/api/v1/ocr", tags=["ocr"])
 logger = logging.getLogger(__name__)
 
+# Admission gate for direct OCR routes.  Dramatiq actors use Redis leases;
+# direct routes need an equivalent in-process bound to prevent unbounded
+# concurrent Tesseract processes from exhausting CPU and memory.
+_OCR_MAX_CONCURRENT = int(os.environ.get("OCR_DIRECT_MAX_CONCURRENT", "2"))
+_ocr_semaphore = threading.Semaphore(_OCR_MAX_CONCURRENT)
+
 
 def create_route_cancellation_checker(request: Request) -> tuple[Callable[[], None], Callable[[], None]]:
     cancel_event = threading.Event()
@@ -144,14 +150,22 @@ async def extract_text_from_pdf_route(
 
         lang = normalize_lang_spec(lang)
 
-        await run_in_threadpool(
-            extract_text_from_pdf,
-            input_path,
-            output_path,
-            lang,
-            file_password,
-            cancellation_check=check_cancel,
-        )
+        if not _ocr_semaphore.acquire(timeout=30):
+            raise HTTPException(
+                status_code=503,
+                detail="OCR capacity exhausted. Please try again shortly.",
+            )
+        try:
+            await run_in_threadpool(
+                extract_text_from_pdf,
+                input_path,
+                output_path,
+                lang,
+                file_password,
+                cancellation_check=check_cancel,
+            )
+        finally:
+            _ocr_semaphore.release()
 
         with open(output_path, "rb") as out_f:
             content = out_f.read()
@@ -215,13 +229,21 @@ async def images_to_searchable_pdf_route(
 
             temp_paths.append(tmp_path)
 
-        await run_in_threadpool(
-            build_searchable_pdf_from_images,
-            temp_paths,
-            output_path,
-            lang,
-            cancellation_check=check_cancel,
-        )
+        if not _ocr_semaphore.acquire(timeout=30):
+            raise HTTPException(
+                status_code=503,
+                detail="OCR capacity exhausted. Please try again shortly.",
+            )
+        try:
+            await run_in_threadpool(
+                build_searchable_pdf_from_images,
+                temp_paths,
+                output_path,
+                lang,
+                cancellation_check=check_cancel,
+            )
+        finally:
+            _ocr_semaphore.release()
 
         background_tasks.add_task(os.remove, output_path)
 
@@ -284,13 +306,21 @@ async def images_to_searchable_pdf_from_r2_route(
             for item in payload.files
         ]
 
-        await run_in_threadpool(
-            build_searchable_pdf_from_r2_images,
-            refs,
-            output_path,
-            lang,
-            cancellation_check=check_cancel,
-        )
+        if not _ocr_semaphore.acquire(timeout=30):
+            raise HTTPException(
+                status_code=503,
+                detail="OCR capacity exhausted. Please try again shortly.",
+            )
+        try:
+            await run_in_threadpool(
+                build_searchable_pdf_from_r2_images,
+                refs,
+                output_path,
+                lang,
+                cancellation_check=check_cancel,
+            )
+        finally:
+            _ocr_semaphore.release()
 
         background_tasks.add_task(os.remove, output_path)
 

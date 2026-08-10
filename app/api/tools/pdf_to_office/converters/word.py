@@ -5,6 +5,8 @@ from docx import Document
 from PIL import Image
 import pytesseract
 
+from app.core.tesseract_capacity import acquire_tesseract_capacity
+
 
 def convert_to_word(pdf_path: str, output_path: str) -> None:
     doc = fitz.open(pdf_path)
@@ -17,7 +19,8 @@ def convert_to_word(pdf_path: str, output_path: str) -> None:
                 pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
                 img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
 
-                text = pytesseract.image_to_string(img)
+                with acquire_tesseract_capacity():
+                    text = pytesseract.image_to_string(img)
                 doc_out.add_paragraph(text)
                 doc_out.add_page_break()
 

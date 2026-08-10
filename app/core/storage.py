@@ -144,16 +144,33 @@ def upload_fileobj(fileobj: BinaryIO, key: str, *, content_type: str | None = No
         return key
 
     client = get_r2_client()
-    encrypted_stream = BytesIO(encrypted_data)
 
     extra_args: dict[str, str] = {}
     if content_type:
         extra_args["ContentType"] = content_type
 
-    if extra_args:
-        client.upload_fileobj(encrypted_stream, settings.r2_bucket, key, ExtraArgs=extra_args)
-    else:
-        client.upload_fileobj(encrypted_stream, settings.r2_bucket, key)
+    # Use a temp file for the encrypted payload instead of wrapping in
+    # BytesIO to let boto3 stream from disk and free the encrypted_data
+    # buffer sooner on large files.
+    import tempfile
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".enc") as enc_f:
+        enc_f.write(encrypted_data)
+        enc_tmp_path = enc_f.name
+
+    # Allow the encrypted byte buffer to be collected before upload.
+    del encrypted_data
+
+    try:
+        with open(enc_tmp_path, "rb") as enc_f:
+            if extra_args:
+                client.upload_fileobj(enc_f, settings.r2_bucket, key, ExtraArgs=extra_args)
+            else:
+                client.upload_fileobj(enc_f, settings.r2_bucket, key)
+    finally:
+        try:
+            os.remove(enc_tmp_path)
+        except FileNotFoundError:
+            pass
 
     return key
 
@@ -175,39 +192,67 @@ def download_to_path(key: str, path: str) -> str:
         return path
 
     client = get_r2_client()
-    buffer = BytesIO()
 
-    client.download_fileobj(settings.r2_bucket, key, buffer)
+    # Stream encrypted data to a temp file instead of holding it in a
+    # BytesIO buffer.  AES-GCM still needs the full ciphertext for
+    # authentication, but the disk-backed intermediate avoids peak RAM
+    # holding encrypted + decrypted copies simultaneously.
+    enc_tmp_path = path + ".enc.tmp"
+    try:
+        with open(enc_tmp_path, "wb") as enc_f:
+            client.download_fileobj(settings.r2_bucket, key, enc_f)
 
-    decrypted_data = decrypt_data(buffer.getvalue())
+        with open(enc_tmp_path, "rb") as enc_f:
+            encrypted_data = enc_f.read()
+    finally:
+        try:
+            os.remove(enc_tmp_path)
+        except FileNotFoundError:
+            pass
+
+    decrypted_data = decrypt_data(encrypted_data)
     with open(path, "wb") as f:
         f.write(decrypted_data)
 
     return path
 
 def stream_object(key: str, *, chunk_size: int = 1024 * 1024) -> tuple[Iterator[bytes], str]:
+    import tempfile
+
     if not settings.r2_bucket:
         local_path = _get_local_file_path(key)
         with open(local_path, "rb") as f:
             encrypted_data = f.read()
         decrypted_data = decrypt_data(encrypted_data)
         content_type = mimetypes.guess_type(key)[0] or "application/octet-stream"
+    else:
+        client = get_r2_client()
+        response = client.get_object(Bucket=settings.r2_bucket, Key=key)
+        content_type = response.get("ContentType") or mimetypes.guess_type(key)[0] or "application/octet-stream"
+        encrypted_data = response["Body"].read()
+        decrypted_data = decrypt_data(encrypted_data)
+        del encrypted_data
 
-        def iterator():
-            for i in range(0, len(decrypted_data), chunk_size):
-                yield decrypted_data[i:i + chunk_size]
-
-        return iterator(), content_type
-
-    client = get_r2_client()
-    response = client.get_object(Bucket=settings.r2_bucket, Key=key)
-    content_type = response.get("ContentType") or mimetypes.guess_type(key)[0] or "application/octet-stream"
-
-    encrypted_data = response["Body"].read()
-    decrypted_data = decrypt_data(encrypted_data)
+    # Write decrypted data to a temp file and stream chunks from disk
+    # so the full plaintext does not remain in the Python heap during
+    # the (potentially slow) HTTP response iteration.
+    tmp_fd, tmp_path = tempfile.mkstemp(prefix="pdfnest-stream-")
+    with os.fdopen(tmp_fd, "wb") as tmp_f:
+        tmp_f.write(decrypted_data)
+    del decrypted_data
 
     def iterator():
-        for i in range(0, len(decrypted_data), chunk_size):
-            yield decrypted_data[i:i + chunk_size]
+        try:
+            with open(tmp_path, "rb") as f:
+                while True:
+                    chunk = f.read(chunk_size)
+                    if not chunk:
+                        break
+                    yield chunk
+        finally:
+            try:
+                os.remove(tmp_path)
+            except FileNotFoundError:
+                pass
 
     return iterator(), content_type
