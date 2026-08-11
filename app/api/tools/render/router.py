@@ -3,21 +3,165 @@ from __future__ import annotations
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import Response
 
-from .service import render_page_to_jpeg_bytes
+from .service import (
+    create_render_session,
+    delete_render_session,
+    get_render_session_page,
+    render_page_to_jpeg_bytes,
+)
 
-router = APIRouter(prefix="/api/v1/render", tags=["render"])
+router = APIRouter(
+    prefix="/api/v1/render",
+    tags=["render"],
+)
 
 
 @router.post("/page")
 async def render_page(
-    file: UploadFile = File(...),
-    page: int = Form(...),
-    dpi: float = Form(144),
+        file: UploadFile = File(...),
+        page: int = Form(...),
+        dpi: float = Form(144),
 ):
     try:
-        image_bytes = await render_page_to_jpeg_bytes(file=file, page=page, dpi=dpi)
-        return Response(content=image_bytes, media_type="image/jpeg")
+        image_bytes = await render_page_to_jpeg_bytes(
+            file=file,
+            page=page,
+            dpi=dpi,
+        )
+
+        return Response(
+            content=image_bytes,
+            media_type="image/jpeg",
+            headers={
+                "Cache-Control": "private, max-age=60",
+            },
+        )
+
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "INVALID_RENDER_REQUEST",
+                "message": str(exc),
+            },
+        ) from exc
+
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "RENDER_FAILED",
+                "message": str(exc),
+            },
+        ) from exc
+
+
+@router.post("/sessions")
+async def create_session(
+        file: UploadFile = File(...),
+):
+    try:
+        session = await create_render_session(file)
+
+        return {
+            "session_id": session.session_id,
+            "page_count": session.page_count,
+            "file_size": session.file_size,
+        }
+
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "INVALID_DOCUMENT",
+                "message": str(exc),
+            },
+        ) from exc
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "SESSION_CREATE_FAILED",
+                "message": str(exc),
+            },
+        ) from exc
+
+
+@router.get("/sessions/{session_id}/page/{page}")
+async def render_session_page(
+        session_id: str,
+        page: int,
+        dpi: float = 144,
+):
+    try:
+        image_bytes = await get_render_session_page(
+            session_id=session_id,
+            page=page,
+            dpi=dpi,
+        )
+
+        return Response(
+            content=image_bytes,
+            media_type="image/jpeg",
+            headers={
+                "Cache-Control": "private, max-age=60",
+            },
+        )
+
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "SESSION_NOT_FOUND",
+                "message": str(exc),
+            },
+        ) from exc
+
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "INVALID_RENDER_REQUEST",
+                "message": str(exc),
+            },
+        ) from exc
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "SESSION_RENDER_FAILED",
+                "message": str(exc),
+            },
+        ) from exc
+
+
+@router.delete("/sessions/{session_id}")
+async def delete_session(
+        session_id: str,
+):
+    try:
+        deleted = delete_render_session(session_id)
+
+        return {
+            "deleted": deleted,
+        }
+
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "SESSION_NOT_FOUND",
+                "message": str(exc),
+            },
+        ) from exc
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "SESSION_DELETE_FAILED",
+                "message": str(exc),
+            },
+        ) from exc
