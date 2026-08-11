@@ -105,6 +105,17 @@ class RenderSessionManager:
             session.last_accessed_at = time.time()
             return session
 
+    def get_optional(self, session_id: str) -> RenderSession | None:
+        with self._lock:
+            self._cleanup_expired_locked()
+
+            session = self._sessions.get(session_id)
+            if session is None:
+                return None
+
+            session.last_accessed_at = time.time()
+            return session
+
     def delete(self, session_id: str) -> None:
         with self._lock:
             session = self._sessions.pop(session_id, None)
