@@ -894,6 +894,35 @@ def compile_document(
                 page.clean_contents()
                 page.insert_image(page.rect, stream=img_bytes.getvalue())
 
+                # Render replacement text and formatting overlays for dirty elements on OCR/scanned page
+                for element in elements:
+                    if not is_element_dirty(element):
+                        continue
+
+                    repl_text = element.get("text", "")
+                    if not repl_text:
+                        continue
+
+                    elem_x = float(element.get("x", 0))
+                    elem_y = float(element.get("y", 0))
+                    elem_w = float(element.get("width", 0))
+                    elem_h = float(element.get("height", 0))
+
+                    target = {
+                        "operation": "replace",
+                        "original_substring": element.get("original_text", ""),
+                        "replacement_substring": repl_text,
+                        "target_bbox": [elem_x, elem_y, elem_x + elem_w, elem_y + elem_h],
+                        "baseline_y": elem_y + elem_h * 0.85,
+                        "font_info": {
+                            "name": element.get("font", "helv"),
+                            "size": element.get("size", 10.0),
+                            "color": element.get("text_color", "#000000"),
+                        },
+                    }
+
+                    render_surgical_replacement(page, target, element=element, skip_redaction=True)
+
             else:
                 # Native PDF page: apply surgical replacement & style engine
                 page_targets = []
