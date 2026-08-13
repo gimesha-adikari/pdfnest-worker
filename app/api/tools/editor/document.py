@@ -1,3 +1,4 @@
+import difflib
 import io
 import json
 import logging
@@ -395,8 +396,440 @@ def extract_document(
                 pages.append(extract_native_page(page, i + 1))
             else:
                 pages.append(extract_ocr_page(page, i + 1))
-
         return {"success": True, "pages": pages}
+
+
+def is_element_dirty(element: dict[str, Any]) -> bool:
+    """Determine whether a layout element has modified text content or style overrides."""
+    if not isinstance(element, dict):
+        return False
+
+    raw_text = element.get("text")
+    raw_orig = element.get("original_text")
+
+    text_val = "" if raw_text is None else str(raw_text)
+    orig_val = "" if raw_orig is None else str(raw_orig)
+
+    if text_val != orig_val:
+        return True
+
+    # Check style object overrides
+    style = element.get("style")
+    if isinstance(style, dict) and style:
+        for key in ["fontFamily", "fontSize", "color", "bold", "italic", "underline", "strikethrough", "background"]:
+            if style.get(key) is not None:
+                return True
+
+    # Check root-level formatting overrides
+    for key in ["bold", "italic", "underline", "strikethrough"]:
+        if element.get(key) is True:
+            return True
+
+    bg_color = element.get("bg_color")
+    if bg_color and bg_color not in ("transparent", "none", "#ffffff"):
+        return True
+
+    return False
+
+
+def tokenize_words(text: str) -> list[dict[str, Any]]:
+    """Extract word tokens from text with start and end character offsets."""
+    words: list[dict[str, Any]] = []
+    if not text:
+        return words
+
+    for m in re.finditer(r"\S+", text):
+        words.append({
+            "word": m.group(0),
+            "start": m.start(),
+            "end": m.end(),
+        })
+    return words
+
+
+def compute_text_diff(original_text: str, edited_text: str) -> list[dict[str, Any]]:
+    """Compute semantic edit diff operations between original_text and edited_text.
+
+    Uses Word-First, Character-Second diffing to ensure whole words are targeted for word edits,
+    while preserving exact character offsets and whitespace without trimming.
+    """
+    orig = "" if original_text is None else str(original_text)
+    edit = "" if edited_text is None else str(edited_text)
+
+    orig_tokens = tokenize_words(orig)
+    edit_tokens = tokenize_words(edit)
+
+    orig_word_list = [t["word"] for t in orig_tokens]
+    edit_word_list = [t["word"] for t in edit_tokens]
+
+    diff_ops: list[dict[str, Any]] = []
+
+    # 1. Fast-path: Equal number of word tokens (1-to-1 word alignment)
+    if len(orig_word_list) == len(edit_word_list) and len(orig_word_list) > 0:
+        i = 0
+        while i < len(orig_word_list):
+            if orig_word_list[i] != edit_word_list[i]:
+                start_i = i
+                while i < len(orig_word_list) and orig_word_list[i] != edit_word_list[i]:
+                    i += 1
+                end_i = i
+
+                o_start = orig_tokens[start_i]["start"]
+                o_end = orig_tokens[end_i - 1]["end"]
+                e_start = edit_tokens[start_i]["start"]
+                e_end = edit_tokens[end_i - 1]["end"]
+
+                o_sub = orig[o_start:o_end]
+                e_sub = edit[e_start:e_end]
+
+                # Check for sub-word punctuation edit within a single word token
+                if (end_i - start_i == 1) and len(orig_word_list[start_i]) > 1:
+                    matcher = difflib.SequenceMatcher(None, orig_word_list[start_i], edit_word_list[start_i])
+                    sub_ops = matcher.get_opcodes()
+                    # If diff is single punctuation replacement at end/start of word (e.g. 'Engineer.' -> 'Engineer,')
+                    if len(sub_ops) == 2 and sub_ops[0][0] == "equal" and sub_ops[1][0] == "replace":
+                        sub_tag, s_i1, s_i2, s_j1, s_j2 = sub_ops[1]
+                        sub_orig_char = orig_word_list[start_i][s_i1:s_i2]
+                        if not sub_orig_char.isalnum():
+                            diff_ops.append({
+                                "operation": "replace",
+                                "original_start": o_start + s_i1,
+                                "original_end": o_start + s_i2,
+                                "original_substring": sub_orig_char,
+                                "edited_start": e_start + s_j1,
+                                "edited_end": e_start + s_j2,
+                                "replacement_substring": edit_word_list[start_i][s_j1:s_j2],
+                                "sub_word_punctuation": True,
+                            })
+                            i = end_i
+                            continue
+
+                diff_ops.append({
+                    "operation": "replace",
+                    "original_start": o_start,
+                    "original_end": o_end,
+                    "original_substring": o_sub,
+                    "edited_start": e_start,
+                    "edited_end": e_end,
+                    "replacement_substring": e_sub,
+                    "sub_word_punctuation": False,
+                })
+            else:
+                i += 1
+        return diff_ops
+
+    # 2. General-path for unequal token counts using SequenceMatcher on word tokens
+    matcher = difflib.SequenceMatcher(None, orig_word_list, edit_word_list)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+
+        if i1 < len(orig_tokens):
+            o_start = orig_tokens[i1]["start"]
+        elif orig_tokens:
+            o_start = orig_tokens[-1]["end"]
+        else:
+            o_start = 0
+
+        if i2 > 0 and i2 - 1 < len(orig_tokens):
+            o_end = orig_tokens[i2 - 1]["end"]
+        else:
+            o_end = o_start
+
+        if j1 < len(edit_tokens):
+            e_start = edit_tokens[j1]["start"]
+        elif edit_tokens:
+            e_start = edit_tokens[-1]["end"]
+        else:
+            e_start = 0
+
+        if j2 > 0 and j2 - 1 < len(edit_tokens):
+            e_end = edit_tokens[j2 - 1]["end"]
+        else:
+            e_end = e_start
+
+        o_sub = orig[o_start:o_end] if i1 < i2 else ""
+        e_sub = edit[e_start:e_end] if j1 < j2 else ""
+
+        diff_ops.append({
+            "operation": tag,
+            "original_start": o_start,
+            "original_end": o_end,
+            "original_substring": o_sub,
+            "edited_start": e_start,
+            "edited_end": e_end,
+            "replacement_substring": e_sub,
+            "sub_word_punctuation": False,
+        })
+
+    return diff_ops
+
+
+def extract_page_char_map(page: fitz.Page) -> list[dict[str, Any]]:
+    """Extract line, span, and character geometry map from PyMuPDF page.get_text('rawdict')."""
+    try:
+        raw = page.get_text("rawdict") or {}
+    except Exception:
+        return []
+
+    blocks = raw.get("blocks", []) or []
+    lines_map: list[dict[str, Any]] = []
+
+    for block in blocks:
+        if not isinstance(block, dict) or block.get("type") != 0:
+            continue
+
+        for line in block.get("lines", []):
+            line_bbox = line.get("bbox")
+            if not line_bbox or len(line_bbox) < 4:
+                continue
+
+            chars: list[dict[str, Any]] = []
+            spans = line.get("spans", []) or []
+
+            for span in spans:
+                font_name = span.get("font", "sans-serif")
+                font_size = span.get("size", 10.0)
+                font_color = span.get("color", 0)
+                color_hex = int_color_to_hex(font_color) if isinstance(font_color, int) else "#000000"
+
+                for char_info in span.get("chars", []) or []:
+                    c = char_info.get("c", "")
+                    bbox = char_info.get("bbox")
+                    origin = char_info.get("origin")
+                    if not bbox or len(bbox) < 4:
+                        continue
+
+                    chars.append({
+                        "c": c,
+                        "bbox": bbox,
+                        "origin": origin if origin and len(origin) >= 2 else (bbox[0], bbox[3]),
+                        "font": font_name,
+                        "size": font_size,
+                        "color": color_hex,
+                    })
+
+            line_text = "".join(c["c"] for c in chars)
+            if not line_text.strip() and not chars:
+                continue
+
+            lines_map.append({
+                "bbox": line_bbox,
+                "text": line_text,
+                "chars": chars,
+                "y0": float(line_bbox[1]),
+                "y1": float(line_bbox[3]),
+                "x0": float(line_bbox[0]),
+                "x1": float(line_bbox[2]),
+            })
+
+    return lines_map
+
+
+def resolve_surgical_targets(page: fitz.Page, element: dict[str, Any]) -> list[dict[str, Any]]:
+    """Determine fine-grained surgical targets (bboxes and metadata) for modified text in a dirty element."""
+    if not is_element_dirty(element):
+        return []
+
+    orig_text = str(element.get("original_text", ""))
+    edit_text = str(element.get("text", ""))
+
+    diff_ops = compute_text_diff(orig_text, edit_text)
+
+    # Style-only edit support: target specific word/substring if specified in payload
+    if not diff_ops and is_element_dirty(element):
+        target_sub = element.get("target_substring") or element.get("original_substring") or element.get("target_text")
+        if target_sub and str(target_sub) in orig_text:
+            target_sub_str = str(target_sub)
+            sel_start = element.get("selection_start")
+            sel_end = element.get("selection_end")
+            if sel_start is not None and sel_end is not None and 0 <= int(sel_start) <= len(orig_text) and int(sel_end) <= len(orig_text):
+                s_idx = int(sel_start)
+                e_idx = int(sel_end)
+            else:
+                s_idx = orig_text.find(target_sub_str)
+                e_idx = s_idx + len(target_sub_str)
+
+            diff_ops = [{
+                "operation": "replace",
+                "original_start": s_idx,
+                "original_end": e_idx,
+                "original_substring": target_sub_str,
+                "edited_start": s_idx,
+                "edited_end": e_idx,
+                "replacement_substring": target_sub_str,
+                "sub_word_punctuation": False,
+            }]
+        elif target_sub:
+            # Target specified but not found in original text -> safety rule: return empty list, do NOT fall back to line!
+            return []
+        else:
+            # Target full original_text when explicit style override applies to full element
+            diff_ops = [{
+                "operation": "replace",
+                "original_start": 0,
+                "original_end": len(orig_text),
+                "original_substring": orig_text,
+                "edited_start": 0,
+                "edited_end": len(edit_text),
+                "replacement_substring": edit_text,
+                "sub_word_punctuation": False,
+            }]
+
+    if not diff_ops:
+        return []
+
+    elem_x = float(element.get("x", 0))
+    elem_y = float(element.get("y", 0))
+    elem_w = float(element.get("width", 0))
+    elem_h = float(element.get("height", 0))
+    elem_size = float(element.get("size", 10.0))
+    elem_font = str(element.get("font", "sans-serif"))
+    elem_color = str(element.get("text_color", "#000000"))
+
+    line_map = extract_page_char_map(page)
+
+    matched_line = None
+    y_matches = [
+        line for line in line_map
+        if abs(line["y0"] - elem_y) <= 4.0 or abs((line["y0"] + line["y1"]) / 2.0 - (elem_y + elem_h / 2.0)) <= 4.0
+    ]
+
+    if len(y_matches) == 1:
+        matched_line = y_matches[0]
+    elif len(y_matches) > 1:
+        matched_line = max(
+            y_matches,
+            key=lambda l: difflib.SequenceMatcher(None, l["text"], orig_text).ratio()
+        )
+    else:
+        text_matches = [
+            line for line in line_map
+            if orig_text and (orig_text in line["text"] or line["text"] in orig_text or difflib.SequenceMatcher(None, line["text"], orig_text).ratio() > 0.8)
+        ]
+        if text_matches:
+            matched_line = max(
+                text_matches,
+                key=lambda l: difflib.SequenceMatcher(None, l["text"], orig_text).ratio()
+            )
+
+    targets: list[dict[str, Any]] = []
+
+    for op in diff_ops:
+        tag = op["operation"]
+        i1 = op["original_start"]
+        i2 = op["original_end"]
+        orig_sub = op["original_substring"]
+        repl_sub = op["replacement_substring"]
+
+        next_word_x = None
+
+        if matched_line and matched_line["chars"]:
+            line_chars = matched_line["chars"]
+
+            # Geometrical neighbor calculation: find x0 of next non-space character after i2
+            if i2 < len(line_chars):
+                for char_info in line_chars[i2:]:
+                    c_str = char_info.get("c", "")
+                    if c_str and not c_str.isspace():
+                        next_word_x = float(char_info["bbox"][0])
+                        break
+
+            if tag in ("replace", "delete"):
+                if 0 <= i1 < len(line_chars) and 0 < i2 <= len(line_chars) and i1 < i2:
+                    target_chars = line_chars[i1:i2]
+                    min_x = min(c["bbox"][0] for c in target_chars)
+                    min_y = min(c["bbox"][1] for c in target_chars)
+                    max_x = max(c["bbox"][2] for c in target_chars)
+                    max_y = max(c["bbox"][3] for c in target_chars)
+                    baseline_y = float(sum(c["origin"][1] for c in target_chars) / len(target_chars))
+
+                    first_char = target_chars[0]
+                    font_info = {
+                        "name": first_char.get("font", elem_font),
+                        "size": first_char.get("size", elem_size),
+                        "color": first_char.get("color", elem_color),
+                    }
+
+                    granularity = "character" if op.get("sub_word_punctuation") else "word"
+
+                    targets.append({
+                        "operation": tag,
+                        "original_substring": orig_sub,
+                        "replacement_substring": repl_sub,
+                        "original_start": i1,
+                        "original_end": i2,
+                        "granularity": granularity,
+                        "target_bbox": [min_x, min_y, max_x, max_y],
+                        "baseline_y": baseline_y,
+                        "font_info": font_info,
+                        "insertion_point": None,
+                        "character_count": len(target_chars),
+                        "next_word_x": next_word_x,
+                        "confidence": "exact",
+                    })
+                    continue
+
+            elif tag == "insert":
+                if i1 > 0 and i1 - 1 < len(line_chars):
+                    anchor_char = line_chars[i1 - 1]
+                    ins_x = float(anchor_char["bbox"][2])
+                    ins_y = float(anchor_char["origin"][1])
+                    font_info = {
+                        "name": anchor_char.get("font", elem_font),
+                        "size": anchor_char.get("size", elem_size),
+                        "color": anchor_char.get("color", elem_color),
+                    }
+                elif i1 == 0 and len(line_chars) > 0:
+                    anchor_char = line_chars[0]
+                    ins_x = float(anchor_char["bbox"][0])
+                    ins_y = float(anchor_char["origin"][1])
+                    font_info = {
+                        "name": anchor_char.get("font", elem_font),
+                        "size": anchor_char.get("size", elem_size),
+                        "color": anchor_char.get("color", elem_color),
+                    }
+                else:
+                    ins_x = elem_x
+                    ins_y = elem_y + elem_h * 0.85
+                    font_info = {"name": elem_font, "size": elem_size, "color": elem_color}
+
+                targets.append({
+                    "operation": tag,
+                    "original_substring": orig_sub,
+                    "replacement_substring": repl_sub,
+                    "original_start": i1,
+                    "original_end": i2,
+                    "granularity": "insertion_point",
+                    "target_bbox": None,
+                    "baseline_y": ins_y,
+                    "font_info": font_info,
+                    "insertion_point": [ins_x, ins_y],
+                    "character_count": 0,
+                    "next_word_x": next_word_x,
+                    "confidence": "exact",
+                })
+                continue
+
+        # Fallback to line element bounding box if character mapping failed
+        fallback_bbox = [elem_x, elem_y, elem_x + elem_w, elem_y + elem_h]
+        targets.append({
+            "operation": tag,
+            "original_substring": orig_sub,
+            "replacement_substring": repl_sub,
+            "original_start": i1,
+            "original_end": i2,
+            "granularity": "line",
+            "target_bbox": None if tag == "insert" else fallback_bbox,
+            "baseline_y": elem_y + elem_h * 0.85,
+            "font_info": {"name": elem_font, "size": elem_size, "color": elem_color},
+            "insertion_point": [elem_x, elem_y + elem_h * 0.85] if tag == "insert" else None,
+            "character_count": len(orig_sub),
+            "next_word_x": None,
+            "confidence": "line_fallback",
+        })
+
+    return targets
 
 
 def compile_document(
@@ -428,13 +861,10 @@ def compile_document(
                 draw = ImageDraw.Draw(img)
 
                 for element in elements:
+                    if not is_element_dirty(element):
+                        continue
+
                     try:
-                        text_val = str(element.get("text", "")).strip()
-                        orig_text = str(element.get("original_text", "")).strip()
-
-                        if text_val == orig_text:
-                            continue
-
                         w = float(element.get("width", 0))
                         h = float(element.get("height", 0))
                         if w <= 0 or h <= 0:
@@ -465,75 +895,280 @@ def compile_document(
                 page.insert_image(page.rect, stream=img_bytes.getvalue())
 
             else:
+                # Native PDF page: apply surgical replacement & style engine
+                page_targets = []
                 for element in elements:
-                    try:
-                        w = float(element.get("width", 0))
-                        h = float(element.get("height", 0))
-                        if w <= 0 or h <= 0:
-                            continue
-
-                        x0 = float(element.get("x", 0))
-                        y0 = float(element.get("y", 0))
-                        bg_hex = element.get("bg_color", "#ffffff")
-                        bg_hex = "#ffffff" if bg_hex == "transparent" else bg_hex
-                        color_rgb = hex_to_rgb(bg_hex)
-
-                        rect = fitz.Rect(x0 - 1, y0 - 1, x0 + w + 1, y0 + h + 1)
-                        page.add_redact_annot(rect, fill=color_rgb)
-                    except (ValueError, TypeError):
+                    if not is_element_dirty(element):
                         continue
 
-                page.apply_redactions()
+                    targets = resolve_surgical_targets(page, element)
+                    if not targets:
+                        targets = [{
+                            "operation": "replace",
+                            "original_substring": element.get("original_text", ""),
+                            "replacement_substring": element.get("text", ""),
+                            "target_bbox": [
+                                float(element.get("x", 0)),
+                                float(element.get("y", 0)),
+                                float(element.get("x", 0)) + float(element.get("width", 0)),
+                                float(element.get("y", 0)) + float(element.get("height", 0)),
+                            ],
+                            "baseline_y": float(element.get("y", 0)) + float(element.get("height", 0)) * 0.85,
+                            "font_info": {
+                                "name": element.get("font", "helv"),
+                                "size": element.get("size", 10.0),
+                                "color": element.get("text_color", "#000000"),
+                            },
+                        }]
 
-            for element in elements:
-                text_val = str(element.get("text", "")).strip()
-                orig_text = str(element.get("original_text", "")).strip()
+                    for target in targets:
+                        page_targets.append((target, element))
 
-                if is_ocr_page and text_val == orig_text:
-                    continue
+                # Step 1: Add all redaction annotations on page
+                has_redactions = False
+                for target, element in page_targets:
+                    op = target.get("operation", "replace")
+                    bbox = target.get("target_bbox")
+                    if op in ("replace", "delete") and bbox and len(bbox) >= 4:
+                        page.add_redact_annot(fitz.Rect(*bbox), fill=None)
+                        has_redactions = True
 
-                if not text_val:
-                    continue
+                # Step 2: Apply all redactions in a single clean pass
+                if has_redactions:
+                    page.apply_redactions()
 
-                try:
-                    x0 = float(element.get("x", 0))
-                    y0 = float(element.get("y", 0))
-                    w = float(element.get("width", 0))
-                    h = float(element.get("height", 0))
-
-                    fallback_size = h * 1.15
-                    font_size = float(element.get("size", fallback_size))
-
-                    font_code = str(element.get("font", "tiro")).lower()
-                    valid_pdf_fonts = ["helv", "hebo", "tiro", "tibo", "cour", "cobo", "symb", "zadb"]
-                    if font_code not in valid_pdf_fonts:
-                        font_code = "tiro"
-
-                    text_color_hex = element.get("text_color", "#000000")
-                    color_rgb = hex_to_rgb(text_color_hex)
-
-                    # A tight textbox makes PyMuPDF shrink the requested font size to fit.
-                    expanded_render_rect = fitz.Rect(x0, y0 - (h * 0.1), x0 + w + 20, y0 + h * 1.5)
-
-                    rc = page.insert_textbox(
-                        expanded_render_rect,
-                        text_val,
-                        fontsize=font_size,
-                        fontname=font_code,
-                        color=color_rgb,
-                        align=0,
-                    )
-
-                    if rc < 0:
-                        page.insert_text(
-                            fitz.Point(x0, y0 + h * 0.85),
-                            text_val,
-                            fontsize=font_size,
-                            fontname=font_code,
-                            color=color_rgb,
-                        )
-                except (ValueError, TypeError, fitz.FitzError) as e:
-                    logger.warning("Failed to insert text on page %s: %s", page_idx, e)
-                    continue
+                # Step 3: Render replacement text, user highlights, and decorations
+                for target, element in page_targets:
+                    render_surgical_replacement(page, target, element=element, fill_color=None, skip_redaction=True)
 
         doc.save(output_pdf_path, garbage=3, deflate=True)
+
+
+def resolve_pdf_font_variant(family: str, bold: bool = False, italic: bool = False) -> str:
+    """Map font family and bold/italic flags to PyMuPDF font code."""
+    f = str(family or "").lower()
+
+    if "times" in f or "tiro" in f or "serif" in f:
+        if bold and italic:
+            return "tibi"
+        if bold:
+            return "tibo"
+        if italic:
+            return "tiit"
+        return "tiro"
+    elif "cour" in f or "mono" in f:
+        if bold and italic:
+            return "cobi"
+        if bold:
+            return "cobo"
+        if italic:
+            return "coit"
+        return "cour"
+    else:
+        if bold and italic:
+            return "hebi"
+        if bold:
+            return "hebo"
+        if italic:
+            return "heit"
+        return "helv"
+
+
+def compute_effective_style(element: dict[str, Any], font_info: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Compute effective style by merging original PDF font info with user style overrides.
+
+    original_style + user_style_overrides = final_style
+    """
+    font_info = font_info or {}
+    element = element or {}
+    style_override = element.get("style") or {}
+    if not isinstance(style_override, dict):
+        style_override = {}
+
+    orig_font = str(font_info.get("name", element.get("font", "helv"))).lower()
+    orig_size = float(font_info.get("size", element.get("size", 10.0)))
+    orig_color = str(font_info.get("color", element.get("text_color", "#000000")))
+
+    font_family_override = style_override.get("fontFamily")
+    if not font_family_override or font_family_override == "original":
+        font_family = orig_font
+        font_source = "original_embedded" if font_info.get("embedded") else "original_pdf"
+    else:
+        font_family = str(font_family_override).lower()
+        font_source = "user_override"
+
+    font_size = float(style_override.get("fontSize") or element.get("size", orig_size))
+    color = str(style_override.get("color") or element.get("text_color", orig_color))
+
+    bold = bool(style_override.get("bold", element.get("bold", False)))
+    italic = bool(style_override.get("italic", element.get("italic", False)))
+
+    font_code = resolve_pdf_font_variant(font_family, bold=bold, italic=italic)
+
+    underline = bool(style_override.get("underline", element.get("underline", False)))
+    strikethrough = bool(style_override.get("strikethrough", element.get("strikethrough", False)))
+
+    user_bg = style_override.get("background") or element.get("bg_color")
+    bg_enabled = False
+    bg_color = None
+
+    if isinstance(user_bg, dict):
+        bg_enabled = bool(user_bg.get("enabled", True))
+        bg_color = user_bg.get("color")
+    elif isinstance(user_bg, str) and user_bg and user_bg not in ("transparent", "none"):
+        bg_enabled = True
+        bg_color = user_bg
+
+    return {
+        "font_code": font_code,
+        "font_family": font_family,
+        "font_source": font_source,
+        "orig_font": orig_font,
+        "font_size": font_size,
+        "color": color,
+        "bold": bold,
+        "italic": italic,
+        "underline": underline,
+        "strikethrough": strikethrough,
+        "user_bg_enabled": bg_enabled,
+        "user_bg_color": bg_color,
+    }
+
+
+def render_surgical_replacement(
+    page: fitz.Page,
+    target: dict[str, Any],
+    element: dict[str, Any] | None = None,
+    fill_color: tuple[float, float, float] | None = None,
+    font_file: str | None = None,
+    skip_redaction: bool = False,
+) -> dict[str, Any]:
+    """Render surgical word/substring replacement with rich formatting and background preservation.
+
+    Returns detailed metrics on target replacement.
+    """
+    element = element or {}
+    op = target.get("operation", "replace")
+    target_bbox = target.get("target_bbox")
+    baseline_y = float(target.get("baseline_y", 0.0))
+    font_info = target.get("font_info", {}) or {}
+
+    style = compute_effective_style(element, font_info)
+    font_code = style["font_code"]
+    font_size = style["font_size"]
+    color_rgb = hex_to_rgb(style["color"])
+    replacement_text = str(target.get("replacement_substring", ""))
+
+    orig_width = 0.0
+    if target_bbox and len(target_bbox) >= 4:
+        orig_width = float(target_bbox[2] - target_bbox[0])
+
+    # 1. TYPE A: Original PDF background preservation via transparent redaction fill=None
+    if not skip_redaction and op in ("replace", "delete") and target_bbox and len(target_bbox) >= 4:
+        rect = fitz.Rect(*target_bbox)
+        page.add_redact_annot(rect, fill=fill_color)
+        page.apply_redactions()
+
+    # 2. TYPE B: User-requested text highlight / background
+    if style["user_bg_enabled"] and style["user_bg_color"] and target_bbox and len(target_bbox) >= 4:
+        user_bg_rgb = hex_to_rgb(style["user_bg_color"])
+        bg_rect = fitz.Rect(
+            target_bbox[0] - 1.0,
+            target_bbox[1] - 1.0,
+            target_bbox[2] + 1.0,
+            target_bbox[3] + 1.0,
+        )
+        page.draw_rect(bg_rect, color=None, fill=user_bg_rgb)
+
+    ins_x = 0.0
+    if op == "insert":
+        ins_pt = target.get("insertion_point")
+        if ins_pt and len(ins_pt) >= 2:
+            ins_x, baseline_y = float(ins_pt[0]), float(ins_pt[1])
+        elif target_bbox and len(target_bbox) >= 4:
+            ins_x, baseline_y = float(target_bbox[0]), float(target_bbox[1])
+    elif target_bbox and len(target_bbox) >= 4:
+        ins_x = float(target_bbox[0])
+
+    rendered_width = 0.0
+    warnings = []
+    font_scaled = False
+    collides = False
+
+    # 3. Geometrical Neighbor Collision Detection
+    next_word_x = target.get("next_word_x")
+    if next_word_x is not None:
+        available_width = max(0.0, float(next_word_x) - ins_x - 2.0)
+    elif target_bbox and len(target_bbox) >= 4:
+        available_width = max(orig_width, float(page.rect.width) - ins_x - 20.0)
+    else:
+        available_width = max(orig_width, 100.0)
+
+    if replacement_text and op in ("replace", "insert"):
+        unscaled_width = fitz.get_text_length(replacement_text, fontname=font_code, fontsize=font_size)
+
+        if next_word_x is not None and unscaled_width > available_width:
+            collides = True
+            warnings.append(
+                f"Collision warning: replacement text width ({unscaled_width:.1f}pt) "
+                f"exceeds available width ({available_width:.1f}pt) to neighboring word."
+            )
+            scale_ratio = available_width / unscaled_width
+            if scale_ratio >= 0.70:
+                font_size = font_size * scale_ratio
+                font_scaled = True
+                warnings.append(f"Font size adjusted to {font_size:.1f}pt to prevent collision.")
+
+        insert_pt = fitz.Point(ins_x, baseline_y)
+        if font_file:
+            page.insert_text(
+                insert_pt,
+                replacement_text,
+                fontsize=font_size,
+                fontfile=font_file,
+                color=color_rgb,
+            )
+        else:
+            page.insert_text(
+                insert_pt,
+                replacement_text,
+                fontsize=font_size,
+                fontname=font_code,
+                color=color_rgb,
+            )
+
+        rendered_width = fitz.get_text_length(replacement_text, fontname=font_code, fontsize=font_size)
+
+        # 4. Text decorations (Underline & Strikethrough)
+        if style["underline"]:
+            u_y = baseline_y + font_size * 0.12
+            page.draw_line(
+                fitz.Point(ins_x, u_y),
+                fitz.Point(ins_x + rendered_width, u_y),
+                color=color_rgb,
+                width=max(0.8, font_size * 0.06),
+            )
+
+        if style["strikethrough"]:
+            s_y = baseline_y - font_size * 0.28
+            page.draw_line(
+                fitz.Point(ins_x, s_y),
+                fitz.Point(ins_x + rendered_width, s_y),
+                color=color_rgb,
+                width=max(0.8, font_size * 0.06),
+            )
+
+    return {
+        "operation": op,
+        "original_width": orig_width,
+        "rendered_width": rendered_width,
+        "width_diff": rendered_width - orig_width,
+        "available_width": available_width,
+        "collides": collides,
+        "font_used": font_code if not font_file else font_file,
+        "font_scaled": font_scaled,
+        "baseline_y": baseline_y,
+        "insertion_x": ins_x,
+        "style": style,
+        "warnings": warnings,
+    }
