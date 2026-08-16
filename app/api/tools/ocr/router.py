@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timezone
 import logging
 import os
 import shutil
@@ -43,6 +44,7 @@ def create_route_cancellation_checker(request: Request) -> tuple[Callable[[], No
         while not cancel_event.is_set():
             try:
                 if await request.is_disconnected():
+                    logger.info("[FORENSIC %s] Worker Disconnect Detected on route %s", datetime.now(timezone.utc).isoformat(), request.url.path)
                     logger.info("[OCR CANCELLATION] Client disconnect detected on route %s", request.url.path)
                     cancel_event.set()
                     break
@@ -191,6 +193,7 @@ async def extract_text_from_pdf_route(
     finally:
         cleanup_cancel()
         _cleanup_paths(input_path, output_path)
+        logger.info("[FORENSIC %s] Cleanup Completed on route %s", datetime.now(timezone.utc).isoformat(), request.url.path)
 
 
 @router.post("/to-text-pdf")

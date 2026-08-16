@@ -7,10 +7,10 @@ import re
 import subprocess
 import tempfile
 import unicodedata
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from functools import lru_cache
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Any, Callable, Sequence
 
 import pymupdf as fitz
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps, ImageStat
@@ -460,11 +460,23 @@ def page_to_ocr_text(
     lang = normalize_lang_spec(lang)
     validate_lang_spec(lang)
 
+    if cancellation_check:
+        cancellation_check()
+
     image = _render_page_image(page, dpi=dpi)
+
+    if cancellation_check:
+        cancellation_check()
+
     prepared = _prepare_image_for_text_ocr(image)
+
+    if cancellation_check:
+        cancellation_check()
 
     if _is_auto_lang_spec(lang):
         preview = _render_page_preview(page)
+        if cancellation_check:
+            cancellation_check()
         resolved_lang = _resolve_auto_lang_spec_from_text_and_image(
             text_hint=page.get_text("text") or "",
             image=preview,
@@ -502,10 +514,16 @@ def _process_page_for_text_extraction(
 
     doc = open_document(input_path, password=password)
     try:
+        if cancellation_check:
+            cancellation_check()
+
         page = doc[page_num]
         native_text = (page.get_text("text") or "").strip()
         if native_text:
             return page_num, native_text
+
+        if cancellation_check:
+            cancellation_check()
 
         ocr_text = page_to_ocr_text(page, lang=lang, cancellation_check=cancellation_check)
         return page_num, ocr_text
@@ -527,6 +545,9 @@ def extract_text_from_pdf(
     Page output ordering is 100% preserved via indexed array assignment.
     Active Tesseract processes are strictly guarded by acquire_tesseract_capacity.
     """
+    if cancellation_check:
+        cancellation_check()
+
     lang = normalize_lang_spec(lang)
     validate_lang_spec(lang)
 
@@ -543,24 +564,59 @@ def extract_text_from_pdf(
 
     if total_pages == 1 or _OCR_PAGE_WORKERS <= 1:
         for i in range(total_pages):
+            if cancellation_check:
+                cancellation_check()
             _, text = _process_page_for_text_extraction(input_path, i, password, lang, cancellation_check)
             page_results[i] = text
     else:
-        with ThreadPoolExecutor(max_workers=_OCR_PAGE_WORKERS) as executor:
-            futures = {
-                executor.submit(_process_page_for_text_extraction, input_path, i, password, lang, cancellation_check): i
-                for i in range(total_pages)
-            }
+        executor = ThreadPoolExecutor(max_workers=_OCR_PAGE_WORKERS)
+        futures: dict[Any, int] = {}
+        try:
+            for i in range(total_pages):
+                if cancellation_check:
+                    cancellation_check()
+                fut = executor.submit(
+                    _process_page_for_text_extraction,
+                    input_path,
+                    i,
+                    password,
+                    lang,
+                    cancellation_check,
+                )
+                futures[fut] = i
+
             for future in as_completed(futures):
+                if cancellation_check:
+                    cancellation_check()
                 idx, text = future.result()
                 page_results[idx] = text
+        except Exception:
+            for fut in futures:
+                fut.cancel()
+            executor.shutdown(wait=False, cancel_futures=True)
+            raise
+        else:
+            executor.shutdown(wait=True)
 
-    with open(output_path, "w", encoding="utf-8") as out:
-        for i, text in enumerate(page_results):
-            if text and text.strip():
-                out.write(f"--- START OF PAGE {i + 1} ---\n")
-                out.write(text.rstrip() + "\n")
-                out.write("--- END OF PAGE ---\n\n")
+    if cancellation_check:
+        cancellation_check()
+
+    try:
+        with open(output_path, "w", encoding="utf-8") as out:
+            for i, text in enumerate(page_results):
+                if cancellation_check:
+                    cancellation_check()
+                if text and text.strip():
+                    out.write(f"--- START OF PAGE {i + 1} ---\n")
+                    out.write(text.rstrip() + "\n")
+                    out.write("--- END OF PAGE ---\n\n")
+    except Exception:
+        if os.path.exists(output_path):
+            try:
+                os.remove(output_path)
+            except OSError:
+                pass
+        raise
 
 
 def _image_to_searchable_pdf_bytes(

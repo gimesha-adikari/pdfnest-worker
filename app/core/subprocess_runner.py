@@ -7,6 +7,8 @@ import subprocess
 import time
 from typing import Callable
 
+from datetime import datetime, timezone
+
 logger = logging.getLogger(__name__)
 
 
@@ -17,6 +19,7 @@ def kill_process_group(pgid: int, term_grace_seconds: float = 1.0) -> None:
 
     try:
         os.killpg(pgid, signal.SIGTERM)
+        logger.info("[FORENSIC %s] SIGTERM Sent to process group %d", datetime.now(timezone.utc).isoformat(), pgid)
         logger.info("[SUBPROCESS HARDENING] Sent SIGTERM to process group %d", pgid)
     except (ProcessLookupError, PermissionError, OSError):
         return
@@ -27,11 +30,13 @@ def kill_process_group(pgid: int, term_grace_seconds: float = 1.0) -> None:
             os.killpg(pgid, 0)
             time.sleep(0.05)
         except (ProcessLookupError, OSError):
+            logger.info("[FORENSIC %s] Tesseract Exited cleanly on SIGTERM (PGID: %d)", datetime.now(timezone.utc).isoformat(), pgid)
             logger.info("[SUBPROCESS HARDENING] Process group %d exited cleanly on SIGTERM", pgid)
             return
 
     try:
         os.killpg(pgid, signal.SIGKILL)
+        logger.warning("[FORENSIC %s] SIGKILL Sent (if needed) to process group %d", datetime.now(timezone.utc).isoformat(), pgid)
         logger.warning("[SUBPROCESS HARDENING] Sent SIGKILL to process group %d after grace timeout", pgid)
     except (ProcessLookupError, PermissionError, OSError):
         pass
