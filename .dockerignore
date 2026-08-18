@@ -1,28 +1,36 @@
-.git/
-.idea/
-.vscode/
-__pycache__/
-.pytest_cache/
-.mypy_cache
-.ruff_cache
-.venv/
-venv/
-env
-dist
-build
-*.log
+# Git
+.git
+.gitignore
+
+# Environment files
 .env
 .env.*
-*.pyc
-*.pyo
-*.pyd
-*.swp
-*.swo
-.gitignore
+!.env.example
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
 .mypy_cache/
 .ruff_cache/
-node_modules/
-dist/
-build/
-coverage/
+.coverage
 htmlcov/
+
+# Python Virtual Environments
+.venv/
+venv/
+ENV/
+env/
+
+# Logs and temp files
+*.log
+tmp/
+
+# OS and Editor metadata
+.DS_Store
+Thumbs.db
+.vscode
+.idea
+*.swp
+*.swo
