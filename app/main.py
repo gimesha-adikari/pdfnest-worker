@@ -46,12 +46,15 @@ async def lifespan(app: FastAPI):
     print(f"[{APP_NAME}] shutting down")
 
 
+from app.core.security import WorkerAuthMiddleware
+
 app = FastAPI(
     title=APP_NAME,
     version=APP_VERSION,
     lifespan=lifespan,
 )
 
+app.add_middleware(WorkerAuthMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,

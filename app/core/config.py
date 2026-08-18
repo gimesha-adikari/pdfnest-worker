@@ -31,5 +31,7 @@ class Settings:
     r2_secret_key: str = os.getenv("R2_SECRET_KEY", "").strip('\'" ')
     r2_endpoint: str = os.getenv("R2_ENDPOINT", "").strip('\'" ')
 
+    worker_shared_secret: str = os.getenv("WORKER_SHARED_SECRET", "dev-secret-change-in-production").strip()
+
 
 settings = Settings()

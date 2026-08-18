@@ -9,6 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
+from tests.test_security import generate_headers
 
 client = TestClient(app)
 
@@ -24,11 +25,13 @@ def create_sample_pdf() -> bytes:
 
 def test_redact_success_cleans_up_input():
     pdf_bytes = create_sample_pdf()
+    headers = generate_headers("POST", "/api/v1/redact")
 
     response = client.post(
         "/api/v1/redact",
         files={"file": ("test.pdf", io.BytesIO(pdf_bytes), "application/pdf")},
         data={"keywords": "CONFIDENTIAL", "boxes": "[]"},
+        headers=headers,
     )
 
     assert response.status_code == 200
@@ -37,6 +40,7 @@ def test_redact_success_cleans_up_input():
 
 def test_redact_failure_cleans_up_both_temp_files():
     pdf_bytes = create_sample_pdf()
+    headers = generate_headers("POST", "/api/v1/redact")
 
     # Mock redact_pdf to raise an exception
     with patch("app.api.tools.redact.router.redact_pdf", side_effect=ValueError("Simulated processing error")):
@@ -44,6 +48,7 @@ def test_redact_failure_cleans_up_both_temp_files():
             "/api/v1/redact",
             files={"file": ("test.pdf", io.BytesIO(pdf_bytes), "application/pdf")},
             data={"keywords": "CONFIDENTIAL", "boxes": "[]"},
+            headers=headers,
         )
 
         assert response.status_code == 500
