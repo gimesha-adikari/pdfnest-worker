@@ -39,6 +39,7 @@ class JobRecord(BaseModel):
     result: dict[str, Any] | None = None
     error: str | None = None
     cancel_requested: bool = False
+    owner_identity: str | None = None
 
 
 class TestJobRequest(BaseModel):

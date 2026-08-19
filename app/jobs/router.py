@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+from pydantic import BaseModel
 from fastapi import APIRouter, Body, Header, HTTPException
 
 from app.jobs.actors import (
@@ -61,3 +63,25 @@ def cancel_job(job_id: str, x_owner_identity: str | None = Header(None)) -> JobR
         return job
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc))
+
+
+class JobSubmitRequest(BaseModel):
+    actor_name: str
+    args: list[Any] = []
+    kwargs: dict[str, Any] = {}
+
+
+@router.post("/submit")
+def submit_generic_job(request: JobSubmitRequest) -> dict[str, Any]:
+    from app.jobs import actors
+
+    actor = getattr(actors, request.actor_name, None)
+    if actor is None:
+        raise HTTPException(status_code=400, detail=f"Actor '{request.actor_name}' not found")
+
+    job_id = request.args[0] if request.args and isinstance(request.args[0], str) else None
+    if job_id and get_job(job_id) is None:
+        create_job(request.actor_name, job_id=job_id)
+
+    actor.send(*request.args, **request.kwargs)
+    return {"success": True, "message": f"Job submitted to {request.actor_name}"}

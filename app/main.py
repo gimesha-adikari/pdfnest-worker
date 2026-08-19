@@ -21,6 +21,7 @@ from app.api.tools.redact.router import router as redact_router
 from app.api.tools.sign.router import router as sign_router
 from app.api.landing.router import router as landing_router
 from app.api.tools.ocr.router import router as ocr_router
+from app.api.tools.markdown.router import router as markdown_router
 
 import os
 
@@ -139,6 +140,7 @@ app.include_router(redact_router)
 app.include_router(sign_router)
 app.include_router(landing_router)
 app.include_router(ocr_router)
+app.include_router(markdown_router)
 
 warnings.filterwarnings(
     "ignore",

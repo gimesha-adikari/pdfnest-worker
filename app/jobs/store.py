@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import json
+import logging
 from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 from redis.exceptions import WatchError
+
+logger = logging.getLogger(__name__)
 
 from app.core.config import settings
 from app.core.redis import redis_client
@@ -29,17 +33,20 @@ def job_key(job_id: str) -> str:
 def create_job(
     job_type: str,
     *,
+    job_id: str | None = None,
     queue_name: JobQueue = JobQueue.default,
     payload: dict[str, Any] | None = None,
+    owner_identity: str | None = None,
 ) -> JobRecord:
     now = utcnow()
     job = JobRecord(
-        id=str(uuid4()),
+        id=job_id or str(uuid4()),
         job_type=job_type,
         queue_name=queue_name,
         created_at=now,
         updated_at=now,
         payload=payload or {},
+        owner_identity=owner_identity,
     )
     save_job(job)
     return job
@@ -92,6 +99,41 @@ def save_job(job: JobRecord) -> None:
                 continue
 
     prune_expired_job_index()
+
+    # Sync task status to Go backend Redis key format pdfnest:tasks:<job.id>
+    try:
+        task_key = f"pdfnest:tasks:{job.id}"
+        existing_task_raw = redis_client.get(task_key)
+        existing_task = json.loads(existing_task_raw) if existing_task_raw else {}
+
+        status_map = {
+            JobState.queued: "QUEUED",
+            JobState.running: "PROCESSING",
+            JobState.succeeded: "COMPLETED",
+            JobState.failed: "FAILED",
+            JobState.cancelled: "CANCELLED",
+            JobState.cancel_requested: "CANCELLED",
+        }
+
+        task_status = status_map.get(job.status, "PROCESSING")
+        result_key = (job.result or {}).get("artifact_key", "")
+
+        task_data = {
+            "id": job.id,
+            "status": task_status,
+            "progress": job.progress,
+            "resultKey": result_key,
+            "resultUrl": f"r2://{result_key}" if result_key else "",
+            "ownerIdentity": existing_task.get("ownerIdentity", job.owner_identity or ""),
+            "reservationId": existing_task.get("reservationId", ""),
+            "downloadToken": existing_task.get("downloadToken", ""),
+            "error": job.error or job.message or "",
+            "updatedAt": int(job.updated_at.timestamp()),
+        }
+
+        redis_client.set(task_key, json.dumps(task_data), ex=3600)
+    except Exception as e:
+        logger.warning(f"[TASK SYNC FAIL] Failed to sync task {job.id}: {e}")
 
 
 def get_job(job_id: str) -> JobRecord | None:
