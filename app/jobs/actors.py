@@ -14,6 +14,7 @@ import pymupdf as fitz
 from app.api.tools.editor.document import compile_document, extract_document
 from app.api.tools.editor.utils import cleanup_paths, temp_file_path
 from app.api.tools.markup.document import process_markup_pdf
+from app.api.tools.markdown.service import convert_pdf_to_markdown
 from app.core.broker import broker  # noqa: F401
 from app.core.storage import build_key, download_to_path, upload_path
 from app.jobs.cancellation import JobCancelledException, check_cancellation
@@ -369,3 +370,98 @@ def _run_markup_job(
     finally:
         release_lease(job_id, owner_identity)
         cleanup_paths(input_path, payload_path, output_pdf_path)
+
+
+@dramatiq.actor(queue_name="conversion", max_retries=3)
+def pdf_to_markdown_job(
+    job_id: str,
+    source_key: str,
+    file_password: str | None = None,
+    lang: str = "eng",
+    include_annotations: bool = False,
+    embed_images: bool = False,
+    source_name: str | None = None,
+) -> None:
+    job = get_job(job_id)
+    if job is None:
+        return
+
+    check_cancellation(job_id)
+    owner_identity = getattr(job, "owner_identity", None) or "anonymous"
+    acquire_lease(job_id, owner_identity)
+
+    update_job(
+        job_id,
+        status=JobState.running,
+        started_at=datetime.now(timezone.utc),
+        progress=5,
+        message="Starting PDF to Markdown job",
+    )
+
+    input_path = temp_file_path("md-job-input-", ".pdf")
+    output_md_path = temp_file_path("md-job-output-", ".md")
+
+    try:
+        check_cancellation(job_id)
+        download_to_path(source_key, input_path)
+
+        def on_progress(pct: int, msg: str) -> None:
+            check_cancellation(job_id)
+            update_job(job_id, progress=pct, message=msg)
+
+        markdown_text = convert_pdf_to_markdown(
+            input_path=input_path,
+            password=file_password,
+            lang=lang,
+            include_annotations=include_annotations,
+            embed_images=embed_images,
+            cancellation_check=lambda: check_cancellation(job_id),
+            progress_cb=on_progress,
+        )
+
+        with open(output_md_path, "w", encoding="utf-8") as f:
+            f.write(markdown_text)
+
+        check_cancellation(job_id)
+
+        output_key = build_key("jobs/markdown/output", suffix=".md")
+        upload_path(output_md_path, output_key, content_type="text/markdown; charset=utf-8")
+
+        download_name = f"{Path(source_name or 'document.pdf').stem}.md"
+
+        update_job(
+            job_id,
+            status=JobState.succeeded,
+            finished_at=datetime.now(timezone.utc),
+            progress=100,
+            result={
+                "artifact_key": output_key,
+                "artifact_name": download_name,
+            },
+            message="PDF to Markdown conversion completed",
+        )
+    except JobCancelledException as exc:
+        logger.info("PDF to Markdown job %s cancelled: %s", job_id, exc)
+        update_job(
+            job_id,
+            status=JobState.cancelled,
+            finished_at=datetime.now(timezone.utc),
+            message="PDF to Markdown job cancelled",
+        )
+        return
+    except Exception as exc:
+        update_job(
+            job_id,
+            status=JobState.failed,
+            finished_at=datetime.now(timezone.utc),
+            error=str(exc),
+            message="PDF to Markdown job failed",
+        )
+        if is_non_retryable_error(exc):
+            logger.warning("Non-retryable PDF error in markdown job %s: %s", job_id, exc)
+            return
+        raise
+    finally:
+        release_lease(job_id, owner_identity)
+        cleanup_paths(input_path, output_md_path)
+
