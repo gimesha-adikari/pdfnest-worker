@@ -8,11 +8,20 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
 from .document import analyze_document
 from .models import PDFAnalysis
+from .python_ast import PythonASTRequest, PythonASTResponse, analyze_python_ast
 
 router = APIRouter(
     prefix="/api/v1/analyzer",
     tags=["analyzer"],
 )
+
+
+@router.post(
+    "/python-ast",
+    response_model=PythonASTResponse,
+)
+async def analyze_python_repo_ast(payload: PythonASTRequest) -> PythonASTResponse:
+    return analyze_python_ast(payload)
 
 
 @router.post(
