@@ -7,9 +7,10 @@ from fastapi.testclient import TestClient
 import pytest
 
 from app.main import app
+from app.core.config import settings
 
 client = TestClient(app)
-SECRET = "dev-secret-change-in-production"
+SECRET = settings.worker_shared_secret
 
 
 def generate_headers(
