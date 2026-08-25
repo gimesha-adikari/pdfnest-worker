@@ -37,7 +37,7 @@ async def render_page(
         clip_y1: float | None = Form(None),
 ):
     try:
-        image_bytes = await render_limiter.run(
+        image_bytes, timings = await render_limiter.run_with_timings(
             render_page_to_jpeg_bytes(
                 file=file,
                 page=page,
@@ -54,6 +54,8 @@ async def render_page(
             media_type="image/jpeg",
             headers={
                 "Cache-Control": "private, max-age=60",
+                "X-Queue-Wait-Ms": f"{timings.get('queue_wait_ms', 0.0):.2f}",
+                "X-Render-Exec-Ms": f"{timings.get('render_execution_ms', 0.0):.2f}",
             },
         )
 

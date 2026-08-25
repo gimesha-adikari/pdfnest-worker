@@ -131,14 +131,16 @@ class RenderConcurrencyLimiter:
         return self._semaphore
 
     @asynccontextmanager
-    async def acquire(self) -> AsyncGenerator[None, None]:
+    async def acquire(self) -> AsyncGenerator[Dict[str, float], None]:
         """
         Acquires a concurrency slot within bounded queue limits.
         Ensures cancellation-safe and exception-safe slot release via finally.
+        Yields a timings dict populated with queue_wait_ms and render_execution_ms.
         """
         sem = self._get_semaphore()
 
         # 1. Queue Bounded Check
+        queue_start = time.perf_counter()
         async with self._lock:
             if self.queued_renders >= self.max_queue:
                 self.total_renders_rejected += 1
@@ -181,16 +183,23 @@ class RenderConcurrencyLimiter:
                     if self.active_renders > self.peak_active_renders:
                         self.peak_active_renders = self.active_renders
 
+        queue_wait_ms = (time.perf_counter() - queue_start) * 1000.0
+        timings: Dict[str, float] = {
+            "queue_wait_ms": queue_wait_ms,
+            "render_execution_ms": 0.0,
+        }
+
         # 3. Execution Guard with Cancellation & Exception Safe Slot Release
         start_time = time.perf_counter()
         failed = False
         try:
-            yield
+            yield timings
         except BaseException:
             failed = True
             raise
         finally:
             elapsed_ms = (time.perf_counter() - start_time) * 1000.0
+            timings["render_execution_ms"] = elapsed_ms
             sem.release()
             async with self._lock:
                 self.active_renders -= 1
@@ -200,13 +209,14 @@ class RenderConcurrencyLimiter:
                     self.total_renders_completed += 1
                     self.total_duration_ms += elapsed_ms
 
-    async def run(self, coro: Awaitable[T]) -> T:
+    async def run_with_timings(self, coro: Awaitable[T]) -> tuple[T, Dict[str, float]]:
         """
-        Executes a render coroutine under the concurrency limiter with strict execution timeout.
+        Executes a render coroutine under the concurrency limiter returning result and timings.
         """
-        async with self.acquire():
+        async with self.acquire() as timings:
             try:
-                return await asyncio.wait_for(coro, timeout=self.render_timeout)
+                res = await asyncio.wait_for(coro, timeout=self.render_timeout)
+                return res, timings
             except asyncio.TimeoutError as exc:
                 async with self._lock:
                     self.total_renders_timed_out += 1
@@ -217,6 +227,13 @@ class RenderConcurrencyLimiter:
                         "message": f"Render processing exceeded {self.render_timeout:.1f}s limit",
                     },
                 ) from exc
+
+    async def run(self, coro: Awaitable[T]) -> T:
+        """
+        Executes a render coroutine under the concurrency limiter with strict execution timeout.
+        """
+        res, _ = await self.run_with_timings(coro)
+        return res
 
     def get_metrics(self) -> Dict[str, Any]:
         """
