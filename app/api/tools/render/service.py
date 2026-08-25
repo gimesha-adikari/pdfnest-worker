@@ -1,5 +1,7 @@
-from __future__ import annotations
-
+import asyncio
+import os
+import signal
+import sys
 import tempfile
 from pathlib import Path
 
@@ -13,6 +15,10 @@ async def render_page_to_jpeg_bytes(
         file: UploadFile,
         page: int,
         dpi: float,
+        clip_x0: float | None = None,
+        clip_y0: float | None = None,
+        clip_x1: float | None = None,
+        clip_y1: float | None = None,
 ) -> bytes:
     if page < 1:
         raise ValueError("Page number must be 1 or greater")
@@ -25,11 +31,78 @@ async def render_page_to_jpeg_bytes(
     if not pdf_bytes:
         raise ValueError("Empty file uploaded")
 
-    return render_pdf_page_to_jpeg(
-        pdf_bytes=pdf_bytes,
-        page_number=page,
-        dpi=dpi,
-    )
+    if not pdf_bytes.startswith(b"%PDF"):
+        raise ValueError("File is not a valid PDF")
+
+    temp_in = tempfile.NamedTemporaryFile(prefix="pdfnest-render-in-", suffix=".pdf", delete=False)
+    temp_out = tempfile.NamedTemporaryFile(prefix="pdfnest-render-out-", suffix=".jpg", delete=False)
+
+    in_path = Path(temp_in.name)
+    out_path = Path(temp_out.name)
+
+    try:
+        temp_in.write(pdf_bytes)
+        temp_in.flush()
+        temp_in.close()
+        temp_out.close()
+
+        cmd = [
+            sys.executable,
+            "-m",
+            "app.api.tools.render.render_cli",
+            "--input",
+            str(in_path),
+            "--output",
+            str(out_path),
+            "--page",
+            str(page),
+            "--dpi",
+            str(dpi),
+        ]
+        if clip_x0 is not None:
+            cmd.extend(["--clip-x0", str(clip_x0)])
+        if clip_y0 is not None:
+            cmd.extend(["--clip-y0", str(clip_y0)])
+        if clip_x1 is not None:
+            cmd.extend(["--clip-x1", str(clip_x1)])
+        if clip_y1 is not None:
+            cmd.extend(["--clip-y1", str(clip_y1)])
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+
+        try:
+            stdout, stderr = await proc.communicate()
+        except BaseException:
+            if proc.returncode is None:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except (ProcessLookupError, OSError):
+                    pass
+                try:
+                    await proc.wait()
+                except Exception:
+                    pass
+            raise
+
+        if proc.returncode != 0:
+            err_msg = stderr.decode(errors="replace").strip()
+            if "Invalid page" in err_msg or "Page number must be" in err_msg or "DPI must be" in err_msg or "Empty file" in err_msg or "PDF contains no pages" in err_msg:
+                raise ValueError(err_msg)
+            raise RuntimeError(f"Render process failed with code {proc.returncode}: {err_msg}")
+
+        if not out_path.exists() or out_path.stat().st_size == 0:
+            raise RuntimeError("Render process did not generate output JPEG")
+
+        return out_path.read_bytes()
+
+    finally:
+        in_path.unlink(missing_ok=True)
+        out_path.unlink(missing_ok=True)
 
 
 async def create_render_session(

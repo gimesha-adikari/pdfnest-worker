@@ -36,6 +36,10 @@ def render_page_from_document(
         document: fitz.Document,
         page_number: int,
         dpi: float,
+        clip_x0: float | None = None,
+        clip_y0: float | None = None,
+        clip_x1: float | None = None,
+        clip_y1: float | None = None,
 ) -> bytes:
     if page_number < 1 or page_number > document.page_count:
         raise ValueError(
@@ -51,8 +55,14 @@ def render_page_from_document(
     zoom = float(dpi) / 72.0
     matrix = fitz.Matrix(zoom, zoom)
 
+    clip_rect = None
+    if clip_x0 is not None and clip_y0 is not None and clip_x1 is not None and clip_y1 is not None:
+        if clip_x1 > clip_x0 and clip_y1 > clip_y0:
+            clip_rect = fitz.Rect(clip_x0, clip_y0, clip_x1, clip_y1)
+
     pixmap = page.get_pixmap(
         matrix=matrix,
+        clip=clip_rect,
         alpha=False,
     )
 
@@ -87,11 +97,19 @@ class PdfRenderDocument:
             self,
             page_number: int,
             dpi: float,
+            clip_x0: float | None = None,
+            clip_y0: float | None = None,
+            clip_x1: float | None = None,
+            clip_y1: float | None = None,
     ) -> bytes:
         return render_page_from_document(
             document=self.document,
             page_number=page_number,
             dpi=dpi,
+            clip_x0=clip_x0,
+            clip_y0=clip_y0,
+            clip_x1=clip_x1,
+            clip_y1=clip_y1,
         )
 
     def close(self) -> None:
@@ -105,6 +123,10 @@ def render_pdf_page_to_jpeg(
         pdf_bytes: bytes,
         page_number: int,
         dpi: float,
+        clip_x0: float | None = None,
+        clip_y0: float | None = None,
+        clip_x1: float | None = None,
+        clip_y1: float | None = None,
 ) -> bytes:
     if not pdf_bytes:
         raise ValueError("Empty file uploaded")
@@ -125,6 +147,10 @@ def render_pdf_page_to_jpeg(
             document=document,
             page_number=page_number,
             dpi=dpi,
+            clip_x0=clip_x0,
+            clip_y0=clip_y0,
+            clip_x1=clip_x1,
+            clip_y1=clip_y1,
         )
     finally:
         document.close()
