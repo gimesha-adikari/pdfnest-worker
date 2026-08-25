@@ -37,7 +37,7 @@ async def render_page(
         clip_y1: float | None = Form(None),
 ):
     try:
-        image_bytes, timings = await render_limiter.run_with_timings(
+        (image_bytes, child_metrics), timings = await render_limiter.run_with_timings(
             render_page_to_jpeg_bytes(
                 file=file,
                 page=page,
@@ -49,14 +49,25 @@ async def render_page(
             )
         )
 
+        headers = {
+            "Cache-Control": "private, max-age=60",
+            "X-Queue-Wait-Ms": f"{timings.get('queue_wait_ms', 0.0):.2f}",
+            "X-Render-Exec-Ms": f"{timings.get('render_execution_ms', 0.0):.2f}",
+        }
+        if child_metrics:
+            headers["X-Render-Child-Cpu-Ms"] = f"{child_metrics.get('total_cpu_ms', 0.0):.2f}"
+            headers["X-Render-Child-User-Cpu-Ms"] = f"{child_metrics.get('user_cpu_ms', 0.0):.2f}"
+            headers["X-Render-Child-Sys-Cpu-Ms"] = f"{child_metrics.get('sys_cpu_ms', 0.0):.2f}"
+            headers["X-Render-Child-Vol-Ctx"] = str(child_metrics.get("vol_ctx", 0))
+            headers["X-Render-Child-Invol-Ctx"] = str(child_metrics.get("invol_ctx", 0))
+            headers["X-Render-Child-Pid"] = str(child_metrics.get("pid", 0))
+            headers["X-Render-Child-Rss-Kb"] = str(child_metrics.get("max_rss_kb", 0))
+            headers["X-Render-Child-Runqueue-Wait-Ms"] = f"{child_metrics.get('runqueue_wait_ms', 0.0):.2f}"
+
         return Response(
             content=image_bytes,
             media_type="image/jpeg",
-            headers={
-                "Cache-Control": "private, max-age=60",
-                "X-Queue-Wait-Ms": f"{timings.get('queue_wait_ms', 0.0):.2f}",
-                "X-Render-Exec-Ms": f"{timings.get('render_execution_ms', 0.0):.2f}",
-            },
+            headers=headers,
         )
 
     except HTTPException:

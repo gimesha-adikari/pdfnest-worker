@@ -98,7 +98,15 @@ async def render_page_to_jpeg_bytes(
         if not out_path.exists() or out_path.stat().st_size == 0:
             raise RuntimeError("Render process did not generate output JPEG")
 
-        return out_path.read_bytes()
+        child_metrics = {}
+        if stdout:
+            import json
+            try:
+                child_metrics = json.loads(stdout.decode().strip())
+            except Exception:
+                pass
+
+        return out_path.read_bytes(), child_metrics
 
     finally:
         in_path.unlink(missing_ok=True)
