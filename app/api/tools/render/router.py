@@ -1,9 +1,7 @@
-from __future__ import annotations
-
-import asyncio
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import Response
 
+from app.core.config import settings
 from .limiter import render_limiter
 from .service import (
     create_render_session,
@@ -23,11 +21,33 @@ async def get_render_metrics():
     """
     Observability endpoint for render concurrency and capacity metrics.
     """
-    return render_limiter.get_metrics()
+    metrics = render_limiter.get_metrics()
+    from app.core.config import settings
+    from .persistent_pool import get_persistent_render_pool
+
+    pool = get_persistent_render_pool()
+    if pool is not None and pool.is_running:
+        metrics["persistent_pool"] = pool.get_metrics()
+    else:
+        metrics["persistent_pool"] = {
+            "enabled": settings.enable_persistent_render_pool,
+            "configured_workers": settings.persistent_render_pool_size if settings.enable_persistent_render_pool else 0,
+            "healthy_workers": 0,
+            "available_workers": 0,
+            "busy_workers": 0,
+            "degraded": settings.enable_persistent_render_pool,
+            "total_completed": 0,
+            "total_failed": 0,
+            "total_restarts": 0,
+            "total_recycled": 0,
+            "total_fallbacks": 0,
+        }
+    return metrics
 
 
 @router.post("/page")
 async def render_page(
+        request: Request,
         file: UploadFile = File(...),
         page: int = Form(...),
         dpi: float = Form(144),
@@ -36,6 +56,13 @@ async def render_page(
         clip_x1: float | None = Form(None),
         clip_y1: float | None = Form(None),
 ):
+    # Gated test-only failure injection (defense-in-depth: requires flag AND non-production environment)
+    simulate_crash = False
+    simulate_hang = False
+    if settings.enable_render_failure_injection and settings.app_env.lower() in ("development", "test", "testing"):
+        simulate_crash = request.headers.get("x-test-simulate-crash", "").lower() in ("true", "1")
+        simulate_hang = request.headers.get("x-test-simulate-hang", "").lower() in ("true", "1")
+
     try:
         (image_bytes, child_metrics), timings = await render_limiter.run_with_timings(
             render_page_to_jpeg_bytes(
@@ -46,6 +73,8 @@ async def render_page(
                 clip_y0=clip_y0,
                 clip_x1=clip_x1,
                 clip_y1=clip_y1,
+                simulate_crash=simulate_crash,
+                simulate_hang=simulate_hang,
             )
         )
 
@@ -55,7 +84,8 @@ async def render_page(
             "X-Render-Exec-Ms": f"{timings.get('render_execution_ms', 0.0):.2f}",
         }
         if child_metrics:
-            headers["X-Render-Child-Cpu-Ms"] = f"{child_metrics.get('total_cpu_ms', 0.0):.2f}"
+            cpu_val = child_metrics.get("render_cpu_ms", child_metrics.get("total_cpu_ms", 0.0))
+            headers["X-Render-Child-Cpu-Ms"] = f"{cpu_val:.2f}"
             headers["X-Render-Child-User-Cpu-Ms"] = f"{child_metrics.get('user_cpu_ms', 0.0):.2f}"
             headers["X-Render-Child-Sys-Cpu-Ms"] = f"{child_metrics.get('sys_cpu_ms', 0.0):.2f}"
             headers["X-Render-Child-Vol-Ctx"] = str(child_metrics.get("vol_ctx", 0))

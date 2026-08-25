@@ -37,14 +37,24 @@ ALLOWED_ORIGINS = [
 
 
 from app.core.janitor import start_worker_janitor
+from app.core.config import settings
+from app.api.tools.render.persistent_pool import (
+    start_persistent_render_pool,
+    shutdown_persistent_render_pool,
+)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print(f"[{APP_NAME}] starting in {APP_ENV} mode")
     start_worker_janitor()
+    if settings.enable_persistent_render_pool:
+        print(f"[{APP_NAME}] initializing persistent render worker pool")
+        await start_persistent_render_pool()
     yield
     print(f"[{APP_NAME}] shutting down")
+    if settings.enable_persistent_render_pool:
+        await shutdown_persistent_render_pool()
 
 
 from app.core.security import WorkerAuthMiddleware

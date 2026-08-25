@@ -4,36 +4,32 @@ import signal
 import sys
 import tempfile
 from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
 
 from fastapi import UploadFile
 
+from app.core.config import settings
+from .persistent_pool import (
+    PersistentWorkerInfrastructureError,
+    get_persistent_render_pool,
+)
 from .renderer import PdfRenderDocument, render_pdf_page_to_jpeg
 from .session import RenderSession, session_manager, sha256_file
 
 
-async def render_page_to_jpeg_bytes(
-        file: UploadFile,
+async def render_page_to_jpeg_bytes_subprocess(
+        pdf_bytes: bytes,
         page: int,
         dpi: float,
         clip_x0: float | None = None,
         clip_y0: float | None = None,
         clip_x1: float | None = None,
         clip_y1: float | None = None,
-) -> bytes:
-    if page < 1:
-        raise ValueError("Page number must be 1 or greater")
-
-    if dpi <= 0:
-        raise ValueError("DPI must be greater than 0")
-
-    pdf_bytes = await file.read()
-
-    if not pdf_bytes:
-        raise ValueError("Empty file uploaded")
-
-    if not pdf_bytes.startswith(b"%PDF"):
-        raise ValueError("File is not a valid PDF")
-
+) -> Tuple[bytes, Dict[str, Any]]:
+    """
+    Certified Phase 3F/3G isolated subprocess renderer.
+    Renders a PDF page in a clean, disposable subprocess.
+    """
     temp_in = tempfile.NamedTemporaryFile(prefix="pdfnest-render-in-", suffix=".pdf", delete=False)
     temp_out = tempfile.NamedTemporaryFile(prefix="pdfnest-render-out-", suffix=".jpg", delete=False)
 
@@ -111,6 +107,89 @@ async def render_page_to_jpeg_bytes(
     finally:
         in_path.unlink(missing_ok=True)
         out_path.unlink(missing_ok=True)
+
+
+async def render_page_to_jpeg_bytes(
+        file: UploadFile,
+        page: int,
+        dpi: float,
+        clip_x0: float | None = None,
+        clip_y0: float | None = None,
+        clip_x1: float | None = None,
+        clip_y1: float | None = None,
+        simulate_crash: bool = False,
+        simulate_hang: bool = False,
+) -> Tuple[bytes, Dict[str, Any]]:
+    if page < 1:
+        raise ValueError("Page number must be 1 or greater")
+
+    if dpi <= 0:
+        raise ValueError("DPI must be greater than 0")
+
+    pdf_bytes = await file.read()
+
+    if not pdf_bytes:
+        raise ValueError("Empty file uploaded")
+
+    if not pdf_bytes.startswith(b"%PDF"):
+        raise ValueError("File is not a valid PDF")
+
+    # 1. Check feature flag: default is False -> certified subprocess renderer
+    if not settings.enable_persistent_render_pool:
+        return await render_page_to_jpeg_bytes_subprocess(
+            pdf_bytes=pdf_bytes,
+            page=page,
+            dpi=dpi,
+            clip_x0=clip_x0,
+            clip_y0=clip_y0,
+            clip_x1=clip_x1,
+            clip_y1=clip_y1,
+        )
+
+    # 2. Persistent Pool path with automatic fallback on infrastructure failure
+    pool = get_persistent_render_pool()
+    if pool is None or not pool.is_running:
+        return await render_page_to_jpeg_bytes_subprocess(
+            pdf_bytes=pdf_bytes,
+            page=page,
+            dpi=dpi,
+            clip_x0=clip_x0,
+            clip_y0=clip_y0,
+            clip_x1=clip_x1,
+            clip_y1=clip_y1,
+        )
+
+    try:
+        return await pool.render(
+            pdf_bytes=pdf_bytes,
+            page=page,
+            dpi=dpi,
+            clip_x0=clip_x0,
+            clip_y0=clip_y0,
+            clip_x1=clip_x1,
+            clip_y1=clip_y1,
+            simulate_crash=simulate_crash,
+            simulate_hang=simulate_hang,
+        )
+    except ValueError:
+        # Normal user/input error: do not retry fallback
+        raise
+    except PersistentWorkerInfrastructureError as exc:
+        # Infrastructure failure: log, increment fallback count, and fallback to certified subprocess renderer
+        pool.increment_fallback_count()
+        import logging
+        logging.getLogger(__name__).warning(
+            f"Persistent render pool infrastructure error: {exc}. Falling back to certified subprocess renderer."
+        )
+        return await render_page_to_jpeg_bytes_subprocess(
+            pdf_bytes=pdf_bytes,
+            page=page,
+            dpi=dpi,
+            clip_x0=clip_x0,
+            clip_y0=clip_y0,
+            clip_x1=clip_x1,
+            clip_y1=clip_y1,
+        )
 
 
 async def create_render_session(

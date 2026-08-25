@@ -5,6 +5,24 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+def _parse_int_env(var_name: str, default: int, min_val: int, max_val: int) -> int:
+    val_str = os.getenv(var_name, "").strip()
+    if not val_str:
+        return default
+    try:
+        val = int(val_str)
+        return max(min_val, min(val, max_val))
+    except ValueError:
+        return default
+
+
+def _parse_bool_env(var_name: str, default: bool = False) -> bool:
+    val_str = os.getenv(var_name, "").strip().lower()
+    if not val_str:
+        return default
+    return val_str in ("true", "1", "yes", "on")
+
+
 @dataclass(frozen=True)
 class Settings:
     app_name: str = "Platen PDF Worker"
@@ -32,6 +50,12 @@ class Settings:
     r2_endpoint: str = os.getenv("R2_ENDPOINT", "").strip('\'" ')
 
     worker_shared_secret: str = os.getenv("WORKER_SHARED_SECRET", "dev-secret-change-in-production").strip()
+
+    enable_persistent_render_pool: bool = field(default_factory=lambda: _parse_bool_env("ENABLE_PERSISTENT_RENDER_POOL", False))
+    persistent_render_pool_size: int = field(default_factory=lambda: _parse_int_env("PERSISTENT_RENDER_POOL_SIZE", 4, 1, 32))
+    worker_max_renders: int = field(default_factory=lambda: _parse_int_env("WORKER_MAX_RENDERS", 1000, 1, 100000))
+    worker_max_rss_mb: int = field(default_factory=lambda: _parse_int_env("WORKER_MAX_RSS_MB", 350, 50, 4096))
+    enable_render_failure_injection: bool = field(default_factory=lambda: _parse_bool_env("ENABLE_RENDER_FAILURE_INJECTION", False))
 
 
 settings = Settings()
