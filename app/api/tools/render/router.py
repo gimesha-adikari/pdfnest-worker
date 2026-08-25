@@ -38,9 +38,12 @@ async def get_render_metrics():
             "degraded": settings.enable_persistent_render_pool,
             "total_completed": 0,
             "total_failed": 0,
+            "total_crashes": 0,
+            "total_timeouts": 0,
             "total_restarts": 0,
             "total_recycled": 0,
             "total_fallbacks": 0,
+            "fallback_reasons": {"crash": 0, "timeout": 0, "infrastructure": 0},
         }
     return metrics
 

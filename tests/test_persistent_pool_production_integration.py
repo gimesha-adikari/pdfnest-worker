@@ -478,7 +478,7 @@ async def test_queue_invariants_across_all_real_lifecycle_transitions(sample_pdf
             assert_queue_strict_invariants(pool)
 
             # C. Real Worker Timeout
-            with pytest.raises(PersistentWorkerInfrastructureError):
+            with pytest.raises((PersistentWorkerInfrastructureError, PersistentWorkerTimeoutError)):
                 await pool.render(sample_pdf_bytes, page=1, dpi=144.0, simulate_hang=True)
             assert_queue_strict_invariants(pool)
 
@@ -680,3 +680,81 @@ def test_http_endpoint_page_rendering_integration(sample_pdf_bytes: bytes):
         assert resp.headers["content-type"] == "image/jpeg"
         assert "x-queue-wait-ms" in resp.headers
         assert "x-render-exec-ms" in resp.headers
+
+
+# 20. Rollback to Subprocess and Re-enable Lifecycle
+@pytest.mark.anyio
+async def test_rollback_to_subprocess_and_re_enable_lifecycle(sample_pdf_bytes: bytes):
+    """
+    Validates dynamic operational transition:
+    1. Persistent pool enabled -> serves requests
+    2. Rollback: persistent pool disabled -> subprocess renderer serves requests
+    3. Re-enable: persistent pool enabled -> healthy workers restored with zero stale state
+    """
+    # 1. Start persistent pool
+    pool = PersistentRenderWorkerPool(size=2, render_timeout_s=5.0)
+    await pool.start()
+    pids_initial = [w.pid for w in pool.workers.values()]
+    assert len(pids_initial) == 2
+
+    # Render with persistent pool
+    jpeg1, meta1 = await pool.render(sample_pdf_bytes, page=1, dpi=144.0)
+    assert len(jpeg1) > 0
+
+    # 2. Rollback to Subprocess
+    await pool.shutdown()
+    for pid in pids_initial:
+        try:
+            os.kill(pid, 0)
+            pytest.fail(f"Worker PID {pid} not terminated during rollback shutdown")
+        except OSError:
+            pass
+
+    mock_rollback_settings = Settings(enable_persistent_render_pool=False)
+    with patch("app.api.tools.render.service.settings", mock_rollback_settings), \
+         patch("app.api.tools.render.service.get_persistent_render_pool", return_value=None):
+        upload = UploadFile(file=io.BytesIO(sample_pdf_bytes), filename="test.pdf")
+        jpeg_sub, _ = await render_page_to_jpeg_bytes(upload, page=1, dpi=144.0)
+        assert len(jpeg_sub) > 0
+
+    # 3. Re-enable Persistent Pool
+    re_pool = PersistentRenderWorkerPool(size=2, render_timeout_s=5.0)
+    await re_pool.start()
+    re_pids = [w.pid for w in re_pool.workers.values()]
+    assert len(re_pids) == 2
+    assert set(re_pids).isdisjoint(set(pids_initial))
+
+    jpeg_re, meta_re = await re_pool.render(sample_pdf_bytes, page=1, dpi=144.0)
+    assert len(jpeg_re) > 0
+    assert re_pool.get_metrics()["healthy_workers"] == 2
+
+    await re_pool.shutdown()
+
+
+# 21. Granular Observability Metrics & Fallback Reasons Breakdown
+@pytest.mark.anyio
+async def test_granular_observability_metrics_breakdown():
+    """Verify get_metrics exposes total_crashes, total_timeouts, and fallback_reasons dictionary."""
+    pool = PersistentRenderWorkerPool(size=2, render_timeout_s=5.0)
+    await pool.start()
+
+    try:
+        m = pool.get_metrics()
+        assert "total_crashes" in m
+        assert "total_timeouts" in m
+        assert "fallback_reasons" in m
+        assert "crash" in m["fallback_reasons"]
+        assert "timeout" in m["fallback_reasons"]
+        assert "infrastructure" in m["fallback_reasons"]
+
+        # Increment with custom reason
+        pool.increment_fallback_count(reason="timeout")
+        pool.increment_fallback_count(reason="crash")
+        pool.increment_fallback_count(reason="crash")
+
+        m2 = pool.get_metrics()
+        assert m2["total_fallbacks"] == 3
+        assert m2["fallback_reasons"]["timeout"] == 1
+        assert m2["fallback_reasons"]["crash"] == 2
+    finally:
+        await pool.shutdown()

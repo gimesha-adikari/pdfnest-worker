@@ -235,6 +235,9 @@ class PersistentRenderWorkerPool:
         self.total_restarts: int = 0
         self.total_fallbacks: int = 0
         self.total_recycled: int = 0
+        self.total_crashes: int = 0
+        self.total_timeouts: int = 0
+        self.fallback_reasons: Dict[str, int] = {"crash": 0, "timeout": 0, "infrastructure": 0}
         self._is_running = False
         self._lock = asyncio.Lock()
 
@@ -337,9 +340,22 @@ class PersistentRenderWorkerPool:
             should_return_to_queue = worker.is_alive
             raise
 
-        except (PersistentWorkerTimeoutError, PersistentWorkerInfrastructureError, PersistentWorkerError) as exc:
+        except PersistentWorkerTimeoutError as exc:
             self.total_failed += 1
-            # Attempt to replace dead/timed-out worker immediately
+            self.total_timeouts += 1
+            # Attempt to replace timed-out worker immediately
+            try:
+                worker = await self._replace_worker(worker, is_recycling=False)
+                should_return_to_queue = True
+            except Exception as replace_exc:
+                logger.error(f"Failed to replace worker {worker.worker_id} after timeout: {replace_exc}")
+                should_return_to_queue = False
+            raise
+
+        except (PersistentWorkerInfrastructureError, PersistentWorkerError) as exc:
+            self.total_failed += 1
+            self.total_crashes += 1
+            # Attempt to replace dead worker immediately
             try:
                 worker = await self._replace_worker(worker, is_recycling=False)
                 should_return_to_queue = True
@@ -353,8 +369,12 @@ class PersistentRenderWorkerPool:
             if self._is_running and should_return_to_queue and worker is not None and worker.is_alive:
                 await self.available_workers.put(worker)
 
-    def increment_fallback_count(self) -> None:
+    def increment_fallback_count(self, reason: str = "infrastructure") -> None:
         self.total_fallbacks += 1
+        if reason in self.fallback_reasons:
+            self.fallback_reasons[reason] += 1
+        else:
+            self.fallback_reasons["infrastructure"] += 1
 
     def get_metrics(self) -> Dict[str, Any]:
         """
@@ -377,9 +397,12 @@ class PersistentRenderWorkerPool:
             "max_rss_high_water_mb": self.max_rss_mb,
             "total_completed": self.total_completed,
             "total_failed": self.total_failed,
+            "total_crashes": self.total_crashes,
+            "total_timeouts": self.total_timeouts,
             "total_restarts": self.total_restarts,
             "total_recycled": self.total_recycled,
             "total_fallbacks": self.total_fallbacks,
+            "fallback_reasons": dict(self.fallback_reasons),
         }
 
     async def shutdown(self) -> None:

@@ -11,6 +11,7 @@ from fastapi import UploadFile
 from app.core.config import settings
 from .persistent_pool import (
     PersistentWorkerInfrastructureError,
+    PersistentWorkerTimeoutError,
     get_persistent_render_pool,
 )
 from .renderer import PdfRenderDocument, render_pdf_page_to_jpeg
@@ -174,12 +175,13 @@ async def render_page_to_jpeg_bytes(
     except ValueError:
         # Normal user/input error: do not retry fallback
         raise
-    except PersistentWorkerInfrastructureError as exc:
-        # Infrastructure failure: log, increment fallback count, and fallback to certified subprocess renderer
-        pool.increment_fallback_count()
+    except (PersistentWorkerTimeoutError, PersistentWorkerInfrastructureError) as exc:
+        # Infrastructure/worker failure: log, increment fallback count with granular reason, and fallback to certified subprocess renderer
+        reason = "timeout" if isinstance(exc, PersistentWorkerTimeoutError) or "timeout" in str(exc).lower() else "crash"
+        pool.increment_fallback_count(reason=reason)
         import logging
         logging.getLogger(__name__).warning(
-            f"Persistent render pool infrastructure error: {exc}. Falling back to certified subprocess renderer."
+            f"Persistent render pool {reason} error: {exc}. Falling back to certified subprocess renderer."
         )
         return await render_page_to_jpeg_bytes_subprocess(
             pdf_bytes=pdf_bytes,
