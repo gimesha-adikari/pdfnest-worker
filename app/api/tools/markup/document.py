@@ -148,7 +148,18 @@ def apply_markup(
             continue
 
         page = doc[page_num - 1]
+        # Studio sends rectangles in the visible page coordinate system. PDF
+        # drawing/text APIs use an unrotated page context, so derotate the
+        # selection and temporarily draw with page rotation disabled. CropBox
+        # coordinates are intentionally relative to the visible crop, not the
+        # original uncropped MediaBox.
+        page_rotation = page.rotation
+        derotation = page.derotation_matrix if page_rotation else None
+        if page_rotation:
+            page.set_rotation(0)
         selection_rect = fitz.Rect(x, y, x + width, y + height)
+        if derotation is not None:
+            selection_rect *= derotation
         color = normalize_hex(box.get("color", "#FFFF00"), "#FFFF00")
 
         if action == "highlight":
@@ -180,6 +191,9 @@ def apply_markup(
                     _underline_words(page, selected, color)
                 else:
                     _draw_manual_underline(page, selection_rect, color)
+
+        if page_rotation:
+            page.set_rotation(page_rotation)
 
         if progress_callback:
             progress_callback(index, total)

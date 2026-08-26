@@ -118,9 +118,8 @@ def editor_extract_job(
         result = extract_document(input_path, password, cancellation_check=lambda: check_cancellation(job_id))
         check_cancellation(job_id)
 
-        if isinstance(result, dict):
-            result["source_tracker"] = source_key
-            result["upright_tracker"] = result.get("upright_tracker") or source_key
+        # The extract layout is public editor data. Storage keys remain inside
+        # the worker lifecycle and must not be returned as source trackers.
 
         update_job(
             job_id,
@@ -464,4 +463,3 @@ def pdf_to_markdown_job(
     finally:
         release_lease(job_id, owner_identity)
         cleanup_paths(input_path, output_md_path)
-

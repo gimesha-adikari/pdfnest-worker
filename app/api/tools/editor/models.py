@@ -6,6 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field
 class ExtractPageElement(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
+    id: str
     text: str
     x: float
     y: float

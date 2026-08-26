@@ -292,6 +292,8 @@ def extract_native_page(page: fitz.Page, page_number: int) -> dict[str, Any]:
             text_block_count += 1
 
     elements = deduplicate_elements(elements)
+    for index, element in enumerate(elements, start=1):
+        element["id"] = f"p{page_number}-text-{index}"
     word_count = len(native_words)
     kind = "mixed"
     if word_count == 0 and image_block_count == 0:
@@ -358,6 +360,8 @@ def extract_ocr_page(page: fitz.Page, page_number: int) -> dict[str, Any]:
         })
 
     elements = deduplicate_elements(elements)
+    for index, element in enumerate(elements, start=1):
+        element["id"] = f"p{page_number}-text-{index}"
     page_image.close()
     del page_image
 
