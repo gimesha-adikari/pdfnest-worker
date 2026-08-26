@@ -115,7 +115,17 @@ def test_production_worker_provenance():
 # 2. Feature Flag Defaults & Explicit Settings Clamping
 def test_feature_flag_default_is_disabled_and_clamped():
     """Verify default disabled state and strict clamping [1, 32] for pool size."""
-    with patch.dict(os.environ, {}, clear=False):
+    # Settings imports load the repository-local .env before tests are
+    # collected. Explicitly blank only the settings under default-test so the
+    # assertion remains deterministic without weakening production dotenv use.
+    default_env = {
+        "ENABLE_PERSISTENT_RENDER_POOL": "",
+        "PERSISTENT_RENDER_POOL_SIZE": "",
+        "WORKER_MAX_RENDERS": "",
+        "WORKER_MAX_RSS_MB": "",
+        "ENABLE_RENDER_FAILURE_INJECTION": "",
+    }
+    with patch.dict(os.environ, default_env, clear=False):
         s = Settings()
         assert s.enable_persistent_render_pool is False
         assert s.persistent_render_pool_size == 4
