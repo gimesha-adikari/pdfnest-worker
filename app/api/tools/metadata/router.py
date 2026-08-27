@@ -15,6 +15,7 @@ from fastapi import (
 from fastapi.responses import FileResponse
 
 from .document import (
+    preserve_metadata,
     read_metadata,
     write_metadata,
 )
@@ -123,3 +124,54 @@ async def write_pdf_metadata(
             os.remove(input_path)
         except FileNotFoundError:
             pass
+
+
+@router.post("/preserve")
+async def preserve_pdf_metadata(
+        background_tasks: BackgroundTasks,
+        file: UploadFile = File(...),
+        metadata_source: UploadFile = File(...),
+        file_password: str | None = Form(None),
+        source_password: str | None = Form(None),
+):
+    fd1, input_path = tempfile.mkstemp(prefix="pdfnest-meta-preserve-in-", suffix=".pdf")
+    os.close(fd1)
+    fd2, source_path = tempfile.mkstemp(prefix="pdfnest-meta-preserve-source-", suffix=".pdf")
+    os.close(fd2)
+    fd3, output_path = tempfile.mkstemp(prefix="pdfnest-meta-preserve-out-", suffix=".pdf")
+    os.close(fd3)
+
+    try:
+        with open(input_path, "wb") as f:
+            shutil.copyfileobj(file.file, f)
+        with open(source_path, "wb") as f:
+            shutil.copyfileobj(metadata_source.file, f)
+
+        preserve_metadata(
+            input_path=input_path,
+            metadata_source_path=source_path,
+            output_path=output_path,
+            password=file_password,
+            source_password=source_password,
+        )
+
+        background_tasks.add_task(os.remove, output_path)
+        return FileResponse(
+            output_path,
+            media_type="application/pdf",
+            filename="metadata-preserved.pdf",
+            background=background_tasks,
+        )
+    except Exception as e:
+        if os.path.exists(output_path):
+            try:
+                os.remove(output_path)
+            except OSError:
+                pass
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        for path in (input_path, source_path):
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
