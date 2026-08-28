@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import logging
 import warnings
 from contextlib import asynccontextmanager
 from typing import Any
@@ -37,11 +38,13 @@ ALLOWED_ORIGINS = [
 
 
 from app.core.janitor import start_worker_janitor
-from app.core.config import settings
+from app.core.config import settings, validate_runtime_config
 from app.api.tools.render.persistent_pool import (
     start_persistent_render_pool,
     shutdown_persistent_render_pool,
 )
+
+validate_runtime_config()
 
 
 @asynccontextmanager
@@ -89,6 +92,10 @@ from fastapi.responses import JSONResponse
 import shutil
 import redis
 
+from app.core.storage import get_r2_client
+
+logger = logging.getLogger(__name__)
+
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -103,11 +110,24 @@ async def live() -> dict[str, str]:
 async def ready() -> JSONResponse:
     redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
     redis_healthy = False
+    actor_healthy = True
+    r2_healthy = True
     try:
-        r = redis.Redis.from_url(redis_url, socket_connect_timeout=2)
+        r = redis.Redis.from_url(redis_url, socket_connect_timeout=2, socket_timeout=2)
         redis_healthy = bool(r.ping())
+        if settings.actor_heartbeat_required:
+            heartbeat = r.get(settings.actor_heartbeat_key)
+            actor_healthy = bool(heartbeat)
     except Exception:
         redis_healthy = False
+        actor_healthy = False if settings.actor_heartbeat_required else True
+
+    if settings.actor_heartbeat_required:
+        try:
+            get_r2_client().head_bucket(Bucket=settings.r2_bucket)
+        except Exception as exc:
+            r2_healthy = False
+            logger.warning("[WORKER READINESS] R2 bucket metadata check failed: %s", exc)
 
     binaries = {
         "tesseract": shutil.which("tesseract") is not None,
@@ -118,14 +138,23 @@ async def ready() -> JSONResponse:
         ),
     }
 
-    if not redis_healthy:
+    engines_healthy = all(binaries.values())
+    if not redis_healthy or not actor_healthy or not engines_healthy or (settings.actor_heartbeat_required and not r2_healthy):
+        if not redis_healthy:
+            logger.warning("[WORKER READINESS] Redis is not ready")
+        if not actor_healthy:
+            logger.warning("[WORKER READINESS] actor heartbeat missing or stale")
+        if not engines_healthy:
+            logger.warning("[WORKER READINESS] required document engines are not ready: %s", binaries)
         return JSONResponse(
             status_code=503,
             content={
                 "status": "not_ready",
-                "redis": False,
+                "redis": redis_healthy,
                 "binaries": binaries,
-                "reason": "Redis is unreachable",
+                "r2": r2_healthy,
+                "actor": actor_healthy,
+                "reason": "Worker dependency is unreachable",
             },
         )
 
@@ -134,6 +163,8 @@ async def ready() -> JSONResponse:
         content={
             "status": "ready",
             "redis": True,
+            "r2": r2_healthy,
+            "actor": actor_healthy,
             "binaries": binaries,
         },
     )

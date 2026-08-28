@@ -103,6 +103,8 @@ def get_r2_client():
         config=Config(
             signature_version="s3v4",
             s3={"addressing_style": "path"},
+            connect_timeout=2,
+            read_timeout=2,
         ),
     )
 

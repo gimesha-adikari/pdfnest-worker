@@ -16,13 +16,18 @@ from app.api.tools.editor.utils import cleanup_paths, temp_file_path
 from app.api.tools.markup.document import process_markup_pdf
 from app.api.tools.markdown.service import convert_pdf_to_markdown
 from app.core.broker import broker  # noqa: F401
+from app.core.config import validate_runtime_config
 from app.core.storage import build_key, download_to_path, upload_path
+from app.core.actor_heartbeat import start_actor_heartbeat
 from app.jobs.cancellation import JobCancelledException, check_cancellation
 from app.jobs.limiter import acquire_lease, release_lease
 from app.jobs.models import JobState
 from app.jobs.store import get_job, update_job
 
 logger = logging.getLogger(__name__)
+
+validate_runtime_config()
+_actor_heartbeat_stop = start_actor_heartbeat()
 
 NON_RETRYABLE_ERRORS = (
     fitz.FileDataError,

@@ -46,4 +46,6 @@ RUN useradd --system --uid 10001 --create-home appuser && \
 
 USER appuser
 
+ENV PDFNEST_ACTOR=true
+
 CMD ["dramatiq", "app.jobs.actors", "--processes", "1", "--threads", "1"]

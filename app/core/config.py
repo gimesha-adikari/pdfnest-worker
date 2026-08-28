@@ -23,6 +23,45 @@ def _parse_bool_env(var_name: str, default: bool = False) -> bool:
     return val_str in ("true", "1", "yes", "on")
 
 
+MANAGED_ENVS = {"canary", "staging", "production"}
+
+
+def is_managed_environment() -> bool:
+    return os.getenv("APP_ENV", "development").strip().lower() in MANAGED_ENVS
+
+
+def validate_runtime_config() -> None:
+    """Reject local fallbacks when a managed worker is starting."""
+    if not is_managed_environment():
+        return
+
+    required = {
+        "REDIS_URL": os.getenv("REDIS_URL", "").strip(),
+        "R2_ENDPOINT": os.getenv("R2_ENDPOINT", "").strip(),
+        "R2_BUCKET": os.getenv("R2_BUCKET", "").strip(),
+        "R2_ACCESS_KEY": os.getenv("R2_ACCESS_KEY", "").strip(),
+        "R2_SECRET_KEY": os.getenv("R2_SECRET_KEY", "").strip(),
+        "FILE_ENCRYPTION_KEY": os.getenv("FILE_ENCRYPTION_KEY", "").strip(),
+        "WORKER_SHARED_SECRET": os.getenv("WORKER_SHARED_SECRET", "").strip(),
+    }
+    missing = [name for name, value in required.items() if not value]
+    if missing:
+        raise ValueError(f"managed APP_ENV requires: {', '.join(missing)}")
+
+    for name in ("REDIS_URL", "R2_ENDPOINT"):
+        value = required[name].lower()
+        if any(host in value for host in ("localhost", "127.0.0.1", "0.0.0.0")):
+            raise ValueError(f"managed configuration {name} must not point to localhost or loopback")
+    if len(required["FILE_ENCRYPTION_KEY"]) != 32:
+        raise ValueError("managed FILE_ENCRYPTION_KEY must be exactly 32 characters")
+    if os.getenv("APP_ENV", "").strip().lower() == "canary" and "canary" not in required["R2_BUCKET"].lower():
+        raise ValueError("canary R2_BUCKET must be an explicitly canary-named dedicated bucket")
+    heartbeat_key = os.getenv("ACTOR_HEARTBEAT_KEY", f"pdfnest:{os.getenv('APP_ENV', '').strip().lower()}:actor:heartbeat").strip()
+    expected_prefix = f"pdfnest:{os.getenv('APP_ENV', '').strip().lower()}:"
+    if not heartbeat_key.startswith(expected_prefix):
+        raise ValueError("ACTOR_HEARTBEAT_KEY must be namespaced to APP_ENV")
+
+
 @dataclass(frozen=True)
 class Settings:
     app_name: str = "Platen PDF Worker"
@@ -56,6 +95,10 @@ class Settings:
     worker_max_renders: int = field(default_factory=lambda: _parse_int_env("WORKER_MAX_RENDERS", 1000, 1, 100000))
     worker_max_rss_mb: int = field(default_factory=lambda: _parse_int_env("WORKER_MAX_RSS_MB", 350, 50, 4096))
     enable_render_failure_injection: bool = field(default_factory=lambda: _parse_bool_env("ENABLE_RENDER_FAILURE_INJECTION", False))
+    actor_heartbeat_required: bool = field(default_factory=lambda: _parse_bool_env("ACTOR_HEARTBEAT_REQUIRED", is_managed_environment()))
+    actor_heartbeat_key: str = field(default_factory=lambda: os.getenv("ACTOR_HEARTBEAT_KEY", f"pdfnest:{os.getenv('APP_ENV', 'development')}:actor:heartbeat").strip())
+    actor_heartbeat_ttl_seconds: int = field(default_factory=lambda: _parse_int_env("ACTOR_HEARTBEAT_TTL_SECONDS", 30, 5, 300))
+    actor_heartbeat_interval_seconds: int = field(default_factory=lambda: _parse_int_env("ACTOR_HEARTBEAT_INTERVAL_SECONDS", 10, 1, 120))
 
 
 settings = Settings()
