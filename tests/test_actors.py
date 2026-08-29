@@ -15,6 +15,7 @@ from app.jobs.actors import (
 from app.jobs.models import JobState
 from app.jobs.store import create_job, get_job, prune_expired_job_index, save_job, update_job, utcnow
 from app.core.redis import redis_client
+from app.core.ocr_v2.errors import RenderingNotEligibleError
 
 
 def test_actor_time_limits():
@@ -127,3 +128,11 @@ def test_duplicate_ocr_delivery_does_not_delete_active_searchable_inputs(monkeyp
         [{"source_key": "jobs/ocr_v2/searchable_pdf/input/page.png", "source_name": "page.png"}],
         "page.png",
     )
+
+
+def test_searchable_renderer_failure_preserves_typed_stage_classification():
+    from app.jobs.actors import _searchable_failure_code, _searchable_failure_message
+
+    code = _searchable_failure_code(RenderingNotEligibleError("artifact validation failed"), "PDF_RENDER")
+    assert code == "PDF_RENDER_FAILURE"
+    assert _searchable_failure_message(code, "PDF_RENDER") == "Searchable PDF V2 job failed during PDF_RENDER (PDF_RENDER_FAILURE)."

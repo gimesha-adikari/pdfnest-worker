@@ -17,6 +17,7 @@ from app.api.tools.markup.document import process_markup_pdf
 from app.api.tools.markdown.service import convert_pdf_to_markdown
 from app.core.broker import broker  # noqa: F401
 from app.core.config import validate_runtime_config
+from app.core.ocr_v2.errors import EngineUnavailableError, OCRTimeoutError, RenderingNotEligibleError
 from app.core.storage import build_key, delete_object, download_to_path, upload_path, upload_text
 from app.core.actor_heartbeat import start_actor_heartbeat
 from app.jobs.cancellation import JobCancelledException, check_cancellation
@@ -48,6 +49,33 @@ def _cleanup_input_objects(keys: list[str]) -> None:
             delete_object(key)
         except Exception:
             logger.warning("OCR V2 input cleanup failed for key %s", key, exc_info=True)
+
+
+def _searchable_failure_code(exc: Exception, stage: str) -> str:
+    """Map a searchable-PDF failure to a safe public contract code.
+
+    The exception itself stays in the actor log for diagnosis, while the job
+    record receives only a stable classification that the backend can project
+    safely to the product UI.
+    """
+    if isinstance(exc, RenderingNotEligibleError):
+        return "PDF_RENDER_FAILURE"
+    if isinstance(exc, EngineUnavailableError):
+        return "ENGINE_UNAVAILABLE"
+    if isinstance(exc, OCRTimeoutError):
+        return "TIMEOUT"
+    if isinstance(exc, ValueError) and str(exc).startswith("PROFILE_NOT_ELIGIBLE:"):
+        return "PROFILE_NOT_ELIGIBLE"
+    if stage == "IMAGE_NORMALIZATION":
+        return "INVALID_INPUT"
+    if stage == "ARTIFACT_PERSISTENCE":
+        return "TASK_STORAGE_UNAVAILABLE"
+    return "ENGINE_FAILURE"
+
+
+def _searchable_failure_message(code: str, stage: str) -> str:
+    """Return safe durable diagnostics without storing exception text."""
+    return f"Searchable PDF V2 job failed during {stage} ({code})."
 
 
 @dramatiq.actor(queue_name="default", max_retries=3)
@@ -126,6 +154,7 @@ def ocr_v2_job(
     page_statuses: dict[str, str] = {}
     acquired = False
     claimed = False
+    stage = "JOB_START"
 
     try:
         check_cancellation(job_id)
@@ -304,6 +333,7 @@ def _run_searchable_pdf_job(
         update_job(job_id, status=JobState.running, started_at=datetime.now(timezone.utc), progress=0, total_pages=len(source_files), message="Searchable PDF V2 job started")
 
         for index, item in enumerate(source_files):
+            stage = "INPUT_DOWNLOAD"
             check_cancellation(job_id)
             suffix = Path(item.get("source_name", "image.png")).suffix or ".img"
             local_path = temp_file_path(prefix=f"pdfnest-searchable-input-{index}-", suffix=suffix)
@@ -316,6 +346,7 @@ def _run_searchable_pdf_job(
         from app.core.ocr_v2.routing import RoutePolicy
         from app.core.ocr_v2.validation import OCRProfile
 
+        stage = "IMAGE_NORMALIZATION"
         build_image_source_pdf(local_inputs, source_pdf)
         # Searchable PDF requires genuine word geometry; PP-OCR's current
         # line-level contract is intentionally not eligible for this profile.
@@ -329,22 +360,27 @@ def _run_searchable_pdf_job(
                 failed_pages.append(int(page.page_index))
             update_job(job_id, progress=int((done / max(1, total)) * 90), total_pages=total, completed_pages=done - len(failed_pages), failed_pages=failed_pages, current_page=page.page_index, page_statuses=page_statuses, message=f"Searchable PDF V2 processing page {done}/{total}")
 
+        stage = "OCR"
         result = worker.process_document(source_pdf, language=language, profile=OCRProfile.SEARCHABLE_PDF_V2, cancellation_check=lambda: check_cancellation(job_id), page_progress_callback=on_page)
         check_cancellation(job_id)
+        stage = "PROFILE_VALIDATION"
         if not result.validation.valid:
             issue_codes = ";".join(issue.code for issue in result.validation.issues)
             raise ValueError(f"PROFILE_NOT_ELIGIBLE:{issue_codes}")
+        stage = "PDF_RENDER"
         SearchablePdfRenderer().render(source_pdf, result, output_pdf)
         check_cancellation(job_id)
+        stage = "ARTIFACT_PERSISTENCE"
         upload_path(output_pdf, result_key, content_type="application/pdf")
         size = Path(output_pdf).stat().st_size
         update_job(job_id, status=JobState.succeeded, finished_at=datetime.now(timezone.utc), progress=100, total_pages=len(result.pages), completed_pages=len(result.pages), failed_pages=[], current_page=None, page_statuses={str(page.page_index): page.status.value for page in result.pages}, result={"artifact_key": result_key, "artifact_name": f"{Path(source_name or 'document').stem}-searchable.pdf", "artifact_content_type": "application/pdf", "artifact_size": size}, message="Searchable PDF V2 job completed")
     except JobCancelledException:
         update_job(job_id, status=JobState.cancelled, finished_at=datetime.now(timezone.utc), current_page=None, error_code="CANCELLED", message="Searchable PDF V2 job cancelled")
     except Exception as exc:
-        logger.exception("Searchable PDF V2 job %s failed", job_id)
-        error_code = "PROFILE_NOT_ELIGIBLE" if str(exc).startswith("PROFILE_NOT_ELIGIBLE:") else "ENGINE_FAILURE"
-        update_job(job_id, status=JobState.failed, finished_at=datetime.now(timezone.utc), current_page=None, error="Searchable PDF V2 job failed.", error_code=error_code, message="Searchable PDF V2 job failed")
+        error_code = _searchable_failure_code(exc, stage)
+        safe_message = _searchable_failure_message(error_code, stage)
+        logger.exception("Searchable PDF V2 job %s failed during %s (%s)", job_id, stage, error_code)
+        update_job(job_id, status=JobState.failed, finished_at=datetime.now(timezone.utc), current_page=None, error=safe_message, error_code=error_code, message=safe_message)
     finally:
         if acquired:
             release_lease(job_id, owner_identity)
