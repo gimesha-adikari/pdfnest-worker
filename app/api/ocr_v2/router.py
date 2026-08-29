@@ -39,6 +39,8 @@ _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._:-]+$")
 
 
 def _request_model(request_id: str, profile: str, language: str | None, routing_policy: str) -> OCRV2WorkerRequest:
+    if profile != OCRV2Profile.OCR_TEXT_V2.value:
+        raise HTTPException(status_code=422, detail={"code": "INVALID_INPUT", "message": "This endpoint only accepts OCR_TEXT_V2"})
     try:
         return OCRV2WorkerRequest(request_id=request_id, profile=profile, language=language, routing_policy=routing_policy)
     except ValueError as exc:
@@ -121,6 +123,7 @@ async def capabilities(language: str = "eng") -> dict[str, object]:
         engine["engine_id"] == "ppocrv6_medium_v2" and engine["available"]
         for engine in engines
     )
+    tesseract_available = any(engine["engine_id"] == "tesseract_v2" and engine["available"] for engine in engines)
     languages = [
         {"code": code, "name": language_name(code)}
         for code in get_installed_tesseract_languages()
@@ -137,6 +140,13 @@ async def capabilities(language: str = "eng") -> dict[str, object]:
         ],
         "quality_engine_available": quality_available,
         "engines": engines,
+        "profiles": ["OCR_TEXT_V2", "SEARCHABLE_PDF_V2"],
+        "searchable_pdf": {
+            "available": tesseract_available,
+            "engine_id": "tesseract_v2",
+            "required_capabilities": ["TEXT", "WORD_GEOMETRY", "READING_ORDER"],
+            "input_formats": ["image/jpeg", "image/png", "image/webp"],
+        },
     }
 
 

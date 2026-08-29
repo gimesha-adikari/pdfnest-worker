@@ -201,6 +201,10 @@ class PageResult:
     failure_code: str | None = None
     failure_message: str | None = None
 
+    @property
+    def tokens_by_id(self) -> dict[str, OCRToken]:
+        return {token.id: token for token in self.tokens}
+
 
 @dataclass(frozen=True)
 class SourceMetadata:

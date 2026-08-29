@@ -33,7 +33,8 @@ def _page_issues(page: PageResult, profile: OCRProfile) -> list[ValidationIssue]
         bbox = token.bbox
         if bbox.width <= 0 or bbox.height <= 0 or bbox.x < 0 or bbox.y < 0 or bbox.x1 > page.geometry.width + 1e-6 or bbox.y1 > page.geometry.height + 1e-6:
             issues.append(ValidationIssue("TOKEN_BBOX_OUT_OF_BOUNDS", "token geometry is outside the visible page", path=f"pages[{page.page_index}].tokens.{token.id}"))
-    if profile is OCRProfile.SEARCHABLE_PDF_V2 and page.status is not PageStatus.BLANK:
+    empty_page = page.status is PageStatus.BLANK or (page.status is not PageStatus.FAILED and not page.text.strip() and not page.tokens)
+    if profile is OCRProfile.SEARCHABLE_PDF_V2 and not empty_page:
         if not page.tokens:
             issues.append(ValidationIssue("WORD_GEOMETRY_EMPTY", "searchable PDF requires actual word geometry"))
         if len(page.reading_order) != len(page.tokens) or set(page.reading_order) != {token.id for token in page.tokens}:
@@ -64,7 +65,9 @@ def validate_document(result: DocumentResult, profile: OCRProfile = OCRProfile.O
         issues.append(ValidationIssue("TEXT_CAPABILITY_MISSING", "OCR Text V2 requires TEXT capability"))
     if profile is OCRProfile.SEARCHABLE_PDF_V2:
         required = {ResultCapability.TEXT.value, ResultCapability.WORD_GEOMETRY.value, ResultCapability.READING_ORDER.value}
-        issues.extend(ValidationIssue(f"DOCUMENT_CAPABILITY_MISSING:{value}", f"missing {value}") for value in sorted(required - set(result.capabilities)))
+        has_text_bearing_page = any(page.status is not PageStatus.FAILED and (page.text.strip() or page.tokens) for page in result.pages)
+        if has_text_bearing_page:
+            issues.extend(ValidationIssue(f"DOCUMENT_CAPABILITY_MISSING:{value}", f"missing {value}") for value in sorted(required - set(result.capabilities)))
     return replace(result, validation=Validation(not issues, tuple(issues)))
 
 

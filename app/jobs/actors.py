@@ -88,8 +88,13 @@ def ocr_v2_job(
         source_name: str,
         language: str,
         routing_policy: str,
+        profile: str = "OCR_TEXT_V2",
+        source_files: list[dict[str, str]] | None = None,
 ) -> None:
     """Run one durable OCR V2 job through the existing Dramatiq worker."""
+    if profile == "SEARCHABLE_PDF_V2":
+        _run_searchable_pdf_job(job_id, language, source_files or [], source_name)
+        return
     job = get_job(job_id)
     if job is None:
         return
@@ -239,6 +244,94 @@ def ocr_v2_job(
         except Exception:
             logger.warning("OCR V2 input cleanup failed for job %s", job_id, exc_info=True)
         cleanup_paths(input_path)
+
+
+def _run_searchable_pdf_job(
+    job_id: str,
+    language: str,
+    source_files: list[dict[str, str]],
+    source_name: str,
+) -> None:
+    """Run ordered images through real word-level OCR and PDF rendering."""
+    job = get_job(job_id)
+    if job is None:
+        return
+    if not source_files or any(not str(item.get("source_key", "")).strip() for item in source_files):
+        update_job(job_id, status=JobState.failed, finished_at=datetime.now(timezone.utc), error="Ordered image input references are invalid.", error_code="INVALID_INPUT", message="Searchable PDF input validation failed")
+        return
+
+    owner_identity = job.owner_identity or (job.payload or {}).get("ownerIdentity") or "guest:anonymous"
+    source_keys = [str(item["source_key"]) for item in source_files]
+    local_inputs: list[str] = []
+    source_pdf = temp_file_path(prefix="pdfnest-searchable-source-", suffix=".pdf")
+    output_pdf = temp_file_path(prefix="pdfnest-searchable-output-", suffix=".pdf")
+    result_key = f"jobs/ocr_v2/searchable_pdf/{job_id}.pdf"
+    failed_pages: list[int] = []
+    page_statuses: dict[str, str] = {}
+    acquired = False
+
+    try:
+        check_cancellation(job_id)
+        if claim_job(job_id) is None:
+            return
+        check_cancellation(job_id)
+        acquired, reason = acquire_lease(job_id, owner_identity)
+        if not acquired:
+            update_job(job_id, status=JobState.failed, finished_at=datetime.now(timezone.utc), error="OCR V2 execution capacity is unavailable.", error_code="ENGINE_UNAVAILABLE" if reason != "REDIS_ERROR" else "TASK_STORAGE_UNAVAILABLE", message="Searchable PDF job could not acquire execution capacity")
+            return
+        update_job(job_id, status=JobState.running, started_at=datetime.now(timezone.utc), progress=0, total_pages=len(source_files), message="Searchable PDF V2 job started")
+
+        for index, item in enumerate(source_files):
+            check_cancellation(job_id)
+            suffix = Path(item.get("source_name", "image.png")).suffix or ".img"
+            local_path = temp_file_path(prefix=f"pdfnest-searchable-input-{index}-", suffix=suffix)
+            download_to_path(str(item["source_key"]), local_path)
+            local_inputs.append(local_path)
+
+        from app.core.ocr_v2 import OCRV2Worker
+        from app.core.ocr_v2.image_pages import build_image_source_pdf
+        from app.core.ocr_v2.renderers.searchable_pdf import SearchablePdfRenderer
+        from app.core.ocr_v2.routing import RoutePolicy
+        from app.core.ocr_v2.validation import OCRProfile
+
+        build_image_source_pdf(local_inputs, source_pdf)
+        # Searchable PDF requires genuine word geometry; PP-OCR's current
+        # line-level contract is intentionally not eligible for this profile.
+        worker = OCRV2Worker(route_policy=RoutePolicy(preferred_engine="tesseract_v2", fallback_engine="tesseract_v2"))
+
+        def on_page(done: int, total: int, page: object) -> None:
+            check_cancellation(job_id)
+            status = getattr(getattr(page, "status", None), "value", "FAILED")
+            page_statuses[str(page.page_index)] = status
+            if status == "FAILED":
+                failed_pages.append(int(page.page_index))
+            update_job(job_id, progress=int((done / max(1, total)) * 90), total_pages=total, completed_pages=done - len(failed_pages), failed_pages=failed_pages, current_page=page.page_index, page_statuses=page_statuses, message=f"Searchable PDF V2 processing page {done}/{total}")
+
+        result = worker.process_document(source_pdf, language=language, profile=OCRProfile.SEARCHABLE_PDF_V2, cancellation_check=lambda: check_cancellation(job_id), page_progress_callback=on_page)
+        check_cancellation(job_id)
+        if not result.validation.valid:
+            issue_codes = ";".join(issue.code for issue in result.validation.issues)
+            raise ValueError(f"PROFILE_NOT_ELIGIBLE:{issue_codes}")
+        SearchablePdfRenderer().render(source_pdf, result, output_pdf)
+        check_cancellation(job_id)
+        upload_path(output_pdf, result_key, content_type="application/pdf")
+        size = Path(output_pdf).stat().st_size
+        update_job(job_id, status=JobState.succeeded, finished_at=datetime.now(timezone.utc), progress=100, total_pages=len(result.pages), completed_pages=len(result.pages), failed_pages=[], current_page=None, page_statuses={str(page.page_index): page.status.value for page in result.pages}, result={"artifact_key": result_key, "artifact_name": f"{Path(source_name or 'document').stem}-searchable.pdf", "artifact_content_type": "application/pdf", "artifact_size": size}, message="Searchable PDF V2 job completed")
+    except JobCancelledException:
+        update_job(job_id, status=JobState.cancelled, finished_at=datetime.now(timezone.utc), current_page=None, error_code="CANCELLED", message="Searchable PDF V2 job cancelled")
+    except Exception as exc:
+        logger.exception("Searchable PDF V2 job %s failed", job_id)
+        error_code = "PROFILE_NOT_ELIGIBLE" if str(exc).startswith("PROFILE_NOT_ELIGIBLE:") else "ENGINE_FAILURE"
+        update_job(job_id, status=JobState.failed, finished_at=datetime.now(timezone.utc), current_page=None, error="Searchable PDF V2 job failed.", error_code=error_code, message="Searchable PDF V2 job failed")
+    finally:
+        if acquired:
+            release_lease(job_id, owner_identity)
+        for key in source_keys:
+            try:
+                delete_object(key)
+            except Exception:
+                logger.warning("Searchable PDF input cleanup failed for job %s", job_id, exc_info=True)
+        cleanup_paths(*local_inputs, source_pdf, output_pdf)
 @dramatiq.actor(queue_name="editor", max_retries=3, time_limit=600_000)
 def editor_extract_job(
         job_id: str,

@@ -5,12 +5,13 @@ from pathlib import Path
 
 import pymupdf as fitz
 import pytest
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 
 from app.core.ocr_v2 import OCRProfile, OCRV2Worker, RasterPreparer, pixel_rect_to_points
 from app.core.ocr_v2.adapters import TesseractAdapter
 from app.core.ocr_v2.contracts import PageContentClassification, PageGeometry, Rect, ResultCapability
 from app.core.ocr_v2.errors import ConfigurationError, RenderingNotEligibleError
+from app.core.ocr_v2.image_pages import build_image_source_pdf
 from app.core.ocr_v2.native import NativeExtractor, NativeValidator
 from app.core.ocr_v2.renderers import SearchablePdfRenderer
 from app.core.ocr_v2.routing import OCRRouter, RoutePolicy
@@ -129,3 +130,64 @@ def test_searchable_renderer_fails_closed_without_word_geometry(tmp_path: Path) 
     result = OCRV2Worker().process_document(source, language="eng")
     with pytest.raises(RenderingNotEligibleError):
         SearchablePdfRenderer().render(source, result, output)
+
+
+def test_image_source_pdf_normalizes_exif_and_preserves_order(tmp_path: Path) -> None:
+    first = Image.new("RGB", (600, 400), "white")
+    ImageDraw.Draw(first).text((50, 80), "First page", fill="black")
+    first_path = tmp_path / "first.png"
+    first.save(first_path)
+
+    second = Image.new("RGB", (400, 600), "white")
+    ImageDraw.Draw(second).text((50, 80), "Second page", fill="black")
+    exif = second.getexif()
+    exif[274] = 6
+    second_path = tmp_path / "second.jpg"
+    second.save(second_path, exif=exif)
+
+    source = tmp_path / "ordered.pdf"
+    normalized = build_image_source_pdf([first_path, second_path], source)
+    assert [item.width for item in normalized] == [600, 600]
+    assert [item.height for item in normalized] == [400, 400]
+    with fitz.open(source) as document:
+        assert len(document) == 2
+        assert document[0].rect.width == pytest.approx(288)
+        assert document[1].rect.width == pytest.approx(288)
+        assert "First page" not in document[0].get_text()
+        assert len(document[0].get_images(full=True)) == 1
+        assert len(document[1].get_images(full=True)) == 1
+
+
+def test_all_blank_image_pages_are_valid_searchable_input(tmp_path: Path) -> None:
+    image_path = tmp_path / "blank.webp"
+    Image.new("RGB", (300, 200), "white").save(image_path)
+    source = tmp_path / "blank.pdf"
+    build_image_source_pdf([image_path], source)
+    result = OCRV2Worker().process_document(source, language="eng", profile=OCRProfile.SEARCHABLE_PDF_V2)
+    assert result.validation.valid
+    output = tmp_path / "blank-searchable.pdf"
+    SearchablePdfRenderer().render(source, result, output)
+    with fitz.open(output) as document:
+        assert len(document) == 1
+        assert document[0].get_text("text").strip() == ""
+
+
+def test_image_input_runs_tesseract_word_geometry_to_searchable_artifact(tmp_path: Path) -> None:
+    image_path = tmp_path / "input.png"
+    image = Image.new("RGB", (1200, 800), "white")
+    draw = ImageDraw.Draw(image)
+    font = ImageFont.truetype("/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf", 96)
+    draw.text((120, 180), "Searchable Image 123", fill="black", stroke_width=1, font=font)
+    image.save(image_path)
+    source = tmp_path / "source.pdf"
+    output = tmp_path / "artifact.pdf"
+    build_image_source_pdf([image_path], source)
+    result = OCRV2Worker().process_document(source, language="eng", profile=OCRProfile.SEARCHABLE_PDF_V2)
+    assert result.validation.valid
+    assert ResultCapability.WORD_GEOMETRY.value in result.capabilities
+    SearchablePdfRenderer().render(source, result, output)
+    with fitz.open(output) as document:
+        extracted = document[0].get_text("text")
+        assert "Searchable" in extracted
+        assert "123" in extracted
+        assert document[0].get_images(full=True)

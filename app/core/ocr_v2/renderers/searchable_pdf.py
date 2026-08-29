@@ -9,6 +9,22 @@ import pymupdf as fitz
 from ..contracts import DocumentResult
 from ..errors import RenderingNotEligibleError
 from ..validation import OCRProfile, require_profile
+from .validation import validate_searchable_pdf_artifact
+
+
+def _font_file_for_text(text: str) -> str | None:
+    """Return an installed script font when one is available; never download."""
+    import shutil
+    import subprocess
+
+    language = "ta" if any("\u0b80" <= char <= "\u0bff" for char in text) else "si" if any("\u0d80" <= char <= "\u0dff" for char in text) else ""
+    if not language or shutil.which("fc-match") is None:
+        return None
+    try:
+        path = subprocess.check_output(["fc-match", "-f", "%{file}", f":lang={language}"], text=True, timeout=2).strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return path if path and Path(path).is_file() else None
 
 
 class SearchablePdfRenderer:
@@ -30,5 +46,14 @@ class SearchablePdfRenderer:
                     box = token.bbox
                     # render_mode=3 is invisible text. The position is derived
                     # from the canonical token box; no coordinates are invented.
-                    page.insert_text((box.x, box.y + max(1.0, box.height * 0.85)), token.text, fontsize=max(1.0, min(12.0, box.height)), fontname="helv", render_mode=3, overlay=True)
+                    font_file = _font_file_for_text(token.text)
+                    kwargs = {"fontname": "helv"}
+                    if font_file:
+                        # PyMuPDF keeps embedded fonts by alias.  Distinct
+                        # script files must not share one alias (2H exposed
+                        # cross-script Unicode loss when they did).
+                        alias = "pdfnest_" + "".join(char if char.isalnum() else "_" for char in Path(font_file).stem)
+                        kwargs = {"fontname": alias[:32], "fontfile": font_file}
+                    page.insert_text((box.x, box.y + max(1.0, box.height * 0.85)), token.text, fontsize=max(1.0, min(12.0, box.height)), render_mode=3, overlay=True, **kwargs)
             document.save(str(target), garbage=3, deflate=True)
+        validate_searchable_pdf_artifact(source, target, checked)

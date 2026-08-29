@@ -5,11 +5,12 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class OCRV2Profile(str, Enum):
     OCR_TEXT_V2 = "OCR_TEXT_V2"
+    SEARCHABLE_PDF_V2 = "SEARCHABLE_PDF_V2"
 
 
 class OCRV2RoutingPolicy(str, Enum):
@@ -60,10 +61,19 @@ class OCRV2JobSubmitRequest(BaseModel):
     profile: OCRV2Profile = OCRV2Profile.OCR_TEXT_V2
     language: str = Field(min_length=1, max_length=128)
     routing_policy: OCRV2RoutingPolicy = OCRV2RoutingPolicy.AUTO
-    source_key: str = Field(min_length=1, max_length=512)
+    source_key: str | None = Field(default=None, max_length=512)
+    source_files: list[dict[str, str]] = Field(default_factory=list, max_length=150)
     source_name: str = Field(default="document.pdf", min_length=1, max_length=255)
     owner_identity: str = Field(min_length=1, max_length=255)
     total_pages: int = Field(default=0, ge=0, le=10000)
+
+    @model_validator(mode="after")
+    def validate_sources(self) -> "OCRV2JobSubmitRequest":
+        if self.profile is OCRV2Profile.OCR_TEXT_V2 and not self.source_key:
+            raise ValueError("OCR Text V2 requires source_key")
+        if self.profile is OCRV2Profile.SEARCHABLE_PDF_V2 and not self.source_files:
+            raise ValueError("Searchable PDF V2 requires ordered source_files")
+        return self
 
 
 class OCRV2JobCancelRequest(BaseModel):
