@@ -1,13 +1,16 @@
 from datetime import timedelta
+from types import SimpleNamespace
 import fitz
 import pytest
 from app.jobs.actors import (
+    _run_searchable_pdf_job,
     editor_compile_job,
     editor_extract_job,
     is_non_retryable_error,
     markup_highlight_job,
     markup_strikeout_job,
     markup_underline_job,
+    ocr_v2_job,
 )
 from app.jobs.models import JobState
 from app.jobs.store import create_job, get_job, prune_expired_job_index, save_job, update_job, utcnow
@@ -99,3 +102,28 @@ def test_monotonic_progress():
     read_job = get_job(job.id)
     assert read_job is not None
     assert read_job.progress == 60
+
+
+def test_duplicate_ocr_delivery_does_not_delete_active_text_input(monkeypatch):
+    monkeypatch.setattr("app.jobs.actors.get_job", lambda _job_id: SimpleNamespace(status=JobState.queued, owner_identity="user:alice", payload={}))
+    monkeypatch.setattr("app.jobs.actors.check_cancellation", lambda _job_id: None)
+    monkeypatch.setattr("app.jobs.actors.claim_job", lambda _job_id: None)
+    delete = lambda _key: pytest.fail("duplicate delivery must not delete the active input")
+    monkeypatch.setattr("app.jobs.actors.delete_object", delete)
+
+    ocr_v2_job("123e4567-e89b-12d3-a456-426614174000", "jobs/ocr_v2/input/document.pdf", "document.pdf", "eng", "AUTO")
+
+
+def test_duplicate_ocr_delivery_does_not_delete_active_searchable_inputs(monkeypatch):
+    monkeypatch.setattr("app.jobs.actors.get_job", lambda _job_id: SimpleNamespace(status=JobState.queued, owner_identity="user:alice", payload={}))
+    monkeypatch.setattr("app.jobs.actors.check_cancellation", lambda _job_id: None)
+    monkeypatch.setattr("app.jobs.actors.claim_job", lambda _job_id: None)
+    delete = lambda _key: pytest.fail("duplicate delivery must not delete the active input")
+    monkeypatch.setattr("app.jobs.actors.delete_object", delete)
+
+    _run_searchable_pdf_job(
+        "123e4567-e89b-12d3-a456-426614174000",
+        "eng",
+        [{"source_key": "jobs/ocr_v2/searchable_pdf/input/page.png", "source_name": "page.png"}],
+        "page.png",
+    )

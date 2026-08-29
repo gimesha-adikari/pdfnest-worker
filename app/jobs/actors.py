@@ -40,6 +40,16 @@ def is_non_retryable_error(exc: Exception) -> bool:
     return isinstance(exc, NON_RETRYABLE_ERRORS)
 
 
+def _cleanup_input_objects(keys: list[str]) -> None:
+    for key in keys:
+        if not key:
+            continue
+        try:
+            delete_object(key)
+        except Exception:
+            logger.warning("OCR V2 input cleanup failed for key %s", key, exc_info=True)
+
+
 @dramatiq.actor(queue_name="default", max_retries=3)
 def test_job(job_id: str, payload: dict[str, Any] | None = None) -> None:
     job = get_job(job_id)
@@ -97,8 +107,12 @@ def ocr_v2_job(
         return
     job = get_job(job_id)
     if job is None:
+        _cleanup_input_objects([source_key])
         return
-    if job.status in {JobState.running, JobState.succeeded, JobState.failed, JobState.cancelled, JobState.cancel_requested}:
+    if job.status == JobState.running:
+        return
+    if job.status in {JobState.succeeded, JobState.failed, JobState.cancelled, JobState.cancel_requested}:
+        _cleanup_input_objects([source_key])
         return
     if not source_key or source_key.startswith("/") or "\\" in source_key or ".." in source_key.split("/"):
         update_job(job_id, status=JobState.failed, finished_at=datetime.now(timezone.utc), error="OCR V2 input reference is invalid.", error_code="INVALID_INPUT", message="OCR V2 job input validation failed")
@@ -111,11 +125,13 @@ def ocr_v2_job(
     failed_pages: list[int] = []
     page_statuses: dict[str, str] = {}
     acquired = False
+    claimed = False
 
     try:
         check_cancellation(job_id)
         if claim_job(job_id) is None:
             return
+        claimed = True
         check_cancellation(job_id)
         acquired, reason = acquire_lease(job_id, owner_identity)
         if not acquired:
@@ -239,10 +255,8 @@ def ocr_v2_job(
     finally:
         if acquired:
             release_lease(job_id, owner_identity)
-        try:
-            delete_object(source_key)
-        except Exception:
-            logger.warning("OCR V2 input cleanup failed for job %s", job_id, exc_info=True)
+        if claimed:
+            _cleanup_input_objects([source_key])
         cleanup_paths(input_path)
 
 
@@ -255,6 +269,7 @@ def _run_searchable_pdf_job(
     """Run ordered images through real word-level OCR and PDF rendering."""
     job = get_job(job_id)
     if job is None:
+        _cleanup_input_objects([str(item.get("source_key", "")).strip() for item in source_files if isinstance(item, dict)])
         return
     if not source_files or any(not str(item.get("source_key", "")).strip() for item in source_files):
         update_job(job_id, status=JobState.failed, finished_at=datetime.now(timezone.utc), error="Ordered image input references are invalid.", error_code="INVALID_INPUT", message="Searchable PDF input validation failed")
@@ -262,6 +277,11 @@ def _run_searchable_pdf_job(
 
     owner_identity = job.owner_identity or (job.payload or {}).get("ownerIdentity") or "guest:anonymous"
     source_keys = [str(item["source_key"]) for item in source_files]
+    if job.status == JobState.running:
+        return
+    if job.status in {JobState.succeeded, JobState.failed, JobState.cancelled, JobState.cancel_requested}:
+        _cleanup_input_objects(source_keys)
+        return
     local_inputs: list[str] = []
     source_pdf = temp_file_path(prefix="pdfnest-searchable-source-", suffix=".pdf")
     output_pdf = temp_file_path(prefix="pdfnest-searchable-output-", suffix=".pdf")
@@ -269,11 +289,13 @@ def _run_searchable_pdf_job(
     failed_pages: list[int] = []
     page_statuses: dict[str, str] = {}
     acquired = False
+    claimed = False
 
     try:
         check_cancellation(job_id)
         if claim_job(job_id) is None:
             return
+        claimed = True
         check_cancellation(job_id)
         acquired, reason = acquire_lease(job_id, owner_identity)
         if not acquired:
@@ -326,11 +348,8 @@ def _run_searchable_pdf_job(
     finally:
         if acquired:
             release_lease(job_id, owner_identity)
-        for key in source_keys:
-            try:
-                delete_object(key)
-            except Exception:
-                logger.warning("Searchable PDF input cleanup failed for job %s", job_id, exc_info=True)
+        if claimed:
+            _cleanup_input_objects(source_keys)
         cleanup_paths(*local_inputs, source_pdf, output_pdf)
 @dramatiq.actor(queue_name="editor", max_retries=3, time_limit=600_000)
 def editor_extract_job(

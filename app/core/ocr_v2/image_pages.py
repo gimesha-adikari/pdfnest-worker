@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from io import BytesIO
+import os
 from pathlib import Path
 from typing import Iterable
 
@@ -20,7 +21,20 @@ from PIL import Image, ImageOps
 # input image's normalized pixel dimensions determine the page's physical size
 # at that fixed scale, preserving aspect ratio without distortion.
 DEFAULT_DPI = 150
+DEFAULT_MAX_IMAGE_PIXELS = 25_000_000
 SUPPORTED_FORMATS = frozenset({"JPEG", "PNG", "WEBP"})
+
+
+def max_image_pixels() -> int:
+    """Return the bounded decoded-pixel budget for one uploaded image."""
+    raw = os.getenv("OCR_V2_MAX_IMAGE_PIXELS", "").strip()
+    if not raw:
+        return DEFAULT_MAX_IMAGE_PIXELS
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_MAX_IMAGE_PIXELS
+    return max(1, min(value, 100_000_000))
 
 
 @dataclass(frozen=True)
@@ -41,6 +55,13 @@ def normalize_image(path: str | Path, *, dpi: int = DEFAULT_DPI) -> NormalizedIm
         image_format = str(opened.format or "").upper()
         if image_format not in SUPPORTED_FORMATS:
             raise ValueError(f"unsupported image format: {image_format or 'unknown'}")
+        width, height = opened.size
+        if width <= 0 or height <= 0:
+            raise ValueError("image dimensions must be positive")
+        pixel_count = width * height
+        limit = max_image_pixels()
+        if pixel_count > limit:
+            raise ValueError(f"image decoded pixel count {pixel_count} exceeds OCR_V2_MAX_IMAGE_PIXELS={limit}")
         opened.load()
         image = ImageOps.exif_transpose(opened)
         if image.mode not in {"RGB", "RGBA"}:

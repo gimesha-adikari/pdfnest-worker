@@ -11,7 +11,7 @@ from app.core.ocr_v2 import OCRProfile, OCRV2Worker, RasterPreparer, pixel_rect_
 from app.core.ocr_v2.adapters import TesseractAdapter
 from app.core.ocr_v2.contracts import PageContentClassification, PageGeometry, Rect, ResultCapability
 from app.core.ocr_v2.errors import ConfigurationError, RenderingNotEligibleError
-from app.core.ocr_v2.image_pages import build_image_source_pdf
+from app.core.ocr_v2.image_pages import build_image_source_pdf, normalize_image
 from app.core.ocr_v2.native import NativeExtractor, NativeValidator
 from app.core.ocr_v2.renderers import SearchablePdfRenderer
 from app.core.ocr_v2.routing import OCRRouter, RoutePolicy
@@ -156,6 +156,15 @@ def test_image_source_pdf_normalizes_exif_and_preserves_order(tmp_path: Path) ->
         assert "First page" not in document[0].get_text()
         assert len(document[0].get_images(full=True)) == 1
         assert len(document[1].get_images(full=True)) == 1
+
+
+def test_image_normalization_rejects_excessive_decoded_pixels(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    image_path = tmp_path / "oversized.png"
+    Image.new("RGB", (1200, 1000), "white").save(image_path)
+    monkeypatch.setenv("OCR_V2_MAX_IMAGE_PIXELS", "1000000")
+
+    with pytest.raises(ValueError, match="OCR_V2_MAX_IMAGE_PIXELS"):
+        normalize_image(image_path)
 
 
 def test_searchable_renderer_preserves_variable_page_geometry_and_reading_order(tmp_path: Path) -> None:
