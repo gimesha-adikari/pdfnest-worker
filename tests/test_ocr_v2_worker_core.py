@@ -158,6 +158,44 @@ def test_image_source_pdf_normalizes_exif_and_preserves_order(tmp_path: Path) ->
         assert len(document[1].get_images(full=True)) == 1
 
 
+def test_searchable_renderer_preserves_variable_page_geometry_and_reading_order(tmp_path: Path) -> None:
+    """Regression: each image page keeps its own geometry and OCR order."""
+    images: list[Path] = []
+    for index, (size, lines) in enumerate(
+        [
+            ((600, 400), [("tiny", 8), ("normal", 16), ("LARGE", 30)]),
+            ((1000, 600), [("wide", 24), ("page", 40), ("42", 56)]),
+        ]
+    ):
+        image = Image.new("RGB", size, "white")
+        draw = ImageDraw.Draw(image)
+        y = 40
+        for text, font_size in lines:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf", font_size)
+            draw.text((40, y), text, fill="black", font=font)
+            y += font_size + 30
+        path = tmp_path / f"variable-page-{index}.png"
+        image.save(path)
+        images.append(path)
+
+    source = tmp_path / "variable-pages.pdf"
+    output = tmp_path / "variable-pages-searchable.pdf"
+    build_image_source_pdf(images, source)
+    result = OCRV2Worker().process_document(source, language="eng", profile=OCRProfile.SEARCHABLE_PDF_V2)
+    assert result.validation.valid
+    assert all(page.tokens for page in result.pages)
+
+    SearchablePdfRenderer().render(source, result, output)
+    with fitz.open(str(source)) as source_document, fitz.open(str(output)) as output_document:
+        assert [page.rect for page in output_document] == [page.rect for page in source_document]
+        for page_result, source_page, output_page in zip(result.pages, source_document, output_document):
+            expected = " ".join(page_result.tokens_by_id[token_id].text for token_id in page_result.reading_order)
+            actual = " ".join(str(word[4]) for word in output_page.get_text("words"))
+            assert expected in actual
+            assert output_page.get_images(full=True)
+            assert source_page.get_pixmap(alpha=False).samples == output_page.get_pixmap(alpha=False).samples
+
+
 def test_all_blank_image_pages_are_valid_searchable_input(tmp_path: Path) -> None:
     image_path = tmp_path / "blank.webp"
     Image.new("RGB", (300, 200), "white").save(image_path)
