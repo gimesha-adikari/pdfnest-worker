@@ -17,12 +17,12 @@ from app.api.tools.markup.document import process_markup_pdf
 from app.api.tools.markdown.service import convert_pdf_to_markdown
 from app.core.broker import broker  # noqa: F401
 from app.core.config import validate_runtime_config
-from app.core.storage import build_key, download_to_path, upload_path
+from app.core.storage import build_key, delete_object, download_to_path, upload_path, upload_text
 from app.core.actor_heartbeat import start_actor_heartbeat
 from app.jobs.cancellation import JobCancelledException, check_cancellation
 from app.jobs.limiter import acquire_lease, release_lease
 from app.jobs.models import JobState
-from app.jobs.store import get_job, update_job
+from app.jobs.store import claim_job, get_job, update_job
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +81,164 @@ def test_job(job_id: str, payload: dict[str, Any] | None = None) -> None:
         raise
 
 
+@dramatiq.actor(queue_name="ocr", max_retries=0, time_limit=3_600_000)
+def ocr_v2_job(
+        job_id: str,
+        source_key: str,
+        source_name: str,
+        language: str,
+        routing_policy: str,
+) -> None:
+    """Run one durable OCR V2 job through the existing Dramatiq worker."""
+    job = get_job(job_id)
+    if job is None:
+        return
+    if job.status in {JobState.running, JobState.succeeded, JobState.failed, JobState.cancelled, JobState.cancel_requested}:
+        return
+    if not source_key or source_key.startswith("/") or "\\" in source_key or ".." in source_key.split("/"):
+        update_job(job_id, status=JobState.failed, finished_at=datetime.now(timezone.utc), error="OCR V2 input reference is invalid.", error_code="INVALID_INPUT", message="OCR V2 job input validation failed")
+        return
+
+    owner_identity = job.owner_identity or (job.payload or {}).get("ownerIdentity") or "guest:anonymous"
+    input_path = temp_file_path(prefix="pdfnest-ocr-v2-input-", suffix=Path(source_name or source_key).suffix or ".pdf")
+    result_key = f"jobs/ocr_v2/results/{job_id}.json"
+    warnings: list[str] = []
+    failed_pages: list[int] = []
+    page_statuses: dict[str, str] = {}
+    acquired = False
+
+    try:
+        check_cancellation(job_id)
+        if claim_job(job_id) is None:
+            return
+        check_cancellation(job_id)
+        acquired, reason = acquire_lease(job_id, owner_identity)
+        if not acquired:
+            update_job(
+                job_id,
+                status=JobState.failed,
+                finished_at=datetime.now(timezone.utc),
+                error="OCR V2 execution capacity is unavailable.",
+                error_code="ENGINE_UNAVAILABLE" if reason != "REDIS_ERROR" else "TASK_STORAGE_UNAVAILABLE",
+                message="OCR V2 job could not acquire execution capacity",
+            )
+            return
+
+        update_job(job_id, progress=0, current_page=None, message="OCR V2 job started")
+        check_cancellation(job_id)
+        download_to_path(source_key, input_path)
+        check_cancellation(job_id)
+
+        # Importing the API projection here keeps the actor dependent on the
+        # same product-safe response mapper without making the job module part
+        # of the FastAPI startup import cycle.
+        from app.api.ocr_v2.router import _response, _route_policy
+        from app.api.ocr_v2.schemas import OCRV2WorkerRequest
+        from app.core.ocr_v2 import OCRV2Worker
+        from app.core.ocr_v2.adapters import PPOCRv6MediumAdapter
+        from app.core.ocr_v2.validation import OCRProfile
+
+        contract = OCRV2WorkerRequest(
+            request_id=job_id,
+            profile="OCR_TEXT_V2",
+            language=language,
+            routing_policy=routing_policy,
+        )
+        if contract.routing_policy in {"AUTO", "QUALITY", "GEOMETRY"} and not PPOCRv6MediumAdapter().availability().available:
+            warnings.append("ENGINE_FALLBACK:PP_OCR_UNAVAILABLE_TO_TESSERACT")
+        worker = OCRV2Worker(route_policy=_route_policy(contract.routing_policy))
+
+        def on_page(done: int, total: int, page: object) -> None:
+            check_cancellation(job_id)
+            if getattr(getattr(page, "status", None), "value", "") == "FAILED":
+                failed_pages.append(int(page.page_index))
+            page_statuses[str(page.page_index)] = getattr(getattr(page, "status", None), "value", "FAILED")
+            # The orchestration callback is intentionally small and durable:
+            # status polling receives counts and the current page, while the
+            # final product result remains in object storage.
+            update_job(
+                job_id,
+                progress=int((done / max(1, total)) * 100),
+                total_pages=total,
+                completed_pages=done - len(failed_pages),
+                failed_pages=failed_pages,
+                current_page=page.page_index,
+                page_statuses=page_statuses,
+                warnings=warnings,
+                message=f"OCR V2 processing page {done}/{total}",
+            )
+
+        result = worker.process_document(
+            input_path,
+            language=contract.language,
+            profile=OCRProfile.OCR_TEXT_V2,
+            cancellation_check=lambda: check_cancellation(job_id),
+            page_progress_callback=on_page,
+        )
+        response = _response(result, contract, warnings)
+        result_payload = response.model_dump()
+        upload_text(json.dumps(result_payload, ensure_ascii=False), result_key, content_type="application/json")
+        failed_pages = [page.page_index for page in result.pages if page.status.value == "FAILED"]
+        completed_pages = len(result.pages) - len(failed_pages)
+        if response.status == "SUCCEEDED":
+            update_job(
+                job_id,
+                status=JobState.succeeded,
+                finished_at=datetime.now(timezone.utc),
+                progress=100,
+                total_pages=result.source.page_count,
+                completed_pages=completed_pages,
+                failed_pages=failed_pages,
+                current_page=None,
+                page_statuses={str(page.page_index): page.status.value for page in result.pages},
+                warnings=response.warnings,
+                result={"artifact_key": result_key, "artifact_name": f"{Path(source_name or 'document').stem}.json"},
+                message="OCR V2 job completed",
+            )
+        else:
+            update_job(
+                job_id,
+                status=JobState.failed,
+                finished_at=datetime.now(timezone.utc),
+                progress=int((len(result.pages) / max(1, result.source.page_count)) * 100),
+                total_pages=result.source.page_count,
+                completed_pages=completed_pages,
+                failed_pages=failed_pages,
+                current_page=None,
+                page_statuses={str(page.page_index): page.status.value for page in result.pages},
+                warnings=response.warnings,
+                error=response.error.message if response.error else "OCR V2 job failed",
+                error_code=response.error.code if response.error else "ENGINE_FAILURE",
+                result={"artifact_key": result_key, "artifact_name": f"{Path(source_name or 'document').stem}.json"},
+                message="OCR V2 job completed with page failures",
+            )
+    except JobCancelledException:
+        update_job(
+            job_id,
+            status=JobState.cancelled,
+            finished_at=datetime.now(timezone.utc),
+            current_page=None,
+            error_code="CANCELLED",
+            message="OCR V2 job cancelled",
+        )
+    except Exception as exc:
+        logger.exception("OCR V2 job %s failed", job_id)
+        update_job(
+            job_id,
+            status=JobState.failed,
+            finished_at=datetime.now(timezone.utc),
+            error="OCR V2 job failed.",
+            error_code="ENGINE_FAILURE",
+            message="OCR V2 job failed",
+        )
+    finally:
+        if acquired:
+            release_lease(job_id, owner_identity)
+        try:
+            delete_object(source_key)
+        except Exception:
+            logger.warning("OCR V2 input cleanup failed for job %s", job_id, exc_info=True)
+        cleanup_paths(input_path)
 @dramatiq.actor(queue_name="editor", max_retries=3, time_limit=600_000)
 def editor_extract_job(
         job_id: str,

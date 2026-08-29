@@ -23,6 +23,8 @@ from app.api.tools.sign.router import router as sign_router
 from app.api.landing.router import router as landing_router
 from app.api.tools.ocr.router import router as ocr_router
 from app.api.tools.markdown.router import router as markdown_router
+from app.api.ocr_v2.router import router as ocr_v2_router
+from app.api.ocr_v2.jobs import router as ocr_v2_jobs_router
 
 import os
 
@@ -182,6 +184,8 @@ app.include_router(sign_router)
 app.include_router(landing_router)
 app.include_router(ocr_router)
 app.include_router(markdown_router)
+app.include_router(ocr_v2_router)
+app.include_router(ocr_v2_jobs_router)
 
 warnings.filterwarnings(
     "ignore",

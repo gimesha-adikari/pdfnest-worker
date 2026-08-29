@@ -183,6 +183,19 @@ def upload_path(path: str, key: str, *, content_type: str | None = None) -> str:
 def upload_text(text: str, key: str, *, content_type: str = "application/json") -> str:
     return upload_fileobj(BytesIO(text.encode("utf-8")), key, content_type=content_type)
 
+def delete_object(key: str) -> None:
+    """Delete a server-created object from the configured worker storage."""
+    if not key or key.startswith("/") or ".." in key.split("/"):
+        raise ValueError("invalid storage key")
+    if not settings.r2_bucket:
+        local_path = _get_local_file_path(key)
+        try:
+            os.remove(local_path)
+        except FileNotFoundError:
+            pass
+        return
+    get_r2_client().delete_object(Bucket=settings.r2_bucket, Key=key)
+
 def download_to_path(key: str, path: str) -> str:
     if not settings.r2_bucket:
         local_path = _get_local_file_path(key)

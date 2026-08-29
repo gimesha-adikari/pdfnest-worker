@@ -38,8 +38,15 @@ class JobRecord(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
     result: dict[str, Any] | None = None
     error: str | None = None
+    error_code: str | None = None
     cancel_requested: bool = False
     owner_identity: str | None = None
+    total_pages: int = 0
+    completed_pages: int = 0
+    failed_pages: list[int] = Field(default_factory=list)
+    current_page: int | None = None
+    page_statuses: dict[str, str] = Field(default_factory=dict)
+    warnings: list[str] = Field(default_factory=list)
 
 
 class TestJobRequest(BaseModel):

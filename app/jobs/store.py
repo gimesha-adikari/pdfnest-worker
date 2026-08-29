@@ -179,6 +179,39 @@ def get_job(job_id: str) -> JobRecord | None:
     return job
 
 
+def claim_job(job_id: str) -> JobRecord | None:
+    """Atomically claim a queued job so duplicate delivery cannot re-run OCR."""
+    key = job_key(job_id)
+    while True:
+        try:
+            with redis_client.pipeline() as pipe:
+                pipe.watch(key)
+                raw = pipe.get(key)
+                if not raw:
+                    pipe.unwatch()
+                    return None
+                job = JobRecord.model_validate_json(raw)
+                if job.status != JobState.queued and job.status != JobState.cancel_requested:
+                    pipe.unwatch()
+                    return None
+                if job.cancel_requested or job.status == JobState.cancel_requested:
+                    pipe.unwatch()
+                    return None
+                job.status = JobState.running
+                job.started_at = utcnow()
+                job.updated_at = utcnow()
+                pipe.multi()
+                pipe.set(key, job.model_dump_json(), ex=settings.job_ttl_seconds)
+                pipe.zadd(JOB_INDEX_KEY, {job.id: job.created_at.timestamp()})
+                pipe.execute()
+                break
+        except WatchError:
+            continue
+    # Keep the existing Go task mirror and retention bookkeeping in sync.
+    save_job(job)
+    return job
+
+
 def list_jobs(limit: int = 50) -> list[JobRecord]:
     if limit <= 0:
         return []
@@ -205,7 +238,14 @@ def update_job(
     message: str | None = None,
     result: dict[str, Any] | None = None,
     error: str | None = None,
+    error_code: str | None = None,
     cancel_requested: bool | None = None,
+    total_pages: int | None = None,
+    completed_pages: int | None = None,
+    failed_pages: list[int] | None = None,
+    current_page: int | None = None,
+    page_statuses: dict[str, str] | None = None,
+    warnings: list[str] | None = None,
 ) -> JobRecord | None:
     job = get_job(job_id)
     if job is None:
@@ -225,8 +265,22 @@ def update_job(
         job.result = result
     if error is not None:
         job.error = error
+    if error_code is not None:
+        job.error_code = error_code
     if cancel_requested is not None:
         job.cancel_requested = cancel_requested
+    if total_pages is not None:
+        job.total_pages = max(0, total_pages)
+    if completed_pages is not None:
+        job.completed_pages = max(0, completed_pages)
+    if failed_pages is not None:
+        job.failed_pages = list(failed_pages)
+    if current_page is not None:
+        job.current_page = current_page
+    if page_statuses is not None:
+        job.page_statuses = dict(page_statuses)
+    if warnings is not None:
+        job.warnings = list(warnings)
 
     save_job(job)
     return job
