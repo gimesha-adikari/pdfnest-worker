@@ -150,3 +150,13 @@ def test_searchable_engine_failure_precedes_profile_capability_failure():
         _raise_primary_page_failure(result)
 
     assert "unavailable" in str(raised.value)
+
+
+def test_markup_engine_failure_precedes_geometry_failure():
+    from app.jobs.actors import _markup_public_error
+    from app.core.ocr_v2.errors import EngineUnavailableError
+
+    code, message = _markup_public_error(EngineUnavailableError("tesseract is unavailable"))
+
+    assert code == "ENGINE_UNAVAILABLE"
+    assert "unavailable" in message.lower()

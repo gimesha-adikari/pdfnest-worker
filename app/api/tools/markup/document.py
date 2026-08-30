@@ -5,6 +5,11 @@ from typing import Callable, Literal
 import fitz
 
 from app.api.tools.editor.document import group_words_by_line, ocr_words_for_page, sample_background_hex
+from app.core.ocr_v2 import OCRV2Worker
+from app.core.ocr_v2.contracts import PageProcessingSource
+from app.core.ocr_v2.markup import MarkupAction as OCRV2MarkupAction, MarkupMode as OCRV2MarkupMode, _annotate, select_regions
+from app.core.ocr_v2.routing import RoutePolicy
+from app.core.ocr_v2.validation import OCRProfile
 from .utils import native_words_in_rect, normalize_hex, open_document
 
 
@@ -214,3 +219,50 @@ def process_markup_pdf(
         doc.save(output_path, deflate=True, garbage=4)
     finally:
         doc.close()
+
+
+def process_markup_pdf_v2_regions(
+        input_path: str,
+        output_path: str,
+        boxes: list[dict],
+        action: MarkupAction,
+        mode: MarkupMode = "smart",
+        password: str | None = None,
+        progress_callback: Callable[[int, int], None] | None = None,
+) -> dict:
+    """Apply Studio rectangle selections using the shared OCR V2 result.
+
+    Manual mode remains rectangle-only. Smart/OCR mode resolves genuine
+    canonical words once and passes the typed selections to the same
+    annotation writer used by the Phase 7 V2 markup product.
+    """
+    worker = OCRV2Worker(
+        route_policy=RoutePolicy(preferred_engine="tesseract_v2", fallback_engine="tesseract_v2"),
+        max_raster_pixels=25_000_000,
+    )
+    result = worker.process_document(
+        input_path,
+        password=password,
+        language="eng",
+        profile=OCRProfile.OCR_TEXT_V2,
+        page_progress_callback=lambda done, total, _page: progress_callback(done, total) if progress_callback else None,
+    )
+    if mode.strip().lower() == "manual":
+        process_markup_pdf(input_path, output_path, boxes, action, mode="manual", password=password, progress_callback=progress_callback)
+        return {"source_policy": "MANUAL_RECTANGLE", "selection_count": 0}
+    selected = select_regions(result, boxes, mode=OCRV2MarkupMode(mode.strip().lower()))
+    with fitz.open(input_path) as document:
+        for selection in selected:
+            matching_box = next(
+                (
+                    box for box in boxes
+                    if int(box.get("page", 1)) - 1 == selection.page_index
+                    and float(box.get("width", 0)) > 0
+                    and float(box.get("height", 0)) > 0
+                ),
+                None,
+            )
+            color = normalize_hex(matching_box.get("color", "#FFFF00")) if matching_box else (1.0, 1.0, 0.0)
+            _annotate(document[selection.page_index], selection, OCRV2MarkupAction(action), color)
+        document.save(output_path, deflate=True, garbage=4)
+    return {"source_policy": "OCR_V2_CANONICAL_WORDS", "selection_count": len(selected), "selections": [selection.to_dict() for selection in selected]}

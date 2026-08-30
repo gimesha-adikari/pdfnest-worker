@@ -11,6 +11,12 @@ import pymupdf as fitz
 import pytesseract
 from PIL import Image, ImageDraw
 
+from app.core.ocr_v2.contracts import PageContentClassification, PageProcessingSource
+from app.core.ocr_v2.errors import EngineUnavailableError
+from app.core.ocr_v2.orchestration import OCRV2Worker
+from app.core.ocr_v2.routing import RoutePolicy
+from app.core.ocr_v2.validation import OCRProfile
+
 logger = logging.getLogger(__name__)
 
 
@@ -401,6 +407,118 @@ def extract_document(
             else:
                 pages.append(extract_ocr_page(page, i + 1))
         return {"success": True, "pages": pages}
+
+
+def _editor_page_kind(classification: PageContentClassification) -> str:
+    return {
+        PageContentClassification.TEXT_NATIVE: "text",
+        PageContentClassification.IMAGE_SCAN: "scanned",
+        PageContentClassification.MIXED: "mixed",
+        PageContentClassification.SUSPICIOUS_TEXT_LAYER: "scanned",
+        PageContentClassification.NEAR_BLANK: "blank",
+        PageContentClassification.BLANK: "blank",
+    }.get(classification, "mixed")
+
+
+def _canonical_editor_elements(page_result: Any) -> list[dict[str, Any]]:
+    """Adapt canonical OCR V2 words into the editor's line element contract.
+
+    The editor can continue to edit line-shaped elements, but the underlying
+    word IDs and genuine word rectangles remain attached for selection,
+    provenance, and future word-level consumers.
+    """
+    tokens = page_result.tokens_by_id
+    elements: list[dict[str, Any]] = []
+    for index, line in enumerate(page_result.lines, start=1):
+        words = [tokens[token_id] for token_id in line.token_ids if token_id in tokens]
+        if not words and not line.text.strip():
+            continue
+        rect = line.bbox
+        heights = [word.bbox.height for word in words if word.bbox.height > 0]
+        size = max(8.0, (max(heights) if heights else rect.height) * 1.15)
+        elements.append({
+            "id": f"p{page_result.page_index + 1}-ocr-v2-line-{index}",
+            "text": line.text,
+            "original_text": line.text,
+            "x": rect.x,
+            "y": rect.y,
+            "width": rect.width,
+            "height": rect.height,
+            "size": round(size, 1),
+            "font": "tiro",
+            "bg_color": "transparent",
+            "text_color": "#000000",
+            "transparent_bg": True,
+            "ocr_v2": True,
+            "source": page_result.processing_source.value,
+            "provenance": list(page_result.provenance_refs),
+            "word_ids": [word.id for word in words],
+            "word_geometry": [
+                {"id": word.id, "text": word.text, "x": word.bbox.x, "y": word.bbox.y, "width": word.bbox.width, "height": word.bbox.height}
+                for word in words
+            ],
+            "reading_order": [word.id for word in words],
+            "confidence": sum(word.confidence.raw_value for word in words if word.confidence) / max(1, sum(1 for word in words if word.confidence)),
+        })
+    return elements
+
+
+def extract_document_v2(
+    input_path: str,
+    password: str | None = None,
+    cancellation_check: Callable[[], None] | None = None,
+    page_progress_callback: Callable[[int, int, Any], None] | None = None,
+) -> dict[str, Any]:
+    """Extract editor layout through the shared OCR V2 canonical result.
+
+    This is an explicit V2 editor mode.  The legacy ``extract_document``
+    function remains available to V1 routes and retains its historical direct
+    OCR behavior until parity/migration is separately approved.
+    """
+    worker = OCRV2Worker(
+        route_policy=RoutePolicy(preferred_engine="tesseract_v2", fallback_engine="tesseract_v2"),
+        max_raster_pixels=25_000_000,
+    )
+    result = worker.process_document(
+        input_path,
+        password=password,
+        language="eng",
+        profile=OCRProfile.OCR_TEXT_V2,
+        cancellation_check=cancellation_check,
+        page_progress_callback=page_progress_callback,
+    )
+    failed = next((page for page in result.pages if page.status.value == "FAILED"), None)
+    if failed is not None:
+        if failed.failure_code == "EngineUnavailableError":
+            raise EngineUnavailableError("OCR V2 editor extraction engine is unavailable")
+        raise RuntimeError("OCR V2 editor extraction failed for a page")
+
+    pages: list[dict[str, Any]] = []
+    for page in result.pages:
+        elements = _canonical_editor_elements(page)
+        pages.append({
+            "page_num": page.page_index + 1,
+            "width": page.geometry.width,
+            "height": page.geometry.height,
+            "elements": elements,
+            "kind": _editor_page_kind(page.content_classification),
+            "is_ocr": page.processing_source is PageProcessingSource.OCR_RECOGNITION,
+            "has_selectable_text": bool(page.tokens),
+            "word_count": len(page.tokens),
+            "text_block_count": len(page.lines),
+            "image_block_count": 1 if page.content_classification in {PageContentClassification.IMAGE_SCAN, PageContentClassification.MIXED} else 0,
+            "source": page.processing_source.value,
+            "provenance": list(page.provenance_refs),
+            "reading_order": list(page.reading_order),
+            "capabilities": sorted(page.capabilities),
+        })
+    return {
+        "success": True,
+        "schema_version": "ocr_v2_editor_layout.v1",
+        "ocr_v2": True,
+        "pages": pages,
+        "source": result.source.to_dict() if hasattr(result.source, "to_dict") else {"page_count": result.source.page_count, "filename": result.source.filename},
+    }
 
 
 def is_element_dirty(element: dict[str, Any]) -> bool:

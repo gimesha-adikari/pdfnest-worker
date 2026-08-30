@@ -48,3 +48,23 @@ class OCRCancellationError(OCRV2Error):
 
 class OCRTimeoutError(OCRV2Error):
     pass
+
+
+class MarkupError(OCRV2Error):
+    """Base class for safe OCR-aware markup classifications."""
+
+
+class TextNotFoundError(MarkupError):
+    pass
+
+
+class AmbiguousSelectionError(MarkupError):
+    pass
+
+
+class WordGeometryUnavailableError(MarkupError):
+    pass
+
+
+class AnnotationWriteError(MarkupError):
+    pass

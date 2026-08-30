@@ -13,7 +13,8 @@ from .orchestration import OCRV2Worker
 from .profiles import product_verdict, searchable_pdf_reason
 from .routing import OCRRouter, RoutePlan, RoutePolicy
 from .validation import OCRProfile, profile_disposition, require_profile, validate_document, validate_page
+from .markup import MarkupAction, MarkupExecutionResult, MarkupMode, MarkupSelection, MarkupSourceType, apply_ocr_markup, select_query, select_regions
 
 __all__ = [
-    "OCRV2Worker", "OCRProfile", "OCRRouter", "RoutePlan", "RoutePolicy", "NativeDecision", "NativeExtractor", "NativeValidator", "PreparedRaster", "RasterPreparer", "normalize_rotation", "page_geometry_from_pdf", "pixel_rect_to_points", "normalize_image", "build_image_source_pdf", "product_verdict", "searchable_pdf_reason", "profile_disposition", "require_profile", "validate_document", "validate_page",
+    "OCRV2Worker", "OCRProfile", "OCRRouter", "RoutePlan", "RoutePolicy", "NativeDecision", "NativeExtractor", "NativeValidator", "PreparedRaster", "RasterPreparer", "normalize_rotation", "page_geometry_from_pdf", "pixel_rect_to_points", "normalize_image", "build_image_source_pdf", "product_verdict", "searchable_pdf_reason", "profile_disposition", "require_profile", "validate_document", "validate_page", "MarkupAction", "MarkupExecutionResult", "MarkupMode", "MarkupSelection", "MarkupSourceType", "apply_ocr_markup", "select_query", "select_regions",
 ]

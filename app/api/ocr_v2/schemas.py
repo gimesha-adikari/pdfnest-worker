@@ -13,6 +13,7 @@ class OCRV2Profile(str, Enum):
     SEARCHABLE_PDF_V2 = "SEARCHABLE_PDF_V2"
     DOCUMENT_EXTRACTION_V2 = "DOCUMENT_EXTRACTION_V2"
     PDF_MARKDOWN_V2 = "PDF_MARKDOWN_V2"
+    MARKUP_V2 = "MARKUP_V2"
 
 
 class OCRV2RoutingPolicy(str, Enum):
@@ -68,6 +69,10 @@ class OCRV2JobSubmitRequest(BaseModel):
     source_name: str = Field(default="document.pdf", min_length=1, max_length=255)
     owner_identity: str = Field(min_length=1, max_length=255)
     total_pages: int = Field(default=0, ge=0, le=10000)
+    markup_action: str | None = Field(default=None, pattern=r"^(highlight|underline|strikeout)$")
+    markup_mode: str = Field(default="smart", pattern=r"^(smart|ocr|native)$")
+    markup_query: str | None = Field(default=None, max_length=500)
+    markup_color: str = Field(default="#FFFF00", pattern=r"^#[0-9A-Fa-f]{6}$")
 
     @model_validator(mode="after")
     def validate_sources(self) -> "OCRV2JobSubmitRequest":
@@ -75,6 +80,8 @@ class OCRV2JobSubmitRequest(BaseModel):
             raise ValueError("Document OCR profiles require source_key")
         if self.profile is OCRV2Profile.SEARCHABLE_PDF_V2 and not self.source_files:
             raise ValueError("Searchable PDF V2 requires ordered source_files")
+        if self.profile is OCRV2Profile.MARKUP_V2 and (not self.markup_action or not self.markup_query or not self.markup_query.strip()):
+            raise ValueError("Markup V2 requires an action and text query")
         return self
 
 

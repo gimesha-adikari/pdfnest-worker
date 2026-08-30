@@ -11,7 +11,7 @@ import dramatiq
 from dramatiq.errors import Retry
 import pymupdf as fitz
 
-from app.api.tools.editor.document import compile_document, extract_document
+from app.api.tools.editor.document import compile_document, extract_document, extract_document_v2
 from app.api.tools.editor.utils import cleanup_paths, temp_file_path
 from app.api.tools.markup.document import process_markup_pdf
 from app.api.tools.markdown.service import convert_pdf_to_markdown
@@ -19,6 +19,7 @@ from app.core.broker import broker  # noqa: F401
 from app.core.config import validate_runtime_config
 from app.core.ocr_v2.diagnostics import emit_searchable_diagnostic, retain_failed_render_artifacts, safe_exception_message
 from app.core.ocr_v2.errors import EngineUnavailableError, OCRTimeoutError, RenderingNotEligibleError
+from app.core.ocr_v2.errors import MarkupError, TextNotFoundError, WordGeometryUnavailableError, AnnotationWriteError
 from app.core.storage import build_key, delete_object, download_to_path, upload_path, upload_text
 from app.core.actor_heartbeat import start_actor_heartbeat
 from app.jobs.cancellation import JobCancelledException, check_cancellation
@@ -144,6 +145,10 @@ def ocr_v2_job(
         routing_policy: str,
         profile: str = "OCR_TEXT_V2",
         source_files: list[dict[str, str]] | None = None,
+        markup_action: str | None = None,
+        markup_mode: str = "smart",
+        markup_query: str | None = None,
+        markup_color: str = "#FFFF00",
 ) -> None:
     """Run one durable OCR V2 job through the existing Dramatiq worker."""
     if profile == "SEARCHABLE_PDF_V2":
@@ -151,6 +156,9 @@ def ocr_v2_job(
         return
     if profile in {"DOCUMENT_EXTRACTION_V2", "PDF_MARKDOWN_V2"}:
         _run_structured_document_job(job_id, source_key, source_name, language, routing_policy, profile)
+        return
+    if profile == "MARKUP_V2":
+        _run_markup_v2_job(job_id, source_key, source_name, language, markup_action or "", markup_mode, markup_query or "", markup_color)
         return
     job = get_job(job_id)
     if job is None:
@@ -590,6 +598,7 @@ def editor_extract_job(
         source_key: str,
         password: str | None = None,
         source_name: str | None = None,
+        ocr_v2: bool = False,
 ) -> None:
     job = get_job(job_id)
     if job is None:
@@ -623,7 +632,24 @@ def editor_extract_job(
         check_cancellation(job_id)
         download_to_path(source_key, input_path)
         check_cancellation(job_id)
-        result = extract_document(input_path, password, cancellation_check=lambda: check_cancellation(job_id))
+        def report_editor_page(done: int, total: int, _page: object) -> None:
+            if not ocr_v2:
+                return
+            progress = min(90, 20 + int((done / max(1, total)) * 70))
+            update_job(
+                job_id,
+                progress=progress,
+                current_page=done,
+                total_pages=total,
+                message=f"OCR V2 editor page {done} of {total} analyzed",
+            )
+
+        result = (extract_document_v2 if ocr_v2 else extract_document)(
+            input_path,
+            password,
+            cancellation_check=lambda: check_cancellation(job_id),
+            page_progress_callback=report_editor_page if ocr_v2 else None,
+        )
         check_cancellation(job_id)
 
         # The extract layout is public editor data. Storage keys remain inside
@@ -635,7 +661,7 @@ def editor_extract_job(
             finished_at=datetime.now(timezone.utc),
             progress=100,
             result=result,
-            message="Editor extraction completed",
+            message="OCR V2 editor extraction completed" if ocr_v2 else "Editor extraction completed",
         )
     except JobCancelledException as exc:
         logger.info("Editor extract job %s cancelled: %s", job_id, exc)
@@ -651,8 +677,9 @@ def editor_extract_job(
             job_id,
             status=JobState.failed,
             finished_at=datetime.now(timezone.utc),
-            error=str(exc),
-            message="Editor extraction failed",
+            error="OCR V2 editor extraction failed." if ocr_v2 else str(exc),
+            error_code="ENGINE_UNAVAILABLE" if isinstance(exc, EngineUnavailableError) else ("EDITOR_EXTRACTION_INVALID" if ocr_v2 else None),
+            message="OCR V2 editor extraction failed" if ocr_v2 else "Editor extraction failed",
         )
         if is_non_retryable_error(exc):
             logger.warning("Non-retryable PDF error in job %s: %s", job_id, exc)
@@ -751,6 +778,93 @@ def editor_compile_job(
         cleanup_paths(input_path, pages_json_path, output_pdf_path)
 
 
+def _markup_public_error(exc: Exception) -> tuple[str, str]:
+    if isinstance(exc, EngineUnavailableError):
+        return "ENGINE_UNAVAILABLE", "The OCR engine is currently unavailable."
+    if isinstance(exc, WordGeometryUnavailableError):
+        return "WORD_GEOMETRY_NOT_AVAILABLE", "Text selection is unavailable because genuine word geometry was not produced."
+    if isinstance(exc, TextNotFoundError):
+        return "TEXT_NOT_FOUND", "The requested text was not found."
+    if isinstance(exc, AnnotationWriteError):
+        return "ANNOTATION_WRITE_FAILURE", "The requested PDF annotation could not be written."
+    if isinstance(exc, MarkupError):
+        return "PROFILE_NOT_ELIGIBLE", "The document is not eligible for automatic OCR-aware markup."
+    if isinstance(exc, OCRTimeoutError):
+        return "TIMEOUT", "Markup processing timed out."
+    return "ENGINE_FAILURE", "OCR-aware markup could not be completed."
+
+
+@dramatiq.actor(queue_name="ocr", max_retries=0, time_limit=900_000)
+def _run_markup_v2_job(
+        job_id: str,
+        source_key: str,
+        source_name: str,
+        language: str,
+        action: str,
+        mode: str,
+        query: str,
+        color: str,
+) -> None:
+    job = get_job(job_id)
+    if job is None:
+        _cleanup_input_objects([source_key])
+        return
+    owner_identity = job.owner_identity or (job.payload or {}).get("ownerIdentity") or "guest:anonymous"
+    input_path = temp_file_path(prefix="pdfnest-ocr-v2-markup-input-", suffix=Path(source_name or source_key).suffix or ".pdf")
+    output_path = temp_file_path(prefix="pdfnest-ocr-v2-markup-output-", suffix=".pdf")
+    acquired = False
+    claimed = False
+    try:
+        check_cancellation(job_id)
+        if claim_job(job_id) is None:
+            return
+        claimed = True
+        acquired, reason = acquire_lease(job_id, owner_identity)
+        if not acquired:
+            update_job(job_id, status=JobState.failed, finished_at=datetime.now(timezone.utc), error="OCR-aware markup execution capacity is unavailable.", error_code="ENGINE_UNAVAILABLE" if reason != "REDIS_ERROR" else "TASK_STORAGE_UNAVAILABLE", message="Markup V2 could not acquire execution capacity")
+            return
+        update_job(job_id, status=JobState.running, started_at=datetime.now(timezone.utc), progress=0, total_pages=job.total_pages, message="OCR-aware markup started")
+        download_to_path(source_key, input_path)
+        from app.core.ocr_v2.markup import MarkupAction, MarkupMode, apply_ocr_markup
+
+        try:
+            selected_action = MarkupAction(action)
+            selected_mode = MarkupMode(mode)
+        except ValueError as exc:
+            raise ValueError("invalid markup action or mode") from exc
+
+        cleaned_color = color.strip().lstrip("#")
+        if len(cleaned_color) != 6:
+            raise ValueError("invalid markup color")
+        rgb = tuple(int(cleaned_color[index:index + 2], 16) / 255 for index in (0, 2, 4))
+
+        def on_progress(done: int, total: int) -> None:
+            check_cancellation(job_id)
+            update_job(job_id, progress=int(done / max(1, total) * 90), total_pages=total, completed_pages=done, current_page=max(0, done - 1), message=f"OCR-aware markup analyzing page {done}/{total}")
+
+        execution = apply_ocr_markup(input_path, output_path, action=selected_action, query=query, language=language, mode=selected_mode, color=rgb, cancellation_check=lambda: check_cancellation(job_id), progress_callback=on_progress)
+        check_cancellation(job_id)
+        output_key = f"jobs/ocr_v2/markup/{action}/{job_id}.pdf"
+        upload_path(output_path, output_key, content_type="application/pdf")
+        artifact_name = f"{action}_{Path(source_name or 'document').stem}.pdf"
+        metadata = execution.to_dict()
+        result_key = f"jobs/ocr_v2/markup/{action}/{job_id}.json"
+        upload_text(json.dumps(metadata, ensure_ascii=False), result_key)
+        update_job(job_id, status=JobState.succeeded, finished_at=datetime.now(timezone.utc), progress=100, total_pages=execution.page_count, completed_pages=execution.page_count, current_page=None, page_statuses={str(index): "SUCCESS" for index in range(execution.page_count)}, result={"artifact_key": output_key, "artifact_name": artifact_name, "artifact_content_type": "application/pdf", "metadata_key": result_key, "action": action}, message="OCR-aware markup completed")
+    except JobCancelledException:
+        update_job(job_id, status=JobState.cancelled, finished_at=datetime.now(timezone.utc), error_code="CANCELLED", message="OCR-aware markup cancelled")
+    except Exception as exc:
+        code, message = _markup_public_error(exc)
+        logger.exception("OCR V2 markup job %s failed", job_id)
+        update_job(job_id, status=JobState.failed, finished_at=datetime.now(timezone.utc), error=message, error_code=code, message="OCR-aware markup failed")
+    finally:
+        if acquired:
+            release_lease(job_id, owner_identity)
+        if claimed:
+            _cleanup_input_objects([source_key])
+        cleanup_paths(input_path, output_path)
+
+
 @dramatiq.actor(queue_name="markup", max_retries=3, time_limit=900_000)
 def markup_highlight_job(job_id: str, source_key: str, payload_key: str, source_name: str | None = None) -> None:
     _run_markup_job(job_id, source_key, payload_key, source_name, action="highlight")
@@ -825,15 +939,27 @@ def _run_markup_job(
                 message=f"{action.title()} processing {done}/{total}",
             )
 
-        process_markup_pdf(
-            input_path=input_path,
-            output_path=output_pdf_path,
-            boxes=boxes,
-            action=action,  # type: ignore[arg-type]
-            mode=mode,      # type: ignore[arg-type]
-            password=file_password,
-            progress_callback=on_progress,
-        )
+        if payload.get("ocr_v2"):
+            from app.api.tools.markup.document import process_markup_pdf_v2_regions
+            process_markup_pdf_v2_regions(
+                input_path=input_path,
+                output_path=output_pdf_path,
+                boxes=boxes,
+                action=action,  # type: ignore[arg-type]
+                mode=mode,      # type: ignore[arg-type]
+                password=file_password,
+                progress_callback=on_progress,
+            )
+        else:
+            process_markup_pdf(
+                input_path=input_path,
+                output_path=output_pdf_path,
+                boxes=boxes,
+                action=action,  # type: ignore[arg-type]
+                mode=mode,      # type: ignore[arg-type]
+                password=file_password,
+                progress_callback=on_progress,
+            )
         check_cancellation(job_id)
 
         output_key = build_key(f"jobs/markup/{action}/output", suffix=".pdf")

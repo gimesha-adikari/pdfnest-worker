@@ -19,6 +19,7 @@ class ExtractRequest(BaseModel):
     source_key: str
     file_password: str | None = None
     source_name: str | None = None
+    ocr_v2: bool = False
 
 
 class CompileRequest(BaseModel):
@@ -40,7 +41,7 @@ async def extract_layout(payload: ExtractRequest) -> JobSubmissionResponse:
         payload=payload.model_dump(exclude_none=True),
     )
 
-    editor_extract_job.send(job.id, payload.source_key, payload.file_password, source_name)
+    editor_extract_job.send(job.id, payload.source_key, payload.file_password, source_name, payload.ocr_v2)
     logger.info("Dispatched extract job %s for %s", job.id, source_name)
 
     return JobSubmissionResponse(

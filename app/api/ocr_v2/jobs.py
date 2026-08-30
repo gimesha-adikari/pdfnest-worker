@@ -91,6 +91,7 @@ def submit(request: OCRV2JobSubmitRequest) -> OCRV2JobStatusResponse:
         job_type = {
             OCRV2Profile.DOCUMENT_EXTRACTION_V2: "document_extraction_v2",
             OCRV2Profile.PDF_MARKDOWN_V2: "pdf_markdown_v2",
+            OCRV2Profile.MARKUP_V2: "ocr_markup_v2",
         }.get(request.profile, "ocr_text_v2")
     job = create_job(
         job_type,
@@ -104,6 +105,10 @@ def submit(request: OCRV2JobSubmitRequest) -> OCRV2JobStatusResponse:
             "source_files": source_files,
             "source_name": request.source_name,
             "ownerIdentity": request.owner_identity,
+            "markup_action": request.markup_action,
+            "markup_mode": request.markup_mode,
+            "markup_query": request.markup_query,
+            "markup_color": request.markup_color,
         },
         owner_identity=request.owner_identity,
     )
@@ -111,7 +116,19 @@ def submit(request: OCRV2JobSubmitRequest) -> OCRV2JobStatusResponse:
         update_job(job.id, total_pages=request.total_pages)
         job = get_job(job.id) or job
     try:
-        ocr_v2_job.send(job.id, source_key, request.source_name, request.language, request.routing_policy.value, profile=request.profile.value, source_files=source_files)
+        ocr_v2_job.send(
+            job.id,
+            source_key,
+            request.source_name,
+            request.language,
+            request.routing_policy.value,
+            profile=request.profile.value,
+            source_files=source_files,
+            markup_action=request.markup_action,
+            markup_mode=request.markup_mode,
+            markup_query=request.markup_query,
+            markup_color=request.markup_color,
+        )
     except Exception:
         update_job(job.id, status=JobState.failed, error="OCR V2 queue is unavailable.", error_code="TASK_STORAGE_UNAVAILABLE", message="OCR V2 queue submission failed")
         raise HTTPException(status_code=503, detail={"code": "TASK_STORAGE_UNAVAILABLE", "message": "OCR V2 queue is temporarily unavailable"})

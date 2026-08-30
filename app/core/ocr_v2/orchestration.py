@@ -78,6 +78,7 @@ class OCRV2Worker:
         self,
         pdf_path: str | Path,
         *,
+        password: str | None = None,
         language: str = "eng",
         profile: OCRProfile = OCRProfile.OCR_TEXT_V2,
         cancellation_check: CancellationCheck | None = None,
@@ -94,6 +95,9 @@ class OCRV2Worker:
         pages: list[PageResult] = []
         provenance: list[Provenance] = []
         with fitz.open(str(source_path)) as document:
+            if document.needs_pass:
+                if not password or document.authenticate(password) <= 0:
+                    raise ValueError("PDF password authentication failed")
             source = SourceMetadata(source_id=str(source_path.resolve()), page_count=len(document), filename=source_path.name)
             for page_index, page in enumerate(document):
                 _check(cancellation_check)
