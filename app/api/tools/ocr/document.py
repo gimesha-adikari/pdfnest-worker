@@ -538,18 +538,29 @@ def extract_text_from_pdf(
     password: str | None = None,
     cancellation_check: Callable[[], None] | None = None,
 ) -> None:
-    """
-    Extracts text from a PDF file using native vector text where present,
-    or page-level parallel OCR via ThreadPoolExecutor.
+    """Extract text through the OCR V2 native-first compatibility adapter.
 
-    Page output ordering is 100% preserved via indexed array assignment.
-    Active Tesseract processes are strictly guarded by acquire_tesseract_capacity.
+    The legacy endpoint and its durable task contract remain unchanged.  For
+    explicit languages, the implementation now consumes canonical OCR V2 page
+    results so native pages avoid OCR and scanned pages use the shared
+    Tesseract TSV adapter.  Automatic-language mode remains the V1-compatible
+    path because OCR V2 intentionally requires explicit languages.
     """
     if cancellation_check:
         cancellation_check()
 
     lang = normalize_lang_spec(lang)
     validate_lang_spec(lang)
+
+    if not _is_auto_lang_spec(lang):
+        _extract_text_from_pdf_v2(
+            input_path,
+            output_path,
+            lang,
+            password=password,
+            cancellation_check=cancellation_check,
+        )
+        return
 
     doc = open_document(input_path, password=password)
     total_pages = doc.page_count
@@ -609,6 +620,47 @@ def extract_text_from_pdf(
                 if text and text.strip():
                     out.write(f"--- START OF PAGE {i + 1} ---\n")
                     out.write(text.rstrip() + "\n")
+                    out.write("--- END OF PAGE ---\n\n")
+    except Exception:
+        if os.path.exists(output_path):
+            try:
+                os.remove(output_path)
+            except OSError:
+                pass
+        raise
+
+
+def _extract_text_from_pdf_v2(
+    input_path: str,
+    output_path: str,
+    lang: str,
+    *,
+    password: str | None = None,
+    cancellation_check: Callable[[], None] | None = None,
+) -> None:
+    """Write the legacy text-file shape from canonical OCR V2 pages."""
+    from app.core.ocr_v2.orchestration import OCRV2Worker
+    from app.core.ocr_v2.validation import OCRProfile
+
+    result = OCRV2Worker().process_document(
+        input_path,
+        password=password,
+        language=lang,
+        profile=OCRProfile.OCR_TEXT_V2,
+        cancellation_check=cancellation_check,
+    )
+    failed_pages = [page.page_index for page in result.pages if page.status.value == "FAILED"]
+    if failed_pages:
+        raise RuntimeError(f"OCR V2 failed on page(s): {', '.join(str(index + 1) for index in failed_pages)}")
+
+    try:
+        with open(output_path, "w", encoding="utf-8") as out:
+            for index, page in enumerate(result.pages):
+                if cancellation_check:
+                    cancellation_check()
+                if page.text and page.text.strip():
+                    out.write(f"--- START OF PAGE {index + 1} ---\n")
+                    out.write(page.text.rstrip() + "\n")
                     out.write("--- END OF PAGE ---\n\n")
     except Exception:
         if os.path.exists(output_path):

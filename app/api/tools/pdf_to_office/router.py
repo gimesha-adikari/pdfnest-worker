@@ -15,5 +15,6 @@ router = APIRouter(prefix="/api/v1/office", tags=["office"])
 async def convert_office(
     format: Literal["docx", "xlsx", "pptx"] = Form(...),
     file: UploadFile = File(...),
+    lang: str = Form("eng"),
 ) -> FileResponse:
-    return await OfficeConversionService.convert(format=format, file=file)
+    return await OfficeConversionService.convert(format=format, file=file, language=lang)

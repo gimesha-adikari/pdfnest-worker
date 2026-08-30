@@ -6,10 +6,9 @@ import tempfile
 import subprocess
 import fitz
 from docx import Document
-from PIL import Image
-import pytesseract
 
-from app.core.tesseract_capacity import acquire_tesseract_capacity
+from app.core.ocr_v2.native import NativeDecision, NativeExtractor, NativeValidator
+from app.core.ocr_v2.structured import StructuredDocumentProcessor, StructuredElement, StructuredElementType
 
 
 def _get_pdf2docx_worker_count() -> int:
@@ -54,25 +53,84 @@ def _run_pdf2docx_isolated(pdf_path: str, output_path: str, workers: int) -> Non
             raise RuntimeError(f"PDF to Word conversion failed ({proc.returncode}): {err_msg}")
 
 
-def convert_to_word(pdf_path: str, output_path: str) -> None:
+def _requires_structured_ocr(pdf_path: str) -> bool:
+    """Select the structured OCR route only for scanned or mixed pages.
+
+    Classification is native-only and therefore does not invoke OCR.  The
+    structured processor then performs the one native-first OCR V2 pass for
+    pages that actually need it.
+    """
+    extractor = NativeExtractor()
+    validator = NativeValidator()
+    with fitz.open(pdf_path) as doc:
+        for page_index, page in enumerate(doc):
+            candidate = extractor.extract(page, page_index)
+            decision = validator.validate(candidate)
+            if decision.decision != NativeDecision.TRUST_NATIVE:
+                return True
+    return False
+
+
+def _add_structured_element(doc: Document, element: StructuredElement) -> None:
+    """Map only structure represented by the canonical structured result."""
+    if element.type is StructuredElementType.HEADING:
+        doc.add_heading(element.text, level=max(1, min(9, element.level or 1)))
+    elif element.type in (StructuredElementType.PARAGRAPH, StructuredElementType.TEXT_BLOCK):
+        if element.text:
+            doc.add_paragraph(element.text)
+    elif element.type is StructuredElementType.LIST:
+        items = element.data.get("items", [])
+        style = "List Number" if element.ordered else "List Bullet"
+        for item in items:
+            text = str(item.get("text", "")).strip()
+            if text:
+                doc.add_paragraph(text, style=style)
+    elif element.type is StructuredElementType.TABLE:
+        headers = element.data.get("headers", [])
+        rows = element.data.get("rows", [])
+        table_rows = ([headers] if headers else []) + list(rows)
+        column_count = max((len(row) for row in table_rows), default=0)
+        if column_count:
+            table = doc.add_table(rows=0, cols=column_count)
+            table.style = "Table Grid"
+            for row in table_rows:
+                cells = table.add_row().cells
+                for index, cell in enumerate(row):
+                    cells[index].text = str(cell.get("text", ""))
+    elif element.type is StructuredElementType.CAPTION:
+        paragraph = doc.add_paragraph()
+        run = paragraph.add_run(element.text)
+        run.italic = True
+    elif element.type is StructuredElementType.FORMULA:
+        # Only genuine structured formula text reaches this mapper.  Current
+        # local Tesseract structured output deliberately does not fabricate it.
+        if element.text:
+            doc.add_paragraph(element.text)
+
+
+def _convert_structured_to_word(pdf_path: str, output_path: str, language: str) -> None:
+    result = StructuredDocumentProcessor().process_document(pdf_path, language=language)
+    doc_out = Document()
+    for page_index, page in enumerate(result.pages):
+        elements = {element.element_id: element for element in page.elements}
+        for element_id in page.reading_order:
+            element = elements[element_id]
+            _add_structured_element(doc_out, element)
+        if page_index < len(result.pages) - 1:
+            doc_out.add_page_break()
+    doc_out.save(output_path)
+
+
+def convert_to_word(pdf_path: str, output_path: str, language: str = "eng") -> None:
     doc = fitz.open(pdf_path)
     try:
-        total_text = sum(len(page.get_text().strip()) for page in doc)
-
-        if total_text < (50 * len(doc)):
-            doc_out = Document()
-            for page in doc:
-                pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-
-                with acquire_tesseract_capacity():
-                    text = pytesseract.image_to_string(img)
-                doc_out.add_paragraph(text)
-                doc_out.add_page_break()
-
-            doc_out.save(output_path)
-        else:
-            workers = _get_pdf2docx_worker_count()
-            _run_pdf2docx_isolated(pdf_path, output_path, workers)
+        structured = _requires_structured_ocr(pdf_path)
     finally:
         doc.close()
+
+    if structured:
+        _convert_structured_to_word(pdf_path, output_path, language)
+        return
+
+    workers = _get_pdf2docx_worker_count()
+    _run_pdf2docx_isolated(pdf_path, output_path, workers)

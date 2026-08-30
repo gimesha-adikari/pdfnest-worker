@@ -15,7 +15,7 @@ from .utils import cleanup_paths, create_temp_paths
 
 class OfficeConversionService:
     @staticmethod
-    async def convert(format: OfficeOutputFormat, file: UploadFile) -> FileResponse:
+    async def convert(format: OfficeOutputFormat, file: UploadFile, language: str = "eng") -> FileResponse:
         file_size = getattr(file, "size", 0) or 10 * 1024 * 1024
         required_bytes = (file_size * 5) + (50 * 1024 * 1024)
         check_disk_space(required_bytes)
@@ -29,7 +29,7 @@ class OfficeConversionService:
                 shutil.copyfileobj(file.file, buffer)
 
             if format == "docx":
-                convert_to_word(input_path, output_path)
+                convert_to_word(input_path, output_path, language=language)
                 media_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
             elif format == "xlsx":
                 convert_to_excel(input_path, output_path)
