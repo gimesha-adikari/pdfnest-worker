@@ -20,6 +20,7 @@ from app.api.tools.ocr.languages import get_installed_tesseract_languages, langu
 from app.api.tools.ocr.router import create_route_cancellation_checker
 from app.core.ocr_v2 import OCRV2Worker
 from app.core.ocr_v2.adapters import PPOCRv6MediumAdapter, TesseractAdapter
+from app.core.ocr_v2.language_policy import OCRLanguageMode, OCRLanguagePolicy
 from app.core.ocr_v2.routing import RoutePolicy
 from app.core.ocr_v2.validation import OCRProfile
 from app.jobs.cancellation import JobCancelledException
@@ -38,13 +39,15 @@ router = APIRouter(prefix="/internal/ocr/v2", tags=["ocr-v2-internal"])
 _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._:-]+$")
 
 
-def _request_model(request_id: str, profile: str, language: str | None, routing_policy: str) -> OCRV2WorkerRequest:
+def _request_model(request_id: str, profile: str, language: str | None, routing_policy: str, language_mode: str = "EXPLICIT", languages: list[str] | None = None) -> OCRV2WorkerRequest:
     if profile != OCRV2Profile.OCR_TEXT_V2.value:
         raise HTTPException(status_code=422, detail={"code": "INVALID_INPUT", "message": "This endpoint only accepts OCR_TEXT_V2"})
+    if not language or not language.strip():
+        raise HTTPException(status_code=422, detail={"code": "INVALID_INPUT", "message": "An OCR language is required"})
     try:
-        return OCRV2WorkerRequest(request_id=request_id, profile=profile, language=language, routing_policy=routing_policy)
+        return OCRV2WorkerRequest(request_id=request_id, profile=profile, language=language or "eng", language_mode=language_mode, languages=languages or [], routing_policy=routing_policy)
     except ValueError as exc:
-        raise HTTPException(status_code=422, detail={"code": "INVALID_INPUT", "message": "Invalid OCR V2 request contract"}) from exc
+        raise HTTPException(status_code=422, detail={"code": "UNSUPPORTED_LANGUAGE", "message": "Choose one or more installed OCR languages."}) from exc
 
 
 def _route_policy(policy: OCRV2RoutingPolicy) -> RoutePolicy:
@@ -104,7 +107,8 @@ async def _stage_pdf(upload: UploadFile) -> str:
 
 
 def _availability(language: str) -> list[dict[str, object]]:
-    tesseract = TesseractAdapter(language)
+    requested = OCRLanguagePolicy.from_request(language)
+    tesseract = TesseractAdapter("eng" if requested.mode is OCRLanguageMode.AUTO else requested.engine_expression)
     tess_detail = tesseract.availability()
     pp = PPOCRv6MediumAdapter()
     pp_detail = pp.availability()
@@ -116,9 +120,10 @@ def _availability(language: str) -> list[dict[str, object]]:
 
 @router.get("/capabilities")
 async def capabilities(language: str = "eng") -> dict[str, object]:
-    if not language or language.strip().lower() in {"auto", "detect"}:
-        raise HTTPException(status_code=422, detail={"code": "UNSUPPORTED_LANGUAGE", "message": "OCR V2 requires explicit language(s)"})
-    engines = _availability(language)
+    try:
+        engines = _availability(language)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail={"code": "UNSUPPORTED_LANGUAGE", "message": "Choose one or more installed OCR languages."}) from exc
     quality_available = any(
         engine["engine_id"] == "ppocrv6_medium_v2" and engine["available"]
         for engine in engines
@@ -133,6 +138,12 @@ async def capabilities(language: str = "eng") -> dict[str, object]:
         "service_ready": True,
         "profile": "OCR_TEXT_V2",
         "languages": languages,
+        "language_policy": {
+            "modes": ["EXPLICIT", "AUTO"],
+            "default_mode": "EXPLICIT",
+            "max_languages": 3,
+            "auto_statuses": ["DETECTED", "MULTILINGUAL_DETECTED", "UNCERTAIN", "UNDETERMINED"],
+        },
         "routing_modes": [
             {"id": "AUTO", "label": "Balanced", "description": "Uses the best available text path for the document.", "available": True},
             {"id": "FAST", "label": "Fast", "description": "Prioritizes a quick standard OCR path.", "available": True},
@@ -157,6 +168,7 @@ def _safe_error_code(failure_code: str | None) -> str:
         "JobCancelledException": "CANCELLED",
         "NativeTextUndecidedError": "NATIVE_TEXT_UNDECIDED",
         "PageValidationError": "INVALID_ENGINE_OUTPUT",
+        "LanguageDetectionUncertainError": "LANGUAGE_DETECTION_UNCERTAIN",
     }
     return mapping.get(failure_code or "", "ENGINE_FAILURE")
 
@@ -166,7 +178,7 @@ def _response(result: object, request: OCRV2WorkerRequest, warnings: list[str]) 
     for page in result.pages:
         source = page.provenance_refs[0] if page.provenance_refs else page.processing_source.value
         page_warnings = [warning for warning in warnings if warning.startswith("ENGINE_FALLBACK")]
-        pages.append(OCRV2PageResponse(page_index=page.page_index, page_id=page.page_id, status=page.status.value, text=page.text, classification=page.content_classification.value, source=source, language={"requested": list(page.language.requested_languages), "detected": list(page.language.detected_languages), "status": page.language.language_status}, warning_codes=page_warnings))
+        pages.append(OCRV2PageResponse(page_index=page.page_index, page_id=page.page_id, status=page.status.value, text=page.text, classification=page.content_classification.value, source=source, language={"requested": list(page.language.requested_languages), "detected": list(page.language.detected_languages), "status": page.language.language_status, "mode": page.language.requested_mode, "confidence": page.language.detection_confidence, "scripts": list(page.language.detected_scripts), "reason": page.language.detection_reason}, warning_codes=page_warnings))
     failed = next((page for page in result.pages if page.status.value == "FAILED"), None)
     status = "FAILED" if failed or not result.validation.valid else "SUCCEEDED"
     error = None
@@ -184,17 +196,28 @@ async def ocr_text_v2(
     request_id: str = Form(...),
     profile: str = Form("OCR_TEXT_V2"),
     language: str | None = Form(None),
+    language_mode: str = Form("EXPLICIT"),
+    languages: list[str] | None = Form(None),
     routing_policy: str = Form("AUTO"),
 ) -> OCRV2WorkerResponse:
     if not _REQUEST_ID_RE.fullmatch(request_id):
         raise HTTPException(status_code=422, detail={"code": "INVALID_INPUT", "message": "Invalid request identifier"})
-    contract = _request_model(request_id, profile, language, routing_policy)
+    try:
+        contract = _request_model(request_id, profile, language, routing_policy, language_mode, languages)
+    except HTTPException as exc:
+        if isinstance(exc.detail, dict) and exc.detail.get("code") == "UNSUPPORTED_LANGUAGE":
+            return JSONResponse(status_code=exc.status_code, content=exc.detail)
+        raise
     path = await _stage_pdf(file)
     check_cancel, cleanup_cancel = create_route_cancellation_checker(request)
     warnings: list[str] = []
     try:
         pp_available = PPOCRv6MediumAdapter().availability().available
-        tess_detail = TesseractAdapter(contract.language).availability()
+        try:
+            requested_policy = OCRLanguagePolicy.from_request(contract.language)
+        except ValueError as exc:
+            return JSONResponse(status_code=422, content={"code": "UNSUPPORTED_LANGUAGE", "message": "Choose one or more installed OCR languages."})
+        tess_detail = TesseractAdapter("eng" if requested_policy.mode is OCRLanguageMode.AUTO else requested_policy.engine_expression).availability()
         if not pp_available and not tess_detail.available:
             return JSONResponse(status_code=422, content={"code": "UNSUPPORTED_LANGUAGE", "message": "The requested OCR language is not installed or supported by the available worker engines."})
         if contract.routing_policy in (OCRV2RoutingPolicy.AUTO, OCRV2RoutingPolicy.QUALITY, OCRV2RoutingPolicy.GEOMETRY) and not pp_available:
@@ -219,7 +242,7 @@ async def ocr_text_v2(
 async def _run_worker(worker: OCRV2Worker, path: str, contract: OCRV2WorkerRequest, check_cancel: object) -> object:
     from starlette.concurrency import run_in_threadpool
 
-    return await run_in_threadpool(worker.process_document, path, language=contract.language, profile=OCRProfile.OCR_TEXT_V2, cancellation_check=check_cancel)
+    return await run_in_threadpool(worker.process_document, path, language=contract.language, language_mode=contract.language_mode.value, languages=contract.languages, profile=OCRProfile.OCR_TEXT_V2, cancellation_check=check_cancel)
 
 
 def _failure_http_status(code: str) -> int:

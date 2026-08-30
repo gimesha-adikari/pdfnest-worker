@@ -11,7 +11,7 @@ import re
 from dataclasses import asdict, dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping, Sequence
 
 import pymupdf as fitz
 
@@ -303,6 +303,9 @@ def apply_ocr_markup(
     action: MarkupAction,
     query: str,
     language: str = "eng",
+    language_mode: str | None = None,
+    languages: Sequence[str] | None = None,
+    language_usage: Mapping[str, float] | None = None,
     mode: MarkupMode = MarkupMode.SMART,
     color: tuple[float, float, float] = (1.0, 1.0, 0.0),
     cancellation_check: Callable[[], None] | None = None,
@@ -313,6 +316,9 @@ def apply_ocr_markup(
     result = worker.process_document(
         input_path,
         language=language,
+        language_mode=language_mode,
+        languages=languages,
+        language_usage=language_usage,
         profile=OCRProfile.OCR_TEXT_V2,
         cancellation_check=cancellation_check,
         page_progress_callback=lambda done, total, _page: progress_callback(done, total) if progress_callback else None,

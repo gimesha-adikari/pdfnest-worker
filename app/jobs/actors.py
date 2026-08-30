@@ -149,16 +149,19 @@ def ocr_v2_job(
         markup_mode: str = "smart",
         markup_query: str | None = None,
         markup_color: str = "#FFFF00",
+        language_mode: str = "EXPLICIT",
+        languages: list[str] | None = None,
+        language_usage: dict[str, float] | None = None,
 ) -> None:
     """Run one durable OCR V2 job through the existing Dramatiq worker."""
     if profile == "SEARCHABLE_PDF_V2":
-        _run_searchable_pdf_job(job_id, language, source_files or [], source_name)
+        _run_searchable_pdf_job(job_id, language, source_files or [], source_name, language_mode, languages or [], language_usage or {})
         return
     if profile in {"DOCUMENT_EXTRACTION_V2", "PDF_MARKDOWN_V2"}:
-        _run_structured_document_job(job_id, source_key, source_name, language, routing_policy, profile)
+        _run_structured_document_job(job_id, source_key, source_name, language, routing_policy, profile, language_mode, languages or [], language_usage or {})
         return
     if profile == "MARKUP_V2":
-        _run_markup_v2_job(job_id, source_key, source_name, language, markup_action or "", markup_mode, markup_query or "", markup_color)
+        _run_markup_v2_job(job_id, source_key, source_name, language, markup_action or "", markup_mode, markup_query or "", markup_color, language_mode, languages or [], language_usage or {})
         return
     job = get_job(job_id)
     if job is None:
@@ -321,6 +324,9 @@ def _run_searchable_pdf_job(
     language: str,
     source_files: list[dict[str, str]],
     source_name: str,
+    language_mode: str = "EXPLICIT",
+    languages: list[str] | None = None,
+    language_usage: dict[str, float] | None = None,
 ) -> None:
     """Run ordered images through real word-level OCR and PDF rendering."""
     job = get_job(job_id)
@@ -406,7 +412,7 @@ def _run_searchable_pdf_job(
             update_job(job_id, progress=int((done / max(1, total)) * 90), total_pages=total, completed_pages=done - len(failed_pages), failed_pages=failed_pages, current_page=page.page_index, page_statuses=page_statuses, message=f"Searchable PDF V2 processing page {done}/{total}")
 
         stage = "OCR"
-        result = worker.process_document(source_pdf, language=language, profile=OCRProfile.SEARCHABLE_PDF_V2, cancellation_check=lambda: check_cancellation(job_id), page_progress_callback=on_page)
+        result = worker.process_document(source_pdf, language=language, language_mode=language_mode, languages=languages or [], language_usage=language_usage or {}, profile=OCRProfile.SEARCHABLE_PDF_V2, cancellation_check=lambda: check_cancellation(job_id), page_progress_callback=on_page)
         check_cancellation(job_id)
         for page in result.pages:
             valid_word_count = sum(
@@ -496,6 +502,9 @@ def _run_structured_document_job(
     language: str,
     routing_policy: str,
     profile: str,
+    language_mode: str = "EXPLICIT",
+    languages: list[str] | None = None,
+    language_usage: dict[str, float] | None = None,
 ) -> None:
     """Process a PDF into the canonical structured result through the OCR queue."""
     job = get_job(job_id)
@@ -550,6 +559,9 @@ def _run_structured_document_job(
         result = StructuredDocumentProcessor().process_document(
             input_path,
             language=language,
+            language_mode=language_mode,
+            languages=languages or [],
+            language_usage=language_usage or {},
             routing_policy=routing_policy,
             cancellation_check=lambda: check_cancellation(job_id),
             page_progress_callback=on_page,
@@ -804,6 +816,9 @@ def _run_markup_v2_job(
         mode: str,
         query: str,
         color: str,
+        language_mode: str = "EXPLICIT",
+        languages: list[str] | None = None,
+        language_usage: dict[str, float] | None = None,
 ) -> None:
     job = get_job(job_id)
     if job is None:
@@ -842,7 +857,7 @@ def _run_markup_v2_job(
             check_cancellation(job_id)
             update_job(job_id, progress=int(done / max(1, total) * 90), total_pages=total, completed_pages=done, current_page=max(0, done - 1), message=f"OCR-aware markup analyzing page {done}/{total}")
 
-        execution = apply_ocr_markup(input_path, output_path, action=selected_action, query=query, language=language, mode=selected_mode, color=rgb, cancellation_check=lambda: check_cancellation(job_id), progress_callback=on_progress)
+        execution = apply_ocr_markup(input_path, output_path, action=selected_action, query=query, language=language, language_mode=language_mode, languages=languages or [], language_usage=language_usage or {}, mode=selected_mode, color=rgb, cancellation_check=lambda: check_cancellation(job_id), progress_callback=on_progress)
         check_cancellation(job_id)
         output_key = f"jobs/ocr_v2/markup/{action}/{job_id}.pdf"
         upload_path(output_path, output_key, content_type="application/pdf")

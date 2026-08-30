@@ -10,22 +10,32 @@ import tempfile
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
+from PIL import Image
 
 from ..contracts import UnnormalizedPageOutput
 from ..errors import ConfigurationError, EngineUnavailableError
 from ..geometry import PreparedRaster
+from ..language_policy import (
+    LanguagePolicyError,
+    LanguageProbe,
+    OCRLanguagePolicy,
+)
 from ...subprocess_runner import run_hardened_subprocess
 from ...tesseract_capacity import acquire_tesseract_capacity
 from .base import EngineAdapter, EngineAvailability, provenance_from_description
 
 
 class TesseractAdapter(EngineAdapter):
-    """Use the installed Tesseract binary and TSV output without auto-detect."""
+    """Use the installed Tesseract binary and TSV output."""
 
     def __init__(self, languages: str, *, timeout: float = 300.0, tessdata_dir: str | None = None) -> None:
-        if not languages or not languages.strip() or languages.strip().lower() in {"auto", "detect"}:
-            raise ConfigurationError("OCR V2 requires explicit Tesseract language(s); auto-detection is not allowed")
-        self.languages = "+".join(part.strip() for part in languages.split("+") if part.strip())
+        if not languages or not languages.strip() or languages.strip().lower() in {"auto", "automatic", "detect"}:
+            raise ConfigurationError("TesseractAdapter requires a resolved explicit language policy")
+        try:
+            self.policy = OCRLanguagePolicy.from_request(languages)
+        except LanguagePolicyError as exc:
+            raise ConfigurationError(str(exc)) from exc
+        self.languages = self.policy.engine_expression
         self.timeout = timeout
         self.tessdata_dir = Path(tessdata_dir or os.getenv("TESSDATA_PREFIX", "")) if (tessdata_dir or os.getenv("TESSDATA_PREFIX")) else None
         self._ready = False
@@ -35,7 +45,7 @@ class TesseractAdapter(EngineAdapter):
             "id": "tesseract_v2",
             "version": "system-tesseract",
             "source": "tesseract-tsv",
-            "configuration": {"languages": self.languages, "timeout_seconds": self.timeout},
+            "configuration": {"languages": list(self.policy.languages), "language_expression": self.languages, "timeout_seconds": self.timeout},
             "capabilities": ["TEXT", "WORD_GEOMETRY", "LINE_GEOMETRY", "BLOCK_GEOMETRY", "CONFIDENCE", "LANGUAGE_METADATA", "READING_ORDER", "PAGE_INDEPENDENT"],
         }
 
@@ -66,6 +76,40 @@ class TesseractAdapter(EngineAdapter):
 
     def readiness(self) -> bool:
         return self._ready and self.availability().available
+
+    def probe(self, image: Image.Image, languages: tuple[str, ...]) -> LanguageProbe:
+        """Run one bounded text-only probe used by the shared AUTO detector."""
+        expression = "+".join(languages)
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as image_file:
+            image.save(image_file, format="PNG")
+            image_path = image_file.name
+        try:
+            env = os.environ.copy()
+            data_dir = self._data_dir()
+            if data_dir:
+                env["TESSDATA_PREFIX"] = str(data_dir)
+            command = ["tesseract", image_path, "stdout", "-l", expression, "--psm", "6", "tsv"]
+            with acquire_tesseract_capacity(timeout=self.timeout):
+                completed = run_hardened_subprocess(command, timeout=self.timeout, env=env)
+            if completed.returncode != 0:
+                return LanguageProbe(languages, "", -1.0)
+            rows = list(csv.DictReader(io.StringIO(completed.stdout), delimiter="\t"))
+            words = [str(row.get("text", "")).strip() for row in rows if str(row.get("text", "")).strip()]
+            confidences = []
+            for row in rows:
+                try:
+                    confidence = float(row.get("conf", "-1"))
+                except (TypeError, ValueError):
+                    continue
+                if confidence >= 0:
+                    confidences.append(confidence)
+            average = sum(confidences) / len(confidences) if confidences else -1.0
+            return LanguageProbe(languages, " ".join(words), average)
+        finally:
+            try:
+                Path(image_path).unlink()
+            except OSError:
+                pass
 
     def recognize_page(self, page_id: str, raster: PreparedRaster) -> UnnormalizedPageOutput:
         if not self.readiness():

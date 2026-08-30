@@ -7,6 +7,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field, model_validator
 
+from app.core.ocr_v2.language_policy import OCRLanguageMode, OCRLanguagePolicy
+
 
 class OCRV2Profile(str, Enum):
     OCR_TEXT_V2 = "OCR_TEXT_V2"
@@ -28,8 +30,22 @@ class OCRV2WorkerRequest(BaseModel):
     schema_version: str = Field(default="ocr_v2_worker_request.v1", pattern=r"^ocr_v2_worker_request\.v1$")
     request_id: str = Field(min_length=1, max_length=128)
     profile: OCRV2Profile = OCRV2Profile.OCR_TEXT_V2
-    language: str = Field(min_length=1, max_length=128)
+    language: str = Field(default="eng", max_length=128)
+    language_mode: OCRLanguageMode = OCRLanguageMode.EXPLICIT
+    languages: list[str] = Field(default_factory=list, max_length=16)
+    language_usage: dict[str, float] = Field(default_factory=dict, max_length=32)
     routing_policy: OCRV2RoutingPolicy = OCRV2RoutingPolicy.AUTO
+
+    @model_validator(mode="after")
+    def normalize_language_policy(self) -> "OCRV2WorkerRequest":
+        policy = OCRLanguagePolicy.from_request(
+            self.language,
+            mode=self.language_mode,
+            languages=self.languages or None,
+        )
+        self.language = "auto" if policy.mode is OCRLanguageMode.AUTO else policy.engine_expression
+        self.languages = list(policy.languages)
+        return self
 
 
 class OCRV2PageResponse(BaseModel):
@@ -62,7 +78,10 @@ class OCRV2WorkerResponse(BaseModel):
 class OCRV2JobSubmitRequest(BaseModel):
     request_id: str = Field(min_length=1, max_length=128)
     profile: OCRV2Profile = OCRV2Profile.OCR_TEXT_V2
-    language: str = Field(min_length=1, max_length=128)
+    language: str = Field(default="eng", max_length=128)
+    language_mode: OCRLanguageMode = OCRLanguageMode.EXPLICIT
+    languages: list[str] = Field(default_factory=list, max_length=16)
+    language_usage: dict[str, float] = Field(default_factory=dict, max_length=32)
     routing_policy: OCRV2RoutingPolicy = OCRV2RoutingPolicy.AUTO
     source_key: str | None = Field(default=None, max_length=512)
     source_files: list[dict[str, str]] = Field(default_factory=list, max_length=150)
@@ -76,6 +95,9 @@ class OCRV2JobSubmitRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_sources(self) -> "OCRV2JobSubmitRequest":
+        policy = OCRLanguagePolicy.from_request(self.language, mode=self.language_mode, languages=self.languages or None)
+        self.language = "auto" if policy.mode is OCRLanguageMode.AUTO else policy.engine_expression
+        self.languages = list(policy.languages)
         if self.profile is not OCRV2Profile.SEARCHABLE_PDF_V2 and not self.source_key:
             raise ValueError("Document OCR profiles require source_key")
         if self.profile is OCRV2Profile.SEARCHABLE_PDF_V2 and not self.source_files:

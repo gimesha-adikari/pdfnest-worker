@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import time
 import uuid
+import os
 from dataclasses import replace
 from pathlib import Path
-from typing import Callable, Mapping
+from typing import Callable, Mapping, Sequence
 
 import pymupdf as fitz
 
@@ -22,8 +23,9 @@ from .contracts import (
     SourceMetadata,
     UnnormalizedPageOutput,
 )
-from .errors import OCRCancellationError, OCRTimeoutError
+from .errors import LanguageDetectionUncertainError, OCRCancellationError, OCRTimeoutError
 from .geometry import RasterPreparer, page_geometry_from_pdf
+from .language_policy import BoundedLanguageDetector, LanguageDecisionStatus, OCRLanguageMode, OCRLanguagePolicy
 from .native import NativeDecision, NativeExtractor, NativeValidator
 from .normalization import normalize_page_output
 from .routing import OCRRouter, RoutePolicy
@@ -80,17 +82,18 @@ class OCRV2Worker:
         *,
         password: str | None = None,
         language: str = "eng",
+        language_mode: str | None = None,
+        languages: Sequence[str] | None = None,
+        language_usage: Mapping[str, float] | None = None,
         profile: OCRProfile = OCRProfile.OCR_TEXT_V2,
         cancellation_check: CancellationCheck | None = None,
         page_timeout_seconds: float | None = None,
         page_progress_callback: PageProgressCallback | None = None,
     ) -> DocumentResult:
-        if not language or not language.strip() or language.strip().lower() in {"auto", "detect"}:
-            raise ValueError("OCR V2 requires explicit language(s); automatic language detection is not supported")
-        language = "+".join(part.strip() for part in language.split("+") if part.strip())
+        policy = OCRLanguagePolicy.from_request(language, mode=language_mode, languages=languages)
         tess_adapter = self.adapters.get("tesseract_v2")
-        if isinstance(tess_adapter, TesseractAdapter) and tess_adapter.languages != language:
-            self.adapters["tesseract_v2"] = TesseractAdapter(language, timeout=tess_adapter.timeout, tessdata_dir=str(tess_adapter.tessdata_dir) if tess_adapter.tessdata_dir else None)
+        if isinstance(tess_adapter, TesseractAdapter) and policy.mode is OCRLanguageMode.EXPLICIT and tess_adapter.languages != policy.engine_expression:
+            self.adapters["tesseract_v2"] = TesseractAdapter(policy.engine_expression, timeout=tess_adapter.timeout, tessdata_dir=str(tess_adapter.tessdata_dir) if tess_adapter.tessdata_dir else None)
         source_path = Path(pdf_path)
         pages: list[PageResult] = []
         provenance: list[Provenance] = []
@@ -113,7 +116,7 @@ class OCRV2Worker:
                     if decision.decision == NativeDecision.TRUST_NATIVE or decision.classification.value in {"BLANK", "NEAR_BLANK"} and not candidate.text.strip():
                         output = self._native_output(candidate)
                         geometry = page_geometry_from_pdf(page)
-                        normalized = normalize_page_output(output, page_index=page_index, geometry=geometry, classification=decision.classification, processing_source=PageProcessingSource.NATIVE_EXTRACTION, language=LanguageMetadata((language,), (), "REQUESTED_ONLY", (), "NOT_DETECTED"))
+                        normalized = normalize_page_output(output, page_index=page_index, geometry=geometry, classification=decision.classification, processing_source=PageProcessingSource.NATIVE_EXTRACTION, language=LanguageMetadata(policy.languages, (), "REQUESTED", (), "NOT_DETECTED", policy.mode.value))
                     else:
                         route = self.router.plan(decision, profile)
                         raster = self.raster_preparer.prepare(page)
@@ -123,6 +126,37 @@ class OCRV2Worker:
                                 f"exceeds configured structured OCR limit {self.max_raster_pixels}"
                             )
                         emit("RASTER_READY", page_index=page_index, width=raster.image.width, height=raster.image.height)
+                        page_policy = policy
+                        detection = None
+                        if policy.mode is OCRLanguageMode.AUTO:
+                            from app.api.tools.ocr.languages import get_installed_tesseract_languages
+
+                            installed = tuple(code for code in get_installed_tesseract_languages() if code in {"eng", "sin", "tam"})
+                            candidates = policy.languages or installed or ("eng",)
+                            sample = _language_detection_sample(raster.image)
+                            detector = BoundedLanguageDetector(
+                                max_probes=int(os.environ.get("OCR_MAX_AUTO_PROBES", "5")),
+                                min_confidence=float(os.environ.get("OCR_AUTO_MIN_CONFIDENCE", "45")),
+                                usage=language_usage,
+                            )
+
+                            def probe(candidate: tuple[str, ...]):
+                                probe_adapter = TesseractAdapter("+".join(candidate))
+                                return probe_adapter.probe(sample, candidate)
+
+                            detection = detector.detect(candidates, probe)
+                            if detection.policy is None:
+                                raise LanguageDetectionUncertainError(detection.reason)
+                            page_policy = detection.policy
+                        if isinstance(self.adapters.get("tesseract_v2"), TesseractAdapter) and page_policy.mode is OCRLanguageMode.EXPLICIT:
+                            base_adapter = self.adapters["tesseract_v2"]
+                            if isinstance(base_adapter, TesseractAdapter) and base_adapter.languages != page_policy.engine_expression:
+                                self.adapters["tesseract_v2"] = TesseractAdapter(page_policy.engine_expression, timeout=base_adapter.timeout, tessdata_dir=str(base_adapter.tessdata_dir) if base_adapter.tessdata_dir else None)
+                        if policy.mode is OCRLanguageMode.AUTO and route.engine_id != "tesseract_v2":
+                            # AUTO detection is a bounded Tesseract probe today;
+                            # do not silently pass an unresolved policy to a
+                            # different engine that cannot report its choice.
+                            route = replace(route, engine_id="tesseract_v2")
                         adapter = self.adapters[route.engine_id or ""]
                         if not adapter.readiness():
                             adapter.initialize()
@@ -130,7 +164,23 @@ class OCRV2Worker:
                             raise RuntimeError(f"adapter {route.engine_id} did not reach readiness")
                         output = adapter.recognize_page(page_id, raster)
                         geometry = raster.geometry
-                        normalized = normalize_page_output(output, page_index=page_index, geometry=geometry, classification=decision.classification, processing_source=PageProcessingSource.OCR_RECOGNITION, language=LanguageMetadata((language,), (), "REQUESTED_ONLY", (), "NOT_DETECTED"))
+                        normalized = normalize_page_output(
+                            output,
+                            page_index=page_index,
+                            geometry=geometry,
+                            classification=decision.classification,
+                            processing_source=PageProcessingSource.OCR_RECOGNITION,
+                            language=LanguageMetadata(
+                                policy.languages,
+                                page_policy.languages,
+                                detection.status.value if detection else LanguageDecisionStatus.REQUESTED.value,
+                                detection.scripts if detection else (),
+                                "DETECTED" if detection else "NOT_DETECTED",
+                                policy.mode.value,
+                                detection.confidence if detection else None,
+                                detection.reason if detection else None,
+                            ),
+                        )
                         if output.provenance:
                             provenance.append(output.provenance)
                     if page_timeout_seconds is not None and time.monotonic() - started > page_timeout_seconds:
@@ -165,3 +215,20 @@ def validate_document_placeholder(page: PageResult, profile: OCRProfile):
     from .contracts import Validation
 
     return Validation(not issues, issues)
+
+
+def _language_detection_sample(image: object):
+    """Build a bounded representative sample from upper, middle, and lower regions."""
+    from PIL import Image
+
+    if not isinstance(image, Image.Image):
+        return image
+    width, height = image.size
+    band = max(1, height // 4)
+    bands = [image.crop((0, start, width, min(height, start + band))) for start in (0, max(0, (height - band) // 2), max(0, height - band))]
+    sample = Image.new("RGB", (width, sum(band_image.height for band_image in bands)), "white")
+    offset = 0
+    for band_image in bands:
+        sample.paste(band_image.convert("RGB"), (0, offset))
+        offset += band_image.height
+    return sample

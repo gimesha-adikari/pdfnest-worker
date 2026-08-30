@@ -15,7 +15,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 import pymupdf as fitz
 
@@ -204,6 +204,7 @@ class StructuredPage:
     reading_order: tuple[str, ...]
     capabilities: tuple[str, ...]
     warnings: tuple[str, ...] = ()
+    language: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -217,6 +218,7 @@ class StructuredPage:
             "reading_order": list(self.reading_order),
             "capabilities": list(self.capabilities),
             "warnings": list(self.warnings),
+            "language": self.language,
         }
 
 
@@ -429,6 +431,9 @@ class StructuredDocumentProcessor:
         pdf_path: str | Path,
         *,
         language: str = "eng",
+        language_mode: str | None = None,
+        languages: Sequence[str] | None = None,
+        language_usage: Mapping[str, float] | None = None,
         routing_policy: str = "AUTO",
         cancellation_check: Callable[[], None] | None = None,
         page_progress_callback: Callable[[int, int, StructuredPage], None] | None = None,
@@ -450,6 +455,9 @@ class StructuredDocumentProcessor:
         ocr_result = ocr_worker.process_document(
             source_path,
             language=language,
+            language_mode=language_mode,
+            languages=languages,
+            language_usage=language_usage,
             profile=OCRProfile.OCR_TEXT_V2,
             cancellation_check=cancellation_check,
             page_timeout_seconds=structured_page_timeout_seconds(),
@@ -510,7 +518,15 @@ class StructuredDocumentProcessor:
                     page_warnings = tuple(warning for warning in warnings if warning.endswith(f":{page_index}"))
                     reading_order = tuple(element.element_id for element in elements)
                     geometry = {"width": ocr_page.geometry.width, "height": ocr_page.geometry.height, "rotation": ocr_page.geometry.rotation, "coordinate_space": ocr_page.geometry.coordinate_space}
-                    structured_page = StructuredPage(page_index, ocr_page.page_id, geometry, classification, processing_source, "BLANK" if not elements else "SUCCESS", tuple(elements), reading_order, tuple(sorted(page_caps)), page_warnings)
+                    structured_page = StructuredPage(page_index, ocr_page.page_id, geometry, classification, processing_source, "BLANK" if not elements else "SUCCESS", tuple(elements), reading_order, tuple(sorted(page_caps)), page_warnings, {
+                        "requested": list(ocr_page.language.requested_languages),
+                        "detected": list(ocr_page.language.detected_languages),
+                        "status": ocr_page.language.language_status,
+                        "mode": ocr_page.language.requested_mode,
+                        "confidence": ocr_page.language.detection_confidence,
+                        "scripts": list(ocr_page.language.detected_scripts),
+                        "reason": ocr_page.language.detection_reason,
+                    })
                     pages.append(structured_page)
                     all_capabilities.update(page_caps)
                     if page_progress_callback:

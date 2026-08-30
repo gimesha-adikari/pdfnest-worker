@@ -50,6 +50,11 @@ class OCRTimeoutError(OCRV2Error):
     pass
 
 
+class LanguageDetectionUncertainError(OCRV2Error):
+    """AUTO mode could not choose a safe language set within its budget."""
+    pass
+
+
 class MarkupError(OCRV2Error):
     """Base class for safe OCR-aware markup classifications."""
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from functools import lru_cache
 from pathlib import Path
 
@@ -28,9 +29,24 @@ def language_name(code: str) -> str:
 
 
 def get_installed_tesseract_languages() -> tuple[str, ...]:
-    from app.api.tools.ocr.document import _get_tessdata_prefix
-    tessdata = _get_tessdata_prefix()
-    if not tessdata.exists():
-        return ("eng",)
-    langs = [p.stem for p in tessdata.glob("*.traineddata") if p.is_file()]
-    return tuple(sorted(langs)) if langs else ("eng",)
+    # Do not trust a stale TESSDATA_PREFIX blindly.  A directory is only a
+    # usable capability root when it contains at least one traineddata file;
+    # otherwise continue through the same known system fallbacks used by the
+    # OCR V2 adapter.
+    candidates = []
+    override = os.getenv("TESSDATA_PREFIX", "").strip()
+    if override:
+        candidates.append(Path(override))
+    candidates.extend(Path(path) for path in (
+        "/usr/share/tesseract-ocr/5/tessdata",
+        "/usr/share/tesseract-ocr/4.00/tessdata",
+        "/usr/share/tessdata",
+        "/usr/local/share/tessdata",
+    ))
+    for tessdata in candidates:
+        if not tessdata.is_dir():
+            continue
+        langs = [p.stem for p in tessdata.glob("*.traineddata") if p.is_file() and p.stem not in {"osd", "pdf"}]
+        if langs:
+            return tuple(sorted(langs))
+    return ()

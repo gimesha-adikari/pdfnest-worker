@@ -112,6 +112,9 @@ class LanguageMetadata:
     language_status: str = "NOT_DETECTED"
     detected_scripts: tuple[str, ...] = ()
     script_status: str = "NOT_DETECTED"
+    requested_mode: str = "EXPLICIT"
+    detection_confidence: float | None = None
+    detection_reason: str | None = None
 
 
 @dataclass(frozen=True)
