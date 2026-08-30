@@ -75,8 +75,14 @@ class TesseractAdapter(EngineAdapter):
             image_path = image_file.name
         try:
             env = os.environ.copy()
-            if self.tessdata_dir:
-                env["TESSDATA_PREFIX"] = str(self.tessdata_dir)
+            # Availability resolves an explicit override through the known
+            # system fallbacks. Pass that same resolved directory to the
+            # subprocess; otherwise a stale/invalid override can make the
+            # availability check succeed while Tesseract still cannot load
+            # the requested language data.
+            data_dir = self._data_dir()
+            if data_dir:
+                env["TESSDATA_PREFIX"] = str(data_dir)
             command = ["tesseract", image_path, "stdout", "-l", self.languages, "tsv"]
             with acquire_tesseract_capacity(timeout=self.timeout):
                 completed = run_hardened_subprocess(command, timeout=self.timeout, env=env)

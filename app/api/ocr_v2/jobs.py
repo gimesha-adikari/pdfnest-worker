@@ -88,7 +88,10 @@ def submit(request: OCRV2JobSubmitRequest) -> OCRV2JobStatusResponse:
     else:
         source_key = _validate_source_key(request.source_key or "")
         source_files = []
-        job_type = "ocr_text_v2"
+        job_type = {
+            OCRV2Profile.DOCUMENT_EXTRACTION_V2: "document_extraction_v2",
+            OCRV2Profile.PDF_MARKDOWN_V2: "pdf_markdown_v2",
+        }.get(request.profile, "ocr_text_v2")
     job = create_job(
         job_type,
         queue_name=JobQueue.ocr,

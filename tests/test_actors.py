@@ -136,3 +136,17 @@ def test_searchable_renderer_failure_preserves_typed_stage_classification():
     code = _searchable_failure_code(RenderingNotEligibleError("artifact validation failed"), "PDF_RENDER")
     assert code == "PDF_RENDER_FAILURE"
     assert _searchable_failure_message(code, "PDF_RENDER") == "Searchable PDF V2 job failed during PDF_RENDER (PDF_RENDER_FAILURE)."
+
+
+def test_searchable_engine_failure_precedes_profile_capability_failure():
+    from app.jobs.actors import _raise_primary_page_failure
+    from app.core.ocr_v2.errors import EngineUnavailableError
+
+    result = SimpleNamespace(
+        pages=(SimpleNamespace(status=SimpleNamespace(value="FAILED"), failure_code="EngineUnavailableError"),)
+    )
+
+    with pytest.raises(EngineUnavailableError) as raised:
+        _raise_primary_page_failure(result)
+
+    assert "unavailable" in str(raised.value)

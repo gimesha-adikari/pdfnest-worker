@@ -51,6 +51,7 @@ class OCRV2Worker:
         native_extractor: NativeExtractor | None = None,
         native_validator: NativeValidator | None = None,
         route_policy: RoutePolicy | None = None,
+        max_raster_pixels: int | None = None,
     ) -> None:
         self.adapters = dict(adapters or {
             "tesseract_v2": TesseractAdapter("eng"),
@@ -60,6 +61,7 @@ class OCRV2Worker:
         self.native_extractor = native_extractor or NativeExtractor()
         self.native_validator = native_validator or NativeValidator()
         self.router = OCRRouter(self.adapters, route_policy)
+        self.max_raster_pixels = max_raster_pixels
 
     def _native_output(self, candidate: object) -> UnnormalizedPageOutput:
         native = candidate  # keep the small conversion explicit at this boundary
@@ -111,6 +113,11 @@ class OCRV2Worker:
                     else:
                         route = self.router.plan(decision, profile)
                         raster = self.raster_preparer.prepare(page)
+                        if self.max_raster_pixels is not None and raster.image.width * raster.image.height > self.max_raster_pixels:
+                            raise ValueError(
+                                f"page raster pixel count {raster.image.width * raster.image.height} "
+                                f"exceeds configured structured OCR limit {self.max_raster_pixels}"
+                            )
                         emit("RASTER_READY", page_index=page_index, width=raster.image.width, height=raster.image.height)
                         adapter = self.adapters[route.engine_id or ""]
                         if not adapter.readiness():

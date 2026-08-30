@@ -11,6 +11,8 @@ from pydantic import BaseModel, Field, model_validator
 class OCRV2Profile(str, Enum):
     OCR_TEXT_V2 = "OCR_TEXT_V2"
     SEARCHABLE_PDF_V2 = "SEARCHABLE_PDF_V2"
+    DOCUMENT_EXTRACTION_V2 = "DOCUMENT_EXTRACTION_V2"
+    PDF_MARKDOWN_V2 = "PDF_MARKDOWN_V2"
 
 
 class OCRV2RoutingPolicy(str, Enum):
@@ -69,8 +71,8 @@ class OCRV2JobSubmitRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_sources(self) -> "OCRV2JobSubmitRequest":
-        if self.profile is OCRV2Profile.OCR_TEXT_V2 and not self.source_key:
-            raise ValueError("OCR Text V2 requires source_key")
+        if self.profile is not OCRV2Profile.SEARCHABLE_PDF_V2 and not self.source_key:
+            raise ValueError("Document OCR profiles require source_key")
         if self.profile is OCRV2Profile.SEARCHABLE_PDF_V2 and not self.source_files:
             raise ValueError("Searchable PDF V2 requires ordered source_files")
         return self

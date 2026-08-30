@@ -47,12 +47,22 @@ class NormalizedImage:
     page_width: float
     page_height: float
     dpi: int = DEFAULT_DPI
+    input_mode: str = ""
+    normalized_mode: str = ""
+    exif_present: bool = False
+    exif_orientation: int | None = None
+    alpha_present: bool = False
 
 
 def normalize_image(path: str | Path, *, dpi: int = DEFAULT_DPI) -> NormalizedImage:
     source = Path(path)
     with Image.open(source) as opened:
         image_format = str(opened.format or "").upper()
+        input_mode = str(opened.mode)
+        exif = opened.getexif()
+        exif_orientation = exif.get(274)
+        exif_present = bool(exif)
+        alpha_present = "A" in opened.getbands() or "transparency" in opened.info
         if image_format not in SUPPORTED_FORMATS:
             raise ValueError(f"unsupported image format: {image_format or 'unknown'}")
         width, height = opened.size
@@ -66,6 +76,7 @@ def normalize_image(path: str | Path, *, dpi: int = DEFAULT_DPI) -> NormalizedIm
         image = ImageOps.exif_transpose(opened)
         if image.mode not in {"RGB", "RGBA"}:
             image = image.convert("RGBA" if "A" in image.getbands() else "RGB")
+        normalized_mode = str(image.mode)
         buffer = BytesIO()
         image.save(buffer, format="PNG", dpi=(dpi, dpi))
         width, height = image.size
@@ -80,6 +91,11 @@ def normalize_image(path: str | Path, *, dpi: int = DEFAULT_DPI) -> NormalizedIm
         page_width=max(1.0, width * 72.0 / dpi),
         page_height=max(1.0, height * 72.0 / dpi),
         dpi=dpi,
+        input_mode=input_mode,
+        normalized_mode=normalized_mode,
+        exif_present=exif_present,
+        exif_orientation=int(exif_orientation) if exif_orientation is not None else None,
+        alpha_present=alpha_present,
     )
 
 

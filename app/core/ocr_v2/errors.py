@@ -28,7 +28,18 @@ class DocumentValidationError(OCRV2Error):
 
 
 class RenderingNotEligibleError(OCRV2Error):
-    pass
+    """Fail-closed render/validation error with safe forensic context."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        substage: str | None = None,
+        reason_code: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.substage = substage
+        self.reason_code = reason_code
 
 
 class OCRCancellationError(OCRV2Error):

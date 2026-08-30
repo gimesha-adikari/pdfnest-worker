@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import subprocess
 from pathlib import Path
 
 import pymupdf as fitz
@@ -64,6 +65,44 @@ def test_native_extractor_clips_edge_word_to_visible_page() -> None:
 def test_tesseract_rejects_implicit_language_detection() -> None:
     with pytest.raises(ConfigurationError):
         TesseractAdapter("auto")
+
+
+def test_tesseract_uses_resolved_tessdata_fallback_for_subprocess(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stale explicit prefix must not bypass the adapter's valid fallback."""
+    missing_prefix = tmp_path / "missing-tessdata"
+    fallback = tmp_path / "fallback-tessdata"
+    fallback.mkdir()
+    (fallback / "eng.traineddata").write_bytes(b"test fixture")
+    monkeypatch.setenv("TESSDATA_PREFIX", str(missing_prefix))
+
+    adapter = TesseractAdapter("eng")
+    monkeypatch.setattr(adapter, "_data_dir", lambda: fallback)
+    captured: dict[str, str] = {}
+
+    def fake_subprocess(command: list[str], *, env: dict[str, str], timeout: float):
+        captured["tessdata_prefix"] = env["TESSDATA_PREFIX"]
+        return subprocess.CompletedProcess(
+            args=command,
+            returncode=0,
+            stdout=(
+                "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext\n"
+                "5\t1\t1\t1\t1\t1\t10\t10\t80\t20\t95\tFallback\n"
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr("app.core.ocr_v2.adapters.tesseract.run_hardened_subprocess", fake_subprocess)
+    image = Image.new("RGB", (100, 60), "white")
+    encoded = io.BytesIO()
+    image.save(encoded, format="PNG")
+    raster = type("Raster", (), {"image": image, "png_bytes": encoded.getvalue()})()
+
+    result = adapter.recognize_page("page-0", raster)
+
+    assert captured["tessdata_prefix"] == str(fallback)
+    assert result.items[0]["text"] == "Fallback"
 
 
 def test_router_uses_configured_fallback_without_product_logic() -> None:
