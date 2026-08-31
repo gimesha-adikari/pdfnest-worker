@@ -1,5 +1,7 @@
 from app.core.ocr_v2.language_policy import (
+    AdaptiveLanguageDetector,
     BoundedLanguageDetector,
+    FusedLanguageDetector,
     LanguageDecisionStatus,
     LanguageProbe,
     LanguageCandidateRanker,
@@ -77,6 +79,204 @@ def test_detector_returns_undetermined_for_scriptless_high_confidence_output():
     assert result.status is LanguageDecisionStatus.UNDETERMINED
     assert result.policy is None
     assert result.reason == "no script evidence"
+
+
+def test_adaptive_detector_expands_sin_tam_when_both_scripts_are_present():
+    calls: list[tuple[str, ...]] = []
+
+    def probe(candidate: tuple[str, ...]) -> LanguageProbe:
+        calls.append(candidate)
+        if candidate == ("sin",):
+            return LanguageProbe(candidate, "සිංහල පෙළ 4821", 80.0)
+        if candidate == ("tam",):
+            return LanguageProbe(candidate, "தமிழ் உரை 4821", 82.0)
+        if candidate == ("eng",):
+            return LanguageProbe(candidate, "", 35.0)
+        return LanguageProbe(candidate, "සිංහල தமிழ் 4821", 94.0)
+
+    result = AdaptiveLanguageDetector().detect(("eng", "sin", "tam"), probe)
+    assert result.status is LanguageDecisionStatus.MULTILINGUAL_DETECTED
+    assert result.policy is not None
+    assert result.policy.engine_expression == "sin+tam"
+    assert ("sin", "tam") in calls
+    assert len(calls) == 4
+
+
+def test_adaptive_detector_expands_the_current_three_language_candidate():
+    def probe(candidate: tuple[str, ...]) -> LanguageProbe:
+        if candidate == ("eng",):
+            return LanguageProbe(candidate, "English sample 4824", 80.0)
+        if candidate == ("sin",):
+            return LanguageProbe(candidate, "සිංහල පෙළ 4824", 80.0)
+        if candidate == ("tam",):
+            return LanguageProbe(candidate, "தமிழ் உரை 4824", 80.0)
+        return LanguageProbe(candidate, "English සිංහල தமிழ் 4824", 96.0)
+
+    result = AdaptiveLanguageDetector().detect(("eng", "sin", "tam"), probe)
+    assert result.status is LanguageDecisionStatus.MULTILINGUAL_DETECTED
+    assert result.policy is not None
+    assert result.policy.engine_expression == "eng+sin+tam"
+    assert result.probes == 4
+
+
+def test_adaptive_detector_does_not_confidently_accept_an_incomplete_triple():
+    def probe(candidate: tuple[str, ...]) -> LanguageProbe:
+        if candidate == ("eng",):
+            return LanguageProbe(candidate, "English sample", 80.0)
+        if candidate == ("sin",):
+            return LanguageProbe(candidate, "සිංහල පෙළ", 58.0)
+        if candidate == ("tam",):
+            return LanguageProbe(candidate, "தமிழ்", 48.0)
+        return LanguageProbe(candidate, "English සිංහල", 96.0)
+
+    result = AdaptiveLanguageDetector().detect(("eng", "sin", "tam"), probe)
+    assert result.status is LanguageDecisionStatus.UNCERTAIN
+    assert result.policy is None
+    assert result.reason == "unexplained script evidence"
+
+
+def test_adaptive_detector_prior_cannot_suppress_script_expansion():
+    calls: list[tuple[str, ...]] = []
+
+    def probe(candidate: tuple[str, ...]) -> LanguageProbe:
+        calls.append(candidate)
+        if candidate == ("sin",):
+            return LanguageProbe(candidate, "සිංහල පෙළ தமிழ் உரை", 80.0)
+        if candidate == ("tam",):
+            return LanguageProbe(candidate, "தமிழ் உரை 4825", 82.0)
+        if candidate == ("sin", "tam"):
+            return LanguageProbe(candidate, "සිංහල පෙළ தமிழ் உரை 4825", 88.0)
+        return LanguageProbe(candidate, "English", 20.0)
+
+    result = AdaptiveLanguageDetector(usage={"eng": 1000, "sin": 1, "tam": 1}).detect(("eng", "sin", "tam"), probe)
+    assert result.policy is not None
+    assert result.policy.engine_expression == "sin+tam"
+    assert ("sin", "tam") in calls
+
+
+def test_adaptive_detector_returns_uncertain_when_script_expansion_budget_is_exhausted():
+    def probe(candidate: tuple[str, ...]) -> LanguageProbe:
+        if candidate == ("eng",):
+            return LanguageProbe(candidate, "English sample", 80.0)
+        if candidate == ("sin",):
+            return LanguageProbe(candidate, "සිංහල පෙළ", 80.0)
+        return LanguageProbe(candidate, "தமிழ் உரை", 80.0)
+
+    result = AdaptiveLanguageDetector(normal_max_probes=3, expanded_max_probes=3).detect(("eng", "sin", "tam"), probe)
+    assert result.status is LanguageDecisionStatus.UNCERTAIN
+    assert result.policy is None
+    assert result.reason == "unexplained script evidence"
+
+
+def test_adaptive_detector_early_accepts_clean_single_language_after_single_probes():
+    calls: list[tuple[str, ...]] = []
+
+    def probe(candidate: tuple[str, ...]) -> LanguageProbe:
+        calls.append(candidate)
+        if candidate == ("eng",):
+            return LanguageProbe(candidate, "English sample text", 95.0)
+        return LanguageProbe(candidate, "", -1.0)
+
+    result = AdaptiveLanguageDetector().detect(("eng", "sin", "tam"), probe)
+    assert result.status is LanguageDecisionStatus.DETECTED
+    assert result.policy is not None
+    assert result.policy.engine_expression == "eng"
+    assert len(calls) == 3
+
+
+def test_fused_detector_accepts_pair_from_independent_single_evidence():
+    def probe(candidate: tuple[str, ...]) -> LanguageProbe:
+        if candidate == ("eng",):
+            return LanguageProbe(candidate, "English sample text", 82.0)
+        if candidate == ("sin",):
+            return LanguageProbe(candidate, "සිංහල පෙළ පරීක්ෂණය", 78.0)
+        if candidate == ("tam",):
+            return LanguageProbe(candidate, "தமிழ்", 25.0)
+        if candidate == ("eng", "sin"):
+            # The fused decision may trust the independent singles even when
+            # the combined sample under-reports one script.
+            return LanguageProbe(candidate, "English sample text", 96.0)
+        return LanguageProbe(candidate, "English sample text", 70.0)
+
+    result = FusedLanguageDetector().detect(("eng", "sin", "tam"), probe)
+    assert result.status is LanguageDecisionStatus.MULTILINGUAL_DETECTED
+    assert result.policy is not None
+    assert result.policy.engine_expression == "eng+sin"
+    assert result.reason == "fused independent script evidence"
+
+
+def test_fused_detector_relaxes_pair_gain_only_when_pair_reproduces_both_scripts():
+    english = " ".join(["English"] * 30)
+    sinhala = " ".join(["සිංහල"] * 20)
+
+    def probe(candidate: tuple[str, ...]) -> LanguageProbe:
+        if candidate == ("eng",):
+            return LanguageProbe(candidate, english, 80.0)
+        if candidate == ("sin",):
+            return LanguageProbe(candidate, sinhala, 74.0)
+        if candidate == ("tam",):
+            return LanguageProbe(candidate, "தமிழ்", 25.0)
+        if candidate == ("eng", "sin"):
+            # The pair only improves the score by one point, but visibly
+            # contains material Latin and Sinhala evidence itself.
+            return LanguageProbe(candidate, f"{english} {sinhala}", 81.0)
+        return LanguageProbe(candidate, english, 70.0)
+
+    result = FusedLanguageDetector().detect(("eng", "sin", "tam"), probe)
+    assert result.status is LanguageDecisionStatus.MULTILINGUAL_DETECTED
+    assert result.policy is not None
+    assert result.policy.engine_expression == "eng+sin"
+
+
+def test_fused_detector_keeps_weak_unresolved_third_script_uncertain():
+    def probe(candidate: tuple[str, ...]) -> LanguageProbe:
+        if candidate == ("eng",):
+            return LanguageProbe(candidate, "English sample text", 80.0)
+        if candidate == ("sin",):
+            return LanguageProbe(candidate, "සිංහල පෙළ", 70.0)
+        if candidate == ("tam",):
+            return LanguageProbe(candidate, "தமிழ்", 47.0)
+        if candidate == ("eng", "sin"):
+            return LanguageProbe(candidate, "English සිංහල", 96.0)
+        return LanguageProbe(candidate, "English සිංහල", 96.0)
+
+    result = FusedLanguageDetector().detect(("eng", "sin", "tam"), probe)
+    assert result.status is LanguageDecisionStatus.UNCERTAIN
+    assert result.policy is None
+
+
+def test_fused_detector_recovers_noisy_dominant_single_without_pair_gain():
+    def probe(candidate: tuple[str, ...]) -> LanguageProbe:
+        if candidate == ("sin",):
+            return LanguageProbe(candidate, "සිංහල පෙළ පරීක්ෂණය", 82.0)
+        if candidate == ("tam",):
+            return LanguageProbe(candidate, "தமிழ் உரை", 53.0)
+        if candidate == ("eng",):
+            return LanguageProbe(candidate, "English noise", 45.0)
+        return LanguageProbe(candidate, "සිංහල පෙළ", 86.0)
+
+    result = FusedLanguageDetector().detect(("eng", "sin", "tam"), probe)
+    assert result.status is LanguageDecisionStatus.DETECTED
+    assert result.policy is not None
+    assert result.policy.engine_expression == "sin"
+
+
+def test_fused_detector_evaluates_strong_third_language():
+    def probe(candidate: tuple[str, ...]) -> LanguageProbe:
+        if candidate == ("eng",):
+            return LanguageProbe(candidate, "English sample text", 80.0)
+        if candidate == ("sin",):
+            return LanguageProbe(candidate, "සිංහල පෙළ පරීක්ෂණය", 78.0)
+        if candidate == ("tam",):
+            return LanguageProbe(candidate, "தமிழ் உரை பக்கம்", 78.0)
+        if candidate == ("eng", "sin"):
+            return LanguageProbe(candidate, "English සිංහල", 88.0)
+        return LanguageProbe(candidate, "English සිංහල தமிழ்", 96.0)
+
+    result = FusedLanguageDetector().detect(("eng", "sin", "tam"), probe)
+    assert result.status is LanguageDecisionStatus.MULTILINGUAL_DETECTED
+    assert result.policy is not None
+    assert result.policy.engine_expression == "eng+sin+tam"
 
 
 def test_installed_language_set_is_a_real_capability_boundary():

@@ -25,7 +25,7 @@ from .contracts import (
 )
 from .errors import LanguageDetectionUncertainError, OCRCancellationError, OCRTimeoutError
 from .geometry import RasterPreparer, page_geometry_from_pdf
-from .language_policy import BoundedLanguageDetector, LanguageDecisionStatus, OCRLanguageMode, OCRLanguagePolicy
+from .language_policy import FusedLanguageDetector, LanguageDecisionStatus, OCRLanguageMode, OCRLanguagePolicy
 from .native import NativeDecision, NativeExtractor, NativeValidator
 from .normalization import normalize_page_output
 from .routing import OCRRouter, RoutePolicy
@@ -134,8 +134,10 @@ class OCRV2Worker:
                             installed = tuple(code for code in get_installed_tesseract_languages() if code in {"eng", "sin", "tam"})
                             candidates = policy.languages or installed or ("eng",)
                             sample = _language_detection_sample(raster.image)
-                            detector = BoundedLanguageDetector(
-                                max_probes=int(os.environ.get("OCR_MAX_AUTO_PROBES", "5")),
+                            detector = FusedLanguageDetector(
+                                initial_probes=int(os.environ.get("OCR_AUTO_INITIAL_PROBES", "3")),
+                                normal_max_probes=int(os.environ.get("OCR_MAX_AUTO_PROBES", "5")),
+                                expanded_max_probes=int(os.environ.get("OCR_AUTO_EXPANDED_MAX_PROBES", "7")),
                                 min_confidence=float(os.environ.get("OCR_AUTO_MIN_CONFIDENCE", "45")),
                                 usage=language_usage,
                             )
