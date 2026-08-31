@@ -68,6 +68,8 @@ def _searchable_failure_code(exc: Exception, stage: str) -> str:
         return "TIMEOUT"
     if isinstance(exc, ValueError) and str(exc).startswith("PROFILE_NOT_ELIGIBLE:"):
         return "PROFILE_NOT_ELIGIBLE"
+    if stage == "INPUT_DOWNLOAD":
+        return "INPUT_DOWNLOAD"
     if stage == "IMAGE_NORMALIZATION":
         return "INVALID_INPUT"
     if stage == "ARTIFACT_PERSISTENCE":
@@ -77,6 +79,8 @@ def _searchable_failure_code(exc: Exception, stage: str) -> str:
 
 def _searchable_failure_message(code: str, stage: str) -> str:
     """Return safe durable diagnostics without storing exception text."""
+    if code == "INPUT_DOWNLOAD":
+        return "We couldn't access one of your uploaded images. Upload the images again to start over."
     return f"Searchable PDF V2 job failed during {stage} ({code})."
 
 

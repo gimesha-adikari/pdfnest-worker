@@ -145,9 +145,9 @@ async def capabilities(language: str = "eng") -> dict[str, object]:
             "auto_statuses": ["DETECTED", "MULTILINGUAL_DETECTED", "UNCERTAIN", "UNDETERMINED"],
         },
         "routing_modes": [
-            {"id": "AUTO", "label": "Balanced", "description": "Uses the best available text path for the document.", "available": True},
-            {"id": "FAST", "label": "Fast", "description": "Prioritizes a quick standard OCR path.", "available": True},
-            {"id": "QUALITY", "label": "Best quality", "description": "Uses the enhanced OCR path when it is available.", "available": quality_available},
+            {"id": "AUTO", "label": "Balanced", "description": "Balances speed and extraction quality for the document.", "available": True},
+            {"id": "FAST", "label": "Fast", "description": "Prioritizes a quicker result.", "available": True},
+            {"id": "QUALITY", "label": "Best quality", "description": "Uses the highest-quality option when available.", "available": quality_available},
         ],
         "quality_engine_available": quality_available,
         "engines": engines,

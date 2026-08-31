@@ -138,6 +138,47 @@ def test_searchable_renderer_failure_preserves_typed_stage_classification():
     assert _searchable_failure_message(code, "PDF_RENDER") == "Searchable PDF V2 job failed during PDF_RENDER (PDF_RENDER_FAILURE)."
 
 
+def test_searchable_missing_input_has_safe_terminal_message():
+    from app.jobs.actors import _searchable_failure_code, _searchable_failure_message
+
+    code = _searchable_failure_code(FileNotFoundError("/tmp/private/source.png"), "INPUT_DOWNLOAD")
+    assert code == "INPUT_DOWNLOAD"
+    message = _searchable_failure_message(code, "INPUT_DOWNLOAD")
+    assert message == "We couldn't access one of your uploaded images. Upload the images again to start over."
+    assert "/tmp/private" not in message
+
+
+def test_searchable_missing_input_reaches_safe_terminal_state(monkeypatch):
+    updates = []
+    monkeypatch.setattr(
+        "app.jobs.actors.get_job",
+        lambda _job_id: SimpleNamespace(status=JobState.queued, owner_identity="guest:missing", payload={}),
+    )
+    monkeypatch.setattr("app.jobs.actors.claim_job", lambda _job_id: object())
+    monkeypatch.setattr("app.jobs.actors.check_cancellation", lambda _job_id: None)
+    monkeypatch.setattr("app.jobs.actors.acquire_lease", lambda _job_id, _owner: (True, ""))
+    monkeypatch.setattr("app.jobs.actors.release_lease", lambda _job_id, _owner: None)
+    monkeypatch.setattr("app.jobs.actors._cleanup_input_objects", lambda _keys: None)
+    monkeypatch.setattr(
+        "app.jobs.actors.download_to_path",
+        lambda _key, _path: (_ for _ in ()).throw(FileNotFoundError("/tmp/private/source.png")),
+    )
+    monkeypatch.setattr("app.jobs.actors.update_job", lambda _job_id, **fields: updates.append(fields))
+
+    _run_searchable_pdf_job(
+        "123e4567-e89b-12d3-a456-426614174000",
+        "eng",
+        [{"source_key": "jobs/ocr_v2/searchable_pdf/input/missing.png", "source_name": "missing.png"}],
+        "missing.png",
+    )
+
+    terminal = updates[-1]
+    assert terminal["status"] == JobState.failed
+    assert terminal["error_code"] == "INPUT_DOWNLOAD"
+    assert terminal["error"] == "We couldn't access one of your uploaded images. Upload the images again to start over."
+    assert "/tmp/private" not in terminal["error"]
+
+
 def test_searchable_engine_failure_precedes_profile_capability_failure():
     from app.jobs.actors import _raise_primary_page_failure
     from app.core.ocr_v2.errors import EngineUnavailableError

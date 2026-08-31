@@ -30,6 +30,19 @@ def is_managed_environment() -> bool:
     return os.getenv("APP_ENV", "development").strip().lower() in MANAGED_ENVS
 
 
+def remote_storage_enabled() -> bool:
+    """Select remote storage only when explicitly requested locally.
+
+    Managed environments always require R2. In local development, dotenv
+    credentials alone must not redirect a run to a remote bucket; use
+    STORAGE_MODE=r2 for an intentional local remote-storage smoke test.
+    """
+    if is_managed_environment():
+        return True
+    mode = os.getenv("STORAGE_MODE", "").strip().lower()
+    return mode in {"r2", "s3", "remote"}
+
+
 def validate_runtime_config() -> None:
     """Reject local fallbacks when a managed worker is starting."""
     if not is_managed_environment():
@@ -87,6 +100,9 @@ class Settings:
     r2_access_key: str = os.getenv("R2_ACCESS_KEY", "").strip('\'" ')
     r2_secret_key: str = os.getenv("R2_SECRET_KEY", "").strip('\'" ')
     r2_endpoint: str = os.getenv("R2_ENDPOINT", "").strip('\'" ')
+    r2_connect_timeout_seconds: int = field(default_factory=lambda: _parse_int_env("R2_CONNECT_TIMEOUT_SECONDS", 5, 1, 30))
+    r2_read_timeout_seconds: int = field(default_factory=lambda: _parse_int_env("R2_READ_TIMEOUT_SECONDS", 30, 5, 300))
+    r2_max_attempts: int = field(default_factory=lambda: _parse_int_env("R2_MAX_ATTEMPTS", 3, 1, 5))
 
     worker_shared_secret: str = os.getenv("WORKER_SHARED_SECRET", "dev-secret-change-in-production").strip()
 

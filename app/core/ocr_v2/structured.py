@@ -1,9 +1,9 @@
 """Canonical structured-document extraction for OCR V2.
 
-This module is deliberately engine-neutral.  Native PDF blocks and tables are
-kept native; scanned pages are represented from the existing Tesseract OCR V2
-result.  It does not infer tables, formulas, headings, or captions from plain
-OCR text when the source does not provide that structure.
+This module is deliberately engine-neutral. Native PDF structure is retained;
+scanned pages may receive conservative headings, lists, and simple aligned
+tables from existing Tesseract line/token geometry. Complex semantics remain
+unsupported unless an upstream structured engine provides them.
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ from __future__ import annotations
 import time
 import uuid
 import os
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
@@ -253,7 +254,7 @@ def _bbox(x0: float, y0: float, x1: float, y1: float) -> dict[str, float]:
 
 
 def _element_sort_key(element: StructuredElement) -> tuple[float, float, int, str]:
-    bbox = element.bbox or {}
+    bbox = (element.data.get("layout_bbox") if element.data else None) or element.bbox or {}
     return (float(bbox.get("y", 0.0)), float(bbox.get("x", 0.0)), element.page_index, element.element_id)
 
 
@@ -344,6 +345,351 @@ def _ocr_elements(page_result: PageResult) -> list[StructuredElement]:
             source="tesseract_ocr",
         ))
     return elements
+
+
+@dataclass(frozen=True)
+class _OCRLayoutLine:
+    """One OCR line in a rotation-normalized layout space.
+
+    Tesseract receives the rendered page image, while PDF text extraction uses
+    the page's unrotated crop-box coordinates.  Keeping both boxes lets the
+    structure heuristics reason about an upright page without changing the
+    canonical source geometry stored in the result.
+    """
+
+    text: str
+    source_bbox: dict[str, float]
+    layout_bbox: dict[str, float]
+    tokens: tuple[tuple[str, dict[str, float], dict[str, float]], ...]
+    line_id: str
+
+
+def _rotate_bbox_for_layout(bbox: dict[str, float], geometry: PageGeometry) -> dict[str, float]:
+    """Map OCR coordinates into an upright layout space for structure analysis."""
+    x, y, width, height = bbox["x"], bbox["y"], bbox["width"], bbox["height"]
+    rotation = geometry.rotation % 360
+    if rotation == 90:
+        return {"x": y, "y": geometry.width - (x + width), "width": height, "height": width}
+    if rotation == 180:
+        return {
+            "x": geometry.width - (x + width),
+            "y": geometry.height - (y + height),
+            "width": width,
+            "height": height,
+        }
+    if rotation == 270:
+        return {"x": geometry.height - (y + height), "y": x, "width": height, "height": width}
+    return dict(bbox)
+
+
+def _bbox_union(boxes: Sequence[dict[str, float]]) -> dict[str, float]:
+    if not boxes:
+        return {"x": 0.0, "y": 0.0, "width": 0.0, "height": 0.0}
+    x0 = min(box["x"] for box in boxes)
+    y0 = min(box["y"] for box in boxes)
+    x1 = max(box["x"] + box["width"] for box in boxes)
+    y1 = max(box["y"] + box["height"] for box in boxes)
+    return {"x": x0, "y": y0, "width": max(0.0, x1 - x0), "height": max(0.0, y1 - y0)}
+
+
+def _ocr_layout_lines(page_result: PageResult) -> list[_OCRLayoutLine]:
+    token_map = page_result.tokens_by_id
+    lines: list[_OCRLayoutLine] = []
+    for line in page_result.lines:
+        text = line.text.strip()
+        if not text:
+            continue
+        source_bbox = {"x": line.bbox.x, "y": line.bbox.y, "width": line.bbox.width, "height": line.bbox.height}
+        token_values: list[tuple[str, dict[str, float], dict[str, float]]] = []
+        for token_id in line.token_ids:
+            token = token_map.get(token_id)
+            if token is None or not token.text.strip():
+                continue
+            token_source_bbox = {"x": token.bbox.x, "y": token.bbox.y, "width": token.bbox.width, "height": token.bbox.height}
+            token_values.append((token.text.strip(), token_source_bbox, _rotate_bbox_for_layout(token_source_bbox, page_result.geometry)))
+        token_values.sort(key=lambda value: (value[2]["x"], value[2]["y"]))
+        lines.append(_OCRLayoutLine(text, source_bbox, _rotate_bbox_for_layout(source_bbox, page_result.geometry), tuple(token_values), line.id))
+    return sorted(lines, key=lambda line: (line.layout_bbox["y"], line.layout_bbox["x"]))
+
+
+def _layout_dimensions(page_result: PageResult) -> tuple[float, float]:
+    if page_result.geometry.rotation % 360 in {90, 270}:
+        return page_result.geometry.height, page_result.geometry.width
+    return page_result.geometry.width, page_result.geometry.height
+
+
+def _line_gap(previous: _OCRLayoutLine, current: _OCRLayoutLine) -> float:
+    return max(0.0, current.layout_bbox["y"] - (previous.layout_bbox["y"] + previous.layout_bbox["height"]))
+
+
+def _line_content_bbox(line: _OCRLayoutLine) -> dict[str, float]:
+    """Use token extent when OCR line boxes are coarse block-width rectangles."""
+    if line.tokens:
+        return _bbox_union([token[2] for token in line.tokens])
+    return line.layout_bbox
+
+
+def _median_line_height(lines: Sequence[_OCRLayoutLine]) -> float:
+    heights = sorted(line.layout_bbox["height"] for line in lines if line.layout_bbox["height"] > 0)
+    if not heights:
+        return 8.0
+    middle = len(heights) // 2
+    return heights[middle] if len(heights) % 2 else (heights[middle - 1] + heights[middle]) / 2.0
+
+
+def _is_linguistic_line(text: str) -> bool:
+    letters = sum(character.isalpha() for character in text)
+    visible = sum(not character.isspace() for character in text)
+    return letters >= 5 and visible > 0 and (letters / visible) >= 0.55
+
+
+def _ocr_heading_level(line: _OCRLayoutLine, index: int, lines: Sequence[_OCRLayoutLine], page_width: float, page_height: float, median_height: float) -> int | None:
+    text = line.text.strip()
+    if not _is_linguistic_line(text) or len(text) > 100 or len(text.split()) > 12:
+        return None
+    if text.endswith((".", ",", ";", ":", "?", "!")) or ":" in text:
+        return None
+    if line.layout_bbox["y"] > page_height * 0.92:
+        return None
+
+    letters = [character for character in text if character.isalpha()]
+    upper_ratio = sum(character.isupper() for character in letters) / max(1, len(letters))
+    words = [word for word in re.findall(r"[^\W\d_]+", text, flags=re.UNICODE) if word]
+    word_count = len(text.split())
+    title_case_words = sum(word[0].isupper() for word in words if word)
+    title_like = len(words) >= 2 and title_case_words / len(words) >= 0.60
+    content_bbox = _line_content_bbox(line)
+    centered = abs((content_bbox["x"] + content_bbox["width"] / 2.0) - page_width / 2.0) <= page_width * 0.16
+    previous_gap = _line_gap(lines[index - 1], line) if index else float("inf")
+    next_gap = _line_gap(line, lines[index + 1]) if index + 1 < len(lines) else float("inf")
+    isolated = max(previous_gap, next_gap) >= median_height * 1.15
+
+    if upper_ratio >= 0.78 and ((centered and word_count <= 6) or (isolated and word_count <= 4)):
+        return 1 if centered and len(text) <= 70 else 2
+    title_connectors = {"a", "an", "and", "at", "by", "for", "from", "in", "of", "on", "the", "to"}
+    title_case_only = all(
+        word.lower() in title_connectors or (word[0].isupper() and (len(word) == 1 or word[1:].islower()))
+        for word in words
+    )
+    if title_like and title_case_only and centered and isolated and not any(character.isdigit() for character in text) and content_bbox["width"] <= page_width * 0.45:
+        return 2
+    return None
+
+
+def _is_list_line(text: str) -> tuple[bool, bool, str]:
+    clean = text.strip()
+    if "|" in clean:
+        return False, False, clean
+    if BULLET_REGEX.match(clean):
+        return True, False, BULLET_REGEX.sub("", clean, count=1).strip()
+    if NUMBERED_LIST_REGEX.match(clean):
+        return True, True, NUMBERED_LIST_REGEX.sub("", clean, count=1).strip()
+    return False, False, clean
+
+
+def _table_header_groups(line: _OCRLayoutLine) -> list[dict[str, Any]]:
+    if len(line.tokens) < 3:
+        return []
+    sorted_tokens = list(line.tokens)
+    span = max(1.0, line.layout_bbox["width"])
+    break_gap = max(18.0, span * 0.05)
+    groups: list[list[tuple[str, dict[str, float], dict[str, float]]]] = [[]]
+    previous_right: float | None = None
+    for token in sorted_tokens:
+        token_left = token[2]["x"]
+        if previous_right is not None and token_left - previous_right > break_gap:
+            groups.append([])
+        groups[-1].append(token)
+        previous_right = max(previous_right or token[2]["x"], token[2]["x"] + token[2]["width"])
+    if len(groups) < 3:
+        return []
+    return [{"text": " ".join(token[0] for token in group), "bbox": _bbox_union([token[1] for token in group]), "rowspan": 1, "colspan": 1} for group in groups]
+
+
+def _simple_ocr_table(lines: Sequence[_OCRLayoutLine], page_result: PageResult, median_height: float) -> tuple[StructuredElement | None, set[str]]:
+    """Recover only repeated, four-ish-column OCR rows with stable geometry."""
+    row_candidates: list[_OCRLayoutLine] = []
+    for line in lines:
+        if len(line.tokens) < 3:
+            continue
+        # A column-header line can look like a short numbered row because
+        # abbreviations such as "NO" are two characters long.  Keep headers
+        # for the explicit header pass below, but never use them as data rows.
+        alpha_values = [character for token in line.tokens for character in token[0] if character.isalpha()]
+        header_like = (
+            len(line.tokens) >= 3
+            and not any(character.isdigit() for token in line.tokens for character in token[0])
+            and bool(alpha_values)
+            and sum(character.isupper() for character in alpha_values) / len(alpha_values) >= 0.75
+        )
+        if header_like:
+            continue
+        first = re.sub(r"[^\w]", "", line.tokens[0][0], flags=re.UNICODE)
+        has_row_number = bool(re.search(r"\d", first)) or len(first) <= 2
+        numeric_middle = [token for token in line.tokens[1:] if re.search(r"\d", token[0]) and token[2]["x"] > line.layout_bbox["x"] + line.layout_bbox["width"] * 0.58]
+        tail = line.tokens[-1][0]
+        has_status_tail = sum(character.isalpha() for character in tail) >= 4
+        if has_row_number and (numeric_middle or has_status_tail or (len(line.tokens) >= 3 and any(character.isalpha() for token in line.tokens[1:] for character in token[0]))):
+            row_candidates.append(line)
+    if len(row_candidates) < 4:
+        return None, set()
+    row_candidates = sorted(row_candidates, key=lambda line: line.layout_bbox["y"])
+    runs: list[list[_OCRLayoutLine]] = [[]]
+    for line in row_candidates:
+        if runs[-1] and line.layout_bbox["y"] - runs[-1][-1].layout_bbox["y"] > median_height * 3.0:
+            runs.append([])
+        runs[-1].append(line)
+    row_candidates = max(runs, key=len)
+    if len(row_candidates) < 4:
+        return None, set()
+    status_rows = sum(sum(character.isalpha() for character in line.tokens[-1][0]) >= 4 for line in row_candidates)
+    if status_rows < 3:
+        return None, set()
+
+    first_row = row_candidates[0]
+    preceding = [line for line in lines if line.layout_bbox["y"] < first_row.layout_bbox["y"] and first_row.layout_bbox["y"] - line.layout_bbox["y"] <= median_height * 3.0]
+    header = max(preceding, key=lambda line: line.layout_bbox["y"], default=None)
+    headers = _table_header_groups(header) if header else []
+    if len(headers) < 3:
+        return None, set()
+
+    table_lines = [line for line in lines if first_row.layout_bbox["y"] - line.layout_bbox["y"] <= median_height * 3.0 and line.layout_bbox["y"] <= row_candidates[-1].layout_bbox["y"] + median_height * 1.5]
+    table_left = min(line.layout_bbox["x"] for line in row_candidates)
+    table_right = max(line.layout_bbox["x"] + line.layout_bbox["width"] for line in row_candidates)
+    table_keys = {line.line_id for line in table_lines if line.layout_bbox["x"] <= table_right and line.layout_bbox["x"] + line.layout_bbox["width"] >= table_left}
+    table_keys.update(line.line_id for line in row_candidates)
+
+    def row_cells(line: _OCRLayoutLine) -> list[dict[str, Any]]:
+        tokens = list(line.tokens)
+        credits_index = max((index for index, token in enumerate(tokens[1:], start=1) if re.search(r"\d", token[0]) and token[2]["x"] > table_left + (table_right - table_left) * 0.58), default=-1)
+        has_status_tail = sum(character.isalpha() for character in tokens[-1][0]) >= 4
+        if credits_index <= 1:
+            if has_status_tail:
+                credits_index = len(tokens) - 1
+                status_index = credits_index
+            else:
+                credits_index = len(tokens)
+                status_index = credits_index
+        else:
+            status_index = credits_index + 1
+        cells = [tokens[0:1], tokens[1:credits_index], tokens[credits_index:status_index], tokens[status_index:]]
+        result: list[dict[str, Any]] = []
+        for cell in cells:
+            if not cell:
+                result.append({"text": "", "bbox": None, "rowspan": 1, "colspan": 1})
+            else:
+                result.append({"text": " ".join(token[0] for token in cell), "bbox": _bbox_union([token[1] for token in cell]), "rowspan": 1, "colspan": 1})
+        return result
+
+    rows = [row_cells(line) for line in row_candidates]
+    if any(len(row) != 4 or not row[1]["text"] for row in rows):
+        return None, set()
+    original_boxes = [line.source_bbox for line in table_lines]
+    layout_boxes = [line.layout_bbox for line in table_lines]
+    table = StructuredElement(
+        element_id=f"ocr-table-{page_result.page_index}-0",
+        type=StructuredElementType.TABLE,
+        page_index=page_result.page_index,
+        text="\n".join(" | ".join(cell["text"] for cell in row) for row in rows),
+        bbox=_bbox_union(original_boxes),
+        source="tesseract_ocr_structure",
+        confidence=0.78,
+        data={"headers": headers, "rows": rows, "row_count": len(rows), "column_count": 4, "reconstruction": "simple-aligned-ocr-table-v1", "layout_bbox": _bbox_union(layout_boxes)},
+    )
+    return table, table_keys
+
+
+def _ocr_structured_elements(page_result: PageResult) -> list[StructuredElement]:
+    lines = _ocr_layout_lines(page_result)
+    if not lines:
+        return _ocr_elements(page_result)
+    page_width, page_height = _layout_dimensions(page_result)
+    median_height = _median_line_height(lines)
+    heading_levels = {line.line_id: _ocr_heading_level(line, index, lines, page_width, page_height, median_height) for index, line in enumerate(lines)}
+    table, table_line_ids = _simple_ocr_table(lines, page_result, median_height)
+    elements: list[StructuredElement] = []
+    current: list[_OCRLayoutLine] = []
+
+    def flush_paragraph() -> None:
+        if not current:
+            return
+        elements.append(StructuredElement(
+            element_id=f"ocr-paragraph-{page_result.page_index}-{len(elements)}",
+            type=StructuredElementType.PARAGRAPH,
+            page_index=page_result.page_index,
+            text=" ".join(line.text for line in current),
+            bbox=_bbox_union([line.source_bbox for line in current]),
+            source="tesseract_ocr_structure",
+            confidence=0.72,
+            data={"line_ids": [line.line_id for line in current], "layout_geometry_available": True, "layout_bbox": _bbox_union([line.layout_bbox for line in current])},
+        ))
+        current.clear()
+
+    def compatible(previous: _OCRLayoutLine, line: _OCRLayoutLine) -> bool:
+        previous_box, box = previous.layout_bbox, line.layout_bbox
+        previous_right = previous_box["x"] + previous_box["width"]
+        right = box["x"] + box["width"]
+        overlap = max(0.0, min(previous_right, right) - max(previous_box["x"], box["x"]))
+        min_width = max(1.0, min(previous_box["width"], box["width"]))
+        return abs(previous_box["x"] - box["x"]) <= max(12.0, page_width * 0.04) or overlap / min_width >= 0.35
+
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        if line.line_id in table_line_ids:
+            flush_paragraph()
+            index += 1
+            continue
+        heading_level = heading_levels.get(line.line_id)
+        if heading_level is not None:
+            flush_paragraph()
+            elements.append(StructuredElement(
+                element_id=f"ocr-heading-{page_result.page_index}-{len(elements)}",
+                type=StructuredElementType.HEADING,
+                page_index=page_result.page_index,
+                text=line.text,
+                bbox=line.source_bbox,
+                source="tesseract_ocr_structure",
+                confidence=0.80,
+                level=heading_level,
+                data={"line_ids": [line.line_id], "layout_bbox": line.layout_bbox},
+            ))
+            index += 1
+            continue
+        is_list, ordered, list_text = _is_list_line(line.text)
+        if is_list:
+            flush_paragraph()
+            list_lines = [line]
+            list_values = [(ordered, list_text)]
+            while index + 1 < len(lines):
+                next_line = lines[index + 1]
+                next_is_list, next_ordered, next_text = _is_list_line(next_line.text)
+                if not next_is_list or next_ordered != ordered or _line_gap(list_lines[-1], next_line) > median_height * 2.5:
+                    break
+                list_lines.append(next_line)
+                list_values.append((next_ordered, next_text))
+                index += 1
+            elements.append(StructuredElement(
+                element_id=f"ocr-list-{page_result.page_index}-{len(elements)}",
+                type=StructuredElementType.LIST,
+                page_index=page_result.page_index,
+                text="\n".join(value[1] for value in list_values),
+                bbox=_bbox_union([item.source_bbox for item in list_lines]),
+                source="tesseract_ocr_structure",
+                confidence=0.76,
+                ordered=ordered,
+                data={"items": [{"item_index": item_index, "text": value[1], "level": 0, "marker": f"{item_index + 1}." if ordered else "-"} for item_index, value in enumerate(list_values)]},
+            ))
+            index += 1
+            continue
+        if current and (_line_gap(current[-1], line) > median_height * 1.9 or not compatible(current[-1], line)):
+            flush_paragraph()
+        current.append(line)
+        index += 1
+    flush_paragraph()
+    if table is not None:
+        elements.append(table)
+    return sorted(elements, key=_element_sort_key)
 
 
 def _table_elements(pdf_page: Any, page_index: int) -> list[StructuredElement]:
@@ -485,13 +831,18 @@ class StructuredDocumentProcessor:
                         tables = _table_elements(plumber_doc.pages[page_index], page_index)
                         table_boxes = [table.bbox for table in tables]
                         native = [element for element in native if not any(_overlaps(element.bbox, box) for box in table_boxes)]
-                    ocr = _ocr_elements(ocr_page)
+                    ocr = _ocr_structured_elements(ocr_page)
                     if classification == PageContentClassification.TEXT_NATIVE.value or ocr_page.processing_source is PageProcessingSource.NATIVE_EXTRACTION:
                         elements = native + tables
                         processing_source = "NATIVE_EXTRACTION"
                     elif classification == PageContentClassification.MIXED.value:
-                        surviving_ocr = [element for element in ocr if not any(_overlaps(element.bbox, native_element.bbox) for native_element in native)]
-                        elements = native + tables + surviving_ocr
+                        # Pages carrying an OCR text layer are classified as
+                        # MIXED, but their text layer is not necessarily
+                        # trustworthy native authoring text.  Prefer the
+                        # rendered OCR line structure here; otherwise the
+                        # same page is duplicated and every OCR line can be
+                        # mistaken for a large-font native heading.
+                        elements = ocr + tables
                         processing_source = "HYBRID"
                         warnings.append(f"MIXED_PAGE_RECONCILED:{page_index}")
                     else:
@@ -507,13 +858,14 @@ class StructuredDocumentProcessor:
                         page_caps.add(ResultCapability.LINE_GEOMETRY.value)
                     if ocr_page.tokens:
                         page_caps.add(ResultCapability.WORD_GEOMETRY.value)
-                    if tables:
+                    table_elements = [element for element in elements if element.type is StructuredElementType.TABLE]
+                    if table_elements:
                         page_caps.add("TABLES")
                     if any(element.type is StructuredElementType.HEADING for element in elements):
                         page_caps.add("HEADINGS")
                     if any(element.type is StructuredElementType.LIST for element in elements):
                         page_caps.add("LISTS")
-                    if classification in {PageContentClassification.IMAGE_SCAN.value, PageContentClassification.MIXED.value} and not tables:
+                    if classification in {PageContentClassification.IMAGE_SCAN.value, PageContentClassification.MIXED.value} and not table_elements:
                         warnings.append(f"TABLE_STRUCTURE_UNAVAILABLE:{page_index}")
                     page_warnings = tuple(warning for warning in warnings if warning.endswith(f":{page_index}"))
                     reading_order = tuple(element.element_id for element in elements)

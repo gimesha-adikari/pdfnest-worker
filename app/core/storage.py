@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import mimetypes
 import os
+import tempfile
 from functools import lru_cache
 from io import BytesIO
 from typing import BinaryIO, Iterator
@@ -16,7 +17,7 @@ from dotenv import load_dotenv
 # Dramatiq workers run outside FastAPI's startup path and need the same environment.
 load_dotenv()
 
-from app.core.config import settings
+from app.core.config import remote_storage_enabled, settings
 
 logger = logging.getLogger(__name__)
 
@@ -103,8 +104,9 @@ def get_r2_client():
         config=Config(
             signature_version="s3v4",
             s3={"addressing_style": "path"},
-            connect_timeout=2,
-            read_timeout=2,
+            connect_timeout=settings.r2_connect_timeout_seconds,
+            read_timeout=settings.r2_read_timeout_seconds,
+            retries={"mode": "standard", "max_attempts": settings.r2_max_attempts},
         ),
     )
 
@@ -117,10 +119,15 @@ def build_key(prefix: str, *, suffix: str = "") -> str:
 
     return f"{clean_prefix}/{uuid4().hex}{clean_suffix}"
 
-LOCAL_STORAGE_DIR = os.environ.get("LOCAL_STORAGE_DIR", "/tmp/pdfnest-storage")
+LOCAL_STORAGE_DEFAULT = os.path.join(tempfile.gettempdir(), "pdfnest-storage")
+
+def get_local_storage_dir() -> str:
+    """Return the shared local object root used by the Go backend."""
+    configured = os.environ.get("LOCAL_STORAGE_DIR", "").strip()
+    return os.path.abspath(configured or LOCAL_STORAGE_DEFAULT)
 
 def _get_local_file_path(key: str, for_write: bool = False) -> str:
-    primary = os.path.join(LOCAL_STORAGE_DIR, key.lstrip("/"))
+    primary = os.path.join(get_local_storage_dir(), key.lstrip("/"))
     if for_write:
         os.makedirs(os.path.dirname(primary), exist_ok=True)
         return primary
@@ -139,7 +146,7 @@ def upload_fileobj(fileobj: BinaryIO, key: str, *, content_type: str | None = No
     data = fileobj.read()
     encrypted_data = encrypt_data(data)
 
-    if not settings.r2_bucket:
+    if not remote_storage_enabled():
         local_path = _get_local_file_path(key, for_write=True)
         with open(local_path, "wb") as f:
             f.write(encrypted_data)
@@ -187,7 +194,7 @@ def delete_object(key: str) -> None:
     """Delete a server-created object from the configured worker storage."""
     if not key or key.startswith("/") or ".." in key.split("/"):
         raise ValueError("invalid storage key")
-    if not settings.r2_bucket:
+    if not remote_storage_enabled():
         local_path = _get_local_file_path(key)
         try:
             os.remove(local_path)
@@ -197,7 +204,7 @@ def delete_object(key: str) -> None:
     get_r2_client().delete_object(Bucket=settings.r2_bucket, Key=key)
 
 def download_to_path(key: str, path: str) -> str:
-    if not settings.r2_bucket:
+    if not remote_storage_enabled():
         local_path = _get_local_file_path(key)
         with open(local_path, "rb") as f:
             encrypted_data = f.read()
@@ -234,7 +241,7 @@ def download_to_path(key: str, path: str) -> str:
 def stream_object(key: str, *, chunk_size: int = 1024 * 1024) -> tuple[Iterator[bytes], str]:
     import tempfile
 
-    if not settings.r2_bucket:
+    if not remote_storage_enabled():
         local_path = _get_local_file_path(key)
         with open(local_path, "rb") as f:
             encrypted_data = f.read()

@@ -40,7 +40,7 @@ ALLOWED_ORIGINS = [
 
 
 from app.core.janitor import start_worker_janitor
-from app.core.config import settings, validate_runtime_config
+from app.core.config import remote_storage_enabled, settings, validate_runtime_config
 from app.api.tools.render.persistent_pool import (
     start_persistent_render_pool,
     shutdown_persistent_render_pool,
@@ -52,6 +52,10 @@ validate_runtime_config()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print(f"[{APP_NAME}] starting in {APP_ENV} mode")
+    if not remote_storage_enabled():
+        local_root = get_local_storage_dir()
+        os.makedirs(local_root, exist_ok=True)
+        print(f"[{APP_NAME}] local storage enabled at {local_root}")
     start_worker_janitor()
     if settings.enable_persistent_render_pool:
         print(f"[{APP_NAME}] initializing persistent render worker pool")
@@ -94,7 +98,7 @@ from fastapi.responses import JSONResponse
 import shutil
 import redis
 
-from app.core.storage import get_r2_client
+from app.core.storage import get_local_storage_dir, get_r2_client
 
 logger = logging.getLogger(__name__)
 
@@ -124,7 +128,8 @@ async def ready() -> JSONResponse:
         redis_healthy = False
         actor_healthy = False if settings.actor_heartbeat_required else True
 
-    if settings.actor_heartbeat_required:
+    remote_required = remote_storage_enabled()
+    if remote_required:
         try:
             get_r2_client().head_bucket(Bucket=settings.r2_bucket)
         except Exception as exc:
@@ -141,7 +146,7 @@ async def ready() -> JSONResponse:
     }
 
     engines_healthy = all(binaries.values())
-    if not redis_healthy or not actor_healthy or not engines_healthy or (settings.actor_heartbeat_required and not r2_healthy):
+    if not redis_healthy or not actor_healthy or not engines_healthy or (remote_required and not r2_healthy):
         if not redis_healthy:
             logger.warning("[WORKER READINESS] Redis is not ready")
         if not actor_healthy:
