@@ -75,6 +75,71 @@ class OCRV2WorkerResponse(BaseModel):
     error: OCRV2ErrorResponse | None = None
 
 
+class OCRV2MarkupPreviewRequest(BaseModel):
+    """Request for a temporary, authenticated markup-selection projection."""
+
+    schema_version: str = Field(default="ocr_v2_markup_preview_request.v1", pattern=r"^ocr_v2_markup_preview_request\.v1$")
+    request_id: str = Field(min_length=1, max_length=128)
+    profile: OCRV2Profile = OCRV2Profile.MARKUP_V2
+    language: str = Field(default="eng", max_length=128)
+    language_mode: OCRLanguageMode = OCRLanguageMode.EXPLICIT
+    languages: list[str] = Field(default_factory=list, max_length=16)
+    language_usage: dict[str, float] = Field(default_factory=dict, max_length=32)
+    routing_policy: OCRV2RoutingPolicy = OCRV2RoutingPolicy.FAST
+
+    @model_validator(mode="after")
+    def normalize_language_policy(self) -> "OCRV2MarkupPreviewRequest":
+        if self.profile is not OCRV2Profile.MARKUP_V2:
+            raise ValueError("markup preview requires the MARKUP_V2 profile")
+        policy = OCRLanguagePolicy.from_request(
+            self.language,
+            mode=self.language_mode,
+            languages=self.languages or None,
+        )
+        self.language = "auto" if policy.mode is OCRLanguageMode.AUTO else policy.engine_expression
+        self.languages = list(policy.languages)
+        return self
+
+
+class OCRV2MarkupPreviewWordResponse(BaseModel):
+    id: str
+    text: str
+    x: float
+    y: float
+    width: float
+    height: float
+    order: int
+    confidence: float | None = None
+
+
+class OCRV2MarkupPreviewPageResponse(BaseModel):
+    page_index: int
+    page_number: int
+    page_id: str
+    width: float
+    height: float
+    rotation: int
+    coordinate_space: str
+    crop_box: list[float] | None = None
+    classification: str
+    kind: str
+    selection_mode: str
+    status: str
+    has_selectable_text: bool
+    word_count: int
+    reading_order: list[str] = Field(default_factory=list)
+    words: list[OCRV2MarkupPreviewWordResponse] = Field(default_factory=list)
+    language: dict[str, Any] = Field(default_factory=dict)
+
+
+class OCRV2MarkupPreviewResponse(BaseModel):
+    schema_version: str = "ocr_v2_markup_preview.v1"
+    profile: str = "MARKUP_V2"
+    status: str
+    page_count: int
+    pages: list[OCRV2MarkupPreviewPageResponse]
+
+
 class OCRV2JobSubmitRequest(BaseModel):
     request_id: str = Field(min_length=1, max_length=128)
     profile: OCRV2Profile = OCRV2Profile.OCR_TEXT_V2

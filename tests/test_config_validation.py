@@ -36,3 +36,53 @@ def test_r2_client_defaults_are_bounded():
 def test_local_storage_default_matches_backend_contract(monkeypatch):
     monkeypatch.delenv("LOCAL_STORAGE_DIR", raising=False)
     assert get_local_storage_dir().endswith("/pdfnest-storage")
+
+
+def test_runtime_config_rejects_invalid_searchable_pdf_engine_selector(monkeypatch):
+    monkeypatch.delenv("OCR_TEXT_ENGINE", raising=False)
+    monkeypatch.setenv("SEARCHABLE_PDF_ENGINE", "not-an-engine")
+
+    with pytest.raises(ValueError, match="SEARCHABLE_PDF_ENGINE"):
+        validate_runtime_config()
+
+
+def test_runtime_config_rejects_invalid_document_extraction_engine_selector(monkeypatch):
+    monkeypatch.delenv("OCR_TEXT_ENGINE", raising=False)
+    monkeypatch.delenv("SEARCHABLE_PDF_ENGINE", raising=False)
+    monkeypatch.setenv("DOCUMENT_EXTRACTION_ENGINE", "not-an-engine")
+
+    with pytest.raises(ValueError, match="DOCUMENT_EXTRACTION_ENGINE"):
+        validate_runtime_config()
+
+
+def test_runtime_config_rejects_invalid_pdf_to_markdown_engine_selector(monkeypatch):
+    monkeypatch.delenv("OCR_TEXT_ENGINE", raising=False)
+    monkeypatch.delenv("SEARCHABLE_PDF_ENGINE", raising=False)
+    monkeypatch.delenv("DOCUMENT_EXTRACTION_ENGINE", raising=False)
+    monkeypatch.setenv("PDF_TO_MARKDOWN_ENGINE", "not-an-engine")
+
+    with pytest.raises(ValueError, match="PDF_TO_MARKDOWN_ENGINE"):
+        validate_runtime_config()
+
+
+def test_runtime_config_rejects_invalid_ocr_markup_engine_selector(monkeypatch):
+    monkeypatch.delenv("OCR_TEXT_ENGINE", raising=False)
+    monkeypatch.delenv("SEARCHABLE_PDF_ENGINE", raising=False)
+    monkeypatch.delenv("DOCUMENT_EXTRACTION_ENGINE", raising=False)
+    monkeypatch.delenv("PDF_TO_MARKDOWN_ENGINE", raising=False)
+    monkeypatch.setenv("OCR_MARKUP_ENGINE", "not-an-engine")
+
+    with pytest.raises(ValueError, match="OCR_MARKUP_ENGINE"):
+        validate_runtime_config()
+
+
+def test_runtime_config_rejects_invalid_editor_ocr_engine_selector(monkeypatch):
+    monkeypatch.delenv("OCR_TEXT_ENGINE", raising=False)
+    monkeypatch.delenv("SEARCHABLE_PDF_ENGINE", raising=False)
+    monkeypatch.delenv("DOCUMENT_EXTRACTION_ENGINE", raising=False)
+    monkeypatch.delenv("PDF_TO_MARKDOWN_ENGINE", raising=False)
+    monkeypatch.delenv("OCR_MARKUP_ENGINE", raising=False)
+    monkeypatch.setenv("EDITOR_OCR_ENGINE", "not-an-engine")
+
+    with pytest.raises(ValueError, match="EDITOR_OCR_ENGINE"):
+        validate_runtime_config()

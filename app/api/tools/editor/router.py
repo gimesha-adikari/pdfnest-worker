@@ -1,11 +1,17 @@
 import logging
 from pathlib import Path
+from typing import Literal
 
 from fastapi import APIRouter, HTTPException, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 
+from app.core.editor_ocr_engine import (
+    EDITOR_OCR_CONSUMER_GENERAL_EDITOR,
+    EDITOR_OCR_CONSUMER_LEGACY,
+    EDITOR_OCR_CONSUMER_STUDIO,
+)
 from app.core.storage import stream_object
 from app.jobs.actors import editor_compile_job, editor_extract_job
 from app.jobs.models import JobQueue, JobState, JobSubmissionResponse
@@ -20,6 +26,7 @@ class ExtractRequest(BaseModel):
     file_password: str | None = None
     source_name: str | None = None
     ocr_v2: bool = False
+    consumer: Literal["general_editor", "studio", "legacy"] = EDITOR_OCR_CONSUMER_LEGACY
 
 
 class CompileRequest(BaseModel):
@@ -41,7 +48,14 @@ async def extract_layout(payload: ExtractRequest) -> JobSubmissionResponse:
         payload=payload.model_dump(exclude_none=True),
     )
 
-    editor_extract_job.send(job.id, payload.source_key, payload.file_password, source_name, payload.ocr_v2)
+    editor_extract_job.send(
+        job.id,
+        payload.source_key,
+        payload.file_password,
+        source_name,
+        payload.ocr_v2,
+        payload.consumer,
+    )
     logger.info("Dispatched extract job %s for %s", job.id, source_name)
 
     return JobSubmissionResponse(

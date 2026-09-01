@@ -18,11 +18,24 @@ from fastapi.responses import JSONResponse
 
 from app.api.tools.ocr.languages import get_installed_tesseract_languages, language_name
 from app.api.tools.ocr.router import create_route_cancellation_checker
-from app.core.ocr_v2 import OCRV2Worker
 from app.core.ocr_v2.adapters import PPOCRv6MediumAdapter, TesseractAdapter
+from app.core.ocr_v2.errors import (
+    EngineUnavailableError,
+    LanguageDetectionUncertainError,
+    OCRTimeoutError,
+    WordGeometryUnavailableError,
+)
 from app.core.ocr_v2.language_policy import OCRLanguageMode, OCRLanguagePolicy
-from app.core.ocr_v2.routing import RoutePolicy
-from app.core.ocr_v2.validation import OCRProfile
+from app.core.ocr_markup_engine import (
+    OcrMarkupEngineConfigurationError,
+    OcrMarkupEngineUnavailableError,
+    execute_ocr_markup_preview,
+)
+from app.core.ocr_text_engine import (
+    OCRTextEngineConfigurationError,
+    OCRTextEngineUnavailableError,
+    execute_ocr_text,
+)
 from app.jobs.cancellation import JobCancelledException
 
 from .schemas import (
@@ -30,6 +43,8 @@ from .schemas import (
     OCRV2PageResponse,
     OCRV2Profile,
     OCRV2RoutingPolicy,
+    OCRV2MarkupPreviewRequest,
+    OCRV2MarkupPreviewResponse,
     OCRV2WorkerRequest,
     OCRV2WorkerResponse,
 )
@@ -50,14 +65,22 @@ def _request_model(request_id: str, profile: str, language: str | None, routing_
         raise HTTPException(status_code=422, detail={"code": "UNSUPPORTED_LANGUAGE", "message": "Choose one or more installed OCR languages."}) from exc
 
 
-def _route_policy(policy: OCRV2RoutingPolicy) -> RoutePolicy:
-    if policy is OCRV2RoutingPolicy.FAST:
-        return RoutePolicy(preferred_engine="tesseract_v2", fallback_engine="tesseract_v2")
-    if policy is OCRV2RoutingPolicy.LANGUAGE_FALLBACK:
-        return RoutePolicy(preferred_engine="tesseract_v2", fallback_engine="tesseract_v2")
-    # AUTO, QUALITY, and GEOMETRY prefer PP-OCRv6 when the real optional
-    # runtime is available and explicitly fall back to Tesseract otherwise.
-    return RoutePolicy(preferred_engine="ppocrv6_medium_v2", fallback_engine="tesseract_v2")
+def _markup_preview_request_model(request_id: str, profile: str, language: str | None, routing_policy: str, language_mode: str = "EXPLICIT", languages: list[str] | None = None) -> OCRV2MarkupPreviewRequest:
+    if profile != OCRV2Profile.MARKUP_V2.value:
+        raise HTTPException(status_code=422, detail={"code": "INVALID_INPUT", "message": "This endpoint only accepts MARKUP_V2"})
+    if not language or not language.strip():
+        raise HTTPException(status_code=422, detail={"code": "INVALID_INPUT", "message": "An OCR language is required"})
+    try:
+        return OCRV2MarkupPreviewRequest(
+            request_id=request_id,
+            profile=profile,
+            language=language,
+            language_mode=language_mode,
+            languages=languages or [],
+            routing_policy=routing_policy,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail={"code": "UNSUPPORTED_LANGUAGE", "message": "Choose one or more installed OCR languages."}) from exc
 
 
 def _max_bytes() -> int:
@@ -222,11 +245,14 @@ async def ocr_text_v2(
             return JSONResponse(status_code=422, content={"code": "UNSUPPORTED_LANGUAGE", "message": "The requested OCR language is not installed or supported by the available worker engines."})
         if contract.routing_policy in (OCRV2RoutingPolicy.AUTO, OCRV2RoutingPolicy.QUALITY, OCRV2RoutingPolicy.GEOMETRY) and not pp_available:
             warnings.append("ENGINE_FALLBACK:PP_OCR_UNAVAILABLE_TO_TESSERACT")
-        worker = OCRV2Worker(route_policy=_route_policy(contract.routing_policy))
         try:
-            result = await _run_worker(worker, path, contract, check_cancel)
+            result = await _run_worker(path, contract, check_cancel)
         except JobCancelledException as exc:
             raise HTTPException(status_code=499, detail={"code": "CANCELLED", "message": "OCR V2 request was cancelled"}) from exc
+        except OCRTextEngineConfigurationError as exc:
+            raise HTTPException(status_code=500, detail={"code": "INVALID_CONFIGURATION", "message": "OCR Text V2 engine configuration is invalid"}) from exc
+        except OCRTextEngineUnavailableError:
+            return JSONResponse(status_code=503, content={"code": "ENGINE_UNAVAILABLE", "message": "OCR Text V2 engine is unavailable"})
         response = _response(result, contract, warnings)
         if response.status == "FAILED":
             return JSONResponse(status_code=_failure_http_status(response.error.code if response.error else "ENGINE_FAILURE"), content=response.model_dump())
@@ -239,10 +265,79 @@ async def ocr_text_v2(
             pass
 
 
-async def _run_worker(worker: OCRV2Worker, path: str, contract: OCRV2WorkerRequest, check_cancel: object) -> object:
+@router.post("/markup/preview", response_model=OCRV2MarkupPreviewResponse)
+async def markup_preview(
+    request: Request,
+    file: UploadFile = File(...),
+    request_id: str = Form(...),
+    profile: str = Form("MARKUP_V2"),
+    language: str | None = Form(None),
+    language_mode: str = Form("EXPLICIT"),
+    languages: list[str] | None = Form(None),
+    routing_policy: str = Form("FAST"),
+) -> OCRV2MarkupPreviewResponse:
+    if not _REQUEST_ID_RE.fullmatch(request_id):
+        raise HTTPException(status_code=422, detail={"code": "INVALID_INPUT", "message": "Invalid request identifier"})
+    try:
+        contract = _markup_preview_request_model(request_id, profile, language, routing_policy, language_mode, languages)
+    except HTTPException as exc:
+        if isinstance(exc.detail, dict) and exc.detail.get("code") == "UNSUPPORTED_LANGUAGE":
+            return JSONResponse(status_code=exc.status_code, content=exc.detail)
+        raise
+    path = await _stage_pdf(file)
+    check_cancel, cleanup_cancel = create_route_cancellation_checker(request)
+    try:
+        result = await _run_markup_preview(path, contract, check_cancel)
+        return OCRV2MarkupPreviewResponse(**result)
+    except JobCancelledException as exc:
+        raise HTTPException(status_code=499, detail={"code": "CANCELLED", "message": "Selectable text preparation was cancelled"}) from exc
+    except OcrMarkupEngineConfigurationError as exc:
+        raise HTTPException(status_code=500, detail={"code": "INVALID_CONFIGURATION", "message": "Markup preview configuration is invalid"}) from exc
+    except (OcrMarkupEngineUnavailableError, EngineUnavailableError):
+        return JSONResponse(status_code=503, content={"code": "ENGINE_UNAVAILABLE", "message": "Selectable text is temporarily unavailable"})
+    except LanguageDetectionUncertainError:
+        return JSONResponse(status_code=422, content={"code": "LANGUAGE_DETECTION_UNCERTAIN", "message": "The document language could not be determined reliably"})
+    except OCRTimeoutError:
+        return JSONResponse(status_code=504, content={"code": "TIMEOUT", "message": "Preparing selectable text took too long"})
+    except WordGeometryUnavailableError:
+        return JSONResponse(status_code=422, content={"code": "WORD_GEOMETRY_NOT_AVAILABLE", "message": "Selectable text is not available for this document"})
+    except Exception:
+        return JSONResponse(status_code=502, content={"code": "ENGINE_FAILURE", "message": "Selectable text could not be prepared"})
+    finally:
+        cleanup_cancel()
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+async def _run_worker(path: str, contract: OCRV2WorkerRequest, check_cancel: object) -> object:
     from starlette.concurrency import run_in_threadpool
 
-    return await run_in_threadpool(worker.process_document, path, language=contract.language, language_mode=contract.language_mode.value, languages=contract.languages, profile=OCRProfile.OCR_TEXT_V2, cancellation_check=check_cancel)
+    return await run_in_threadpool(
+        execute_ocr_text,
+        path,
+        language=contract.language,
+        language_mode=contract.language_mode.value,
+        languages=contract.languages,
+        language_usage=contract.language_usage,
+        routing_policy=contract.routing_policy.value,
+        cancellation_check=check_cancel,
+    )
+
+
+async def _run_markup_preview(path: str, contract: OCRV2MarkupPreviewRequest, check_cancel: object) -> object:
+    from starlette.concurrency import run_in_threadpool
+
+    return await run_in_threadpool(
+        execute_ocr_markup_preview,
+        path,
+        language=contract.language,
+        language_mode=contract.language_mode.value,
+        languages=contract.languages,
+        language_usage=contract.language_usage,
+        cancellation_check=check_cancel,
+    )
 
 
 def _failure_http_status(code: str) -> int:

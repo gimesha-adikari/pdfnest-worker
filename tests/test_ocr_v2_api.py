@@ -118,6 +118,17 @@ def test_ocr_v2_valid_authenticated_native_flow() -> None:
     assert payload["pages"][0]["source"] == "pymupdf_native_extractor"
 
 
+def test_ocr_v2_sdk_engine_authenticated_native_flow(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OCR_TEXT_ENGINE", "sdk")
+    headers = _headers("POST", "/internal/ocr/v2/text")
+    response = _post("/internal/ocr/v2/text", headers=headers, files={"file": ("native.pdf", _native_pdf(), "application/pdf")}, data={"request_id": "sdk-native-flow", "language": "eng", "routing_policy": "AUTO"})
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "SUCCEEDED"
+    assert "Native OCR V2 boundary" in payload["text"]
+    assert payload["pages"][0]["source"] == "pymupdf_native_extractor"
+
+
 def test_ocr_v2_quality_policy_reports_explicit_pp_fallback() -> None:
     headers = _headers("POST", "/internal/ocr/v2/text")
     response = _post("/internal/ocr/v2/text", headers=headers, files={"file": ("scan.pdf", _scanned_pdf(), "application/pdf")}, data={"request_id": "fallback-flow", "language": "eng", "routing_policy": "QUALITY"})

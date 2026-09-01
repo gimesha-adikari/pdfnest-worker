@@ -20,6 +20,36 @@ from app.core.config import validate_runtime_config
 from app.core.ocr_v2.diagnostics import emit_searchable_diagnostic, retain_failed_render_artifacts, safe_exception_message
 from app.core.ocr_v2.errors import EngineUnavailableError, OCRTimeoutError, RenderingNotEligibleError
 from app.core.ocr_v2.errors import MarkupError, TextNotFoundError, WordGeometryUnavailableError, AnnotationWriteError
+from app.core.ocr_text_engine import (
+    OCRTextEngineConfigurationError,
+    OCRTextEngineUnavailableError,
+    execute_ocr_text,
+)
+from app.core.searchable_pdf_engine import (
+    SearchablePdfEngineConfigurationError,
+    SearchablePdfEngineUnavailableError,
+    execute_searchable_pdf,
+)
+from app.core.document_extraction_engine import (
+    DocumentExtractionEngineConfigurationError,
+    DocumentExtractionEngineUnavailableError,
+    execute_document_extraction,
+)
+from app.core.pdf_to_markdown_engine import (
+    PdfToMarkdownEngineConfigurationError,
+    PdfToMarkdownEngineUnavailableError,
+    execute_pdf_to_markdown,
+)
+from app.core.ocr_markup_engine import (
+    OcrMarkupEngineConfigurationError,
+    OcrMarkupEngineUnavailableError,
+    execute_ocr_markup,
+)
+from app.core.editor_ocr_engine import (
+    EDITOR_OCR_CONSUMER_GENERAL_EDITOR,
+    EditorOcrEngineConfigurationError,
+    execute_editor_ocr,
+)
 from app.core.storage import build_key, delete_object, download_to_path, upload_path, upload_text
 from app.core.actor_heartbeat import start_actor_heartbeat
 from app.jobs.cancellation import JobCancelledException, check_cancellation
@@ -216,11 +246,9 @@ def ocr_v2_job(
         # Importing the API projection here keeps the actor dependent on the
         # same product-safe response mapper without making the job module part
         # of the FastAPI startup import cycle.
-        from app.api.ocr_v2.router import _response, _route_policy
+        from app.api.ocr_v2.router import _response
         from app.api.ocr_v2.schemas import OCRV2WorkerRequest
-        from app.core.ocr_v2 import OCRV2Worker
         from app.core.ocr_v2.adapters import PPOCRv6MediumAdapter
-        from app.core.ocr_v2.validation import OCRProfile
 
         contract = OCRV2WorkerRequest(
             request_id=job_id,
@@ -230,8 +258,6 @@ def ocr_v2_job(
         )
         if contract.routing_policy in {"AUTO", "QUALITY", "GEOMETRY"} and not PPOCRv6MediumAdapter().availability().available:
             warnings.append("ENGINE_FALLBACK:PP_OCR_UNAVAILABLE_TO_TESSERACT")
-        worker = OCRV2Worker(route_policy=_route_policy(contract.routing_policy))
-
         def on_page(done: int, total: int, page: object) -> None:
             check_cancellation(job_id)
             if getattr(getattr(page, "status", None), "value", "") == "FAILED":
@@ -252,10 +278,10 @@ def ocr_v2_job(
                 message=f"OCR V2 processing page {done}/{total}",
             )
 
-        result = worker.process_document(
+        result = execute_ocr_text(
             input_path,
             language=contract.language,
-            profile=OCRProfile.OCR_TEXT_V2,
+            routing_policy=contract.routing_policy.value,
             cancellation_check=lambda: check_cancellation(job_id),
             page_progress_callback=on_page,
         )
@@ -304,6 +330,24 @@ def ocr_v2_job(
             current_page=None,
             error_code="CANCELLED",
             message="OCR V2 job cancelled",
+        )
+    except OCRTextEngineConfigurationError:
+        update_job(
+            job_id,
+            status=JobState.failed,
+            finished_at=datetime.now(timezone.utc),
+            error="OCR Text V2 engine configuration is invalid.",
+            error_code="INVALID_CONFIGURATION",
+            message="OCR Text V2 job configuration is invalid",
+        )
+    except OCRTextEngineUnavailableError:
+        update_job(
+            job_id,
+            status=JobState.failed,
+            finished_at=datetime.now(timezone.utc),
+            error="OCR Text V2 engine is unavailable.",
+            error_code="ENGINE_UNAVAILABLE",
+            message="OCR Text V2 engine is unavailable",
         )
     except Exception as exc:
         logger.exception("OCR V2 job %s failed", job_id)
@@ -358,6 +402,7 @@ def _run_searchable_pdf_job(
     forensic_metadata: list[dict[str, Any]] = []
     acquired = False
     claimed = False
+    stage = "JOB_START"
 
     try:
         check_cancellation(job_id)
@@ -379,11 +424,7 @@ def _run_searchable_pdf_job(
             download_to_path(str(item["source_key"]), local_path)
             local_inputs.append(local_path)
 
-        from app.core.ocr_v2 import OCRV2Worker
         from app.core.ocr_v2.image_pages import build_image_source_pdf
-        from app.core.ocr_v2.renderers.searchable_pdf import SearchablePdfRenderer
-        from app.core.ocr_v2.routing import RoutePolicy
-        from app.core.ocr_v2.validation import OCRProfile
 
         stage = "IMAGE_NORMALIZATION"
         normalized_images = build_image_source_pdf(local_inputs, source_pdf)
@@ -403,10 +444,6 @@ def _run_searchable_pdf_job(
             }
             forensic_metadata.append(metadata)
             emit_searchable_diagnostic(event="SOURCE_PAGE_METADATA", job_id=job_id, substage="PDF_RENDER_SOURCE_SETUP", fields=metadata)
-        # Searchable PDF requires genuine word geometry; PP-OCR's current
-        # line-level contract is intentionally not eligible for this profile.
-        worker = OCRV2Worker(route_policy=RoutePolicy(preferred_engine="tesseract_v2", fallback_engine="tesseract_v2"))
-
         def on_page(done: int, total: int, page: object) -> None:
             check_cancellation(job_id)
             status = getattr(getattr(page, "status", None), "value", "FAILED")
@@ -415,39 +452,53 @@ def _run_searchable_pdf_job(
                 failed_pages.append(int(page.page_index))
             update_job(job_id, progress=int((done / max(1, total)) * 90), total_pages=total, completed_pages=done - len(failed_pages), failed_pages=failed_pages, current_page=page.page_index, page_statuses=page_statuses, message=f"Searchable PDF V2 processing page {done}/{total}")
 
+        def after_ocr(result: object) -> None:
+            nonlocal stage
+            check_cancellation(job_id)
+            for page in getattr(result, "pages", ()):
+                valid_word_count = sum(
+                    1
+                    for token in page.tokens
+                    if token.text.strip()
+                    and token.bbox.width > 0
+                    and token.bbox.height > 0
+                    and token.bbox.x >= 0
+                    and token.bbox.y >= 0
+                    and token.bbox.x1 <= page.geometry.width + 1e-6
+                    and token.bbox.y1 <= page.geometry.height + 1e-6
+                )
+                page_metadata = {
+                    "page_index": page.page_index,
+                    "ocr_token_count": len(page.tokens),
+                    "valid_word_token_count": valid_word_count,
+                    "reading_order_token_count": len(page.reading_order),
+                }
+                for source_metadata in forensic_metadata:
+                    if source_metadata["page_index"] == page.page_index:
+                        source_metadata.update(page_metadata)
+                        break
+                emit_searchable_diagnostic(event="OCR_PAGE_METADATA", job_id=job_id, substage="PDF_RENDER_PROFILE_CHECK", fields=page_metadata)
+            _raise_primary_page_failure(result)
+            stage = "PROFILE_VALIDATION"
+            validation = getattr(result, "validation", None)
+            if validation is None or not validation.valid:
+                issue_codes = ";".join(issue.code for issue in getattr(validation, "issues", ()))
+                raise ValueError(f"PROFILE_NOT_ELIGIBLE:{issue_codes}")
+            stage = "PDF_RENDER"
+
         stage = "OCR"
-        result = worker.process_document(source_pdf, language=language, language_mode=language_mode, languages=languages or [], language_usage=language_usage or {}, profile=OCRProfile.SEARCHABLE_PDF_V2, cancellation_check=lambda: check_cancellation(job_id), page_progress_callback=on_page)
-        check_cancellation(job_id)
-        for page in result.pages:
-            valid_word_count = sum(
-                1
-                for token in page.tokens
-                if token.text.strip()
-                and token.bbox.width > 0
-                and token.bbox.height > 0
-                and token.bbox.x >= 0
-                and token.bbox.y >= 0
-                and token.bbox.x1 <= page.geometry.width + 1e-6
-                and token.bbox.y1 <= page.geometry.height + 1e-6
-            )
-            page_metadata = {
-                "page_index": page.page_index,
-                "ocr_token_count": len(page.tokens),
-                "valid_word_token_count": valid_word_count,
-                "reading_order_token_count": len(page.reading_order),
-            }
-            for source_metadata in forensic_metadata:
-                if source_metadata["page_index"] == page.page_index:
-                    source_metadata.update(page_metadata)
-                    break
-            emit_searchable_diagnostic(event="OCR_PAGE_METADATA", job_id=job_id, substage="PDF_RENDER_PROFILE_CHECK", fields=page_metadata)
-        _raise_primary_page_failure(result)
-        stage = "PROFILE_VALIDATION"
-        if not result.validation.valid:
-            issue_codes = ";".join(issue.code for issue in result.validation.issues)
-            raise ValueError(f"PROFILE_NOT_ELIGIBLE:{issue_codes}")
-        stage = "PDF_RENDER"
-        SearchablePdfRenderer().render(source_pdf, result, output_pdf, job_id=job_id)
+        result = execute_searchable_pdf(
+            source_pdf,
+            output_pdf,
+            language=language,
+            language_mode=language_mode,
+            languages=languages or [],
+            language_usage=language_usage or {},
+            cancellation_check=lambda: check_cancellation(job_id),
+            page_progress_callback=on_page,
+            after_ocr=after_ocr,
+            diagnostic_job_id=job_id,
+        )
         check_cancellation(job_id)
         stage = "ARTIFACT_PERSISTENCE"
         upload_path(output_pdf, result_key, content_type="application/pdf")
@@ -455,6 +506,10 @@ def _run_searchable_pdf_job(
         update_job(job_id, status=JobState.succeeded, finished_at=datetime.now(timezone.utc), progress=100, total_pages=len(result.pages), completed_pages=len(result.pages), failed_pages=[], current_page=None, page_statuses={str(page.page_index): page.status.value for page in result.pages}, result={"artifact_key": result_key, "artifact_name": f"{Path(source_name or 'document').stem}-searchable.pdf", "artifact_content_type": "application/pdf", "artifact_size": size}, message="Searchable PDF V2 job completed")
     except JobCancelledException:
         update_job(job_id, status=JobState.cancelled, finished_at=datetime.now(timezone.utc), current_page=None, error_code="CANCELLED", message="Searchable PDF V2 job cancelled")
+    except SearchablePdfEngineConfigurationError:
+        update_job(job_id, status=JobState.failed, finished_at=datetime.now(timezone.utc), current_page=None, error="Searchable PDF engine configuration is invalid.", error_code="INVALID_CONFIGURATION", message="Searchable PDF job configuration is invalid")
+    except SearchablePdfEngineUnavailableError:
+        update_job(job_id, status=JobState.failed, finished_at=datetime.now(timezone.utc), current_page=None, error="Searchable PDF engine is unavailable.", error_code="ENGINE_UNAVAILABLE", message="Searchable PDF engine is unavailable")
     except Exception as exc:
         error_code = _searchable_failure_code(exc, stage)
         safe_message = _searchable_failure_message(error_code, stage)
@@ -530,6 +585,7 @@ def _run_structured_document_job(
     acquired = False
     claimed = False
     stage = "JOB_START"
+    markdown_text: str | None = None
     try:
         check_cancellation(job_id)
         if claim_job(job_id) is None:
@@ -542,8 +598,6 @@ def _run_structured_document_job(
         update_job(job_id, progress=0, current_page=None, message=f"{profile} job started")
         download_to_path(source_key, input_path)
         check_cancellation(job_id)
-        from app.core.ocr_v2.structured import StructuredDocumentProcessor, render_structured_markdown
-
         stage = "STRUCTURED_PROCESSING"
 
         def on_page(done: int, total: int, page: object) -> None:
@@ -560,19 +614,48 @@ def _run_structured_document_job(
                 message=f"{profile} processing page {done}/{total}",
             )
 
-        result = StructuredDocumentProcessor().process_document(
-            input_path,
-            language=language,
-            language_mode=language_mode,
-            languages=languages or [],
-            language_usage=language_usage or {},
-            routing_policy=routing_policy,
-            cancellation_check=lambda: check_cancellation(job_id),
-            page_progress_callback=on_page,
-        )
+        if profile == "DOCUMENT_EXTRACTION_V2":
+            result = execute_document_extraction(
+                input_path,
+                language=language,
+                language_mode=language_mode,
+                languages=languages or [],
+                language_usage=language_usage or {},
+                routing_policy=routing_policy,
+                cancellation_check=lambda: check_cancellation(job_id),
+                page_progress_callback=on_page,
+            )
+        elif profile == "PDF_MARKDOWN_V2":
+            markdown_execution = execute_pdf_to_markdown(
+                input_path,
+                language=language,
+                language_mode=language_mode,
+                languages=languages or [],
+                language_usage=language_usage or {},
+                routing_policy=routing_policy,
+                cancellation_check=lambda: check_cancellation(job_id),
+                page_progress_callback=on_page,
+            )
+            result = markdown_execution.structured_result
+            markdown_text = markdown_execution.markdown
+        else:
+            # This branch is retained for any future structured profile, and
+            # deliberately stays on the frozen internal processor.
+            from app.core.ocr_v2.structured import StructuredDocumentProcessor
+
+            result = StructuredDocumentProcessor().process_document(
+                input_path,
+                language=language,
+                language_mode=language_mode,
+                languages=languages or [],
+                language_usage=language_usage or {},
+                routing_policy=routing_policy,
+                cancellation_check=lambda: check_cancellation(job_id),
+                page_progress_callback=on_page,
+            )
         result_payload = result.to_dict()
         if profile == "PDF_MARKDOWN_V2":
-            result_payload["markdown"] = render_structured_markdown(result)
+            result_payload["markdown"] = markdown_text
         serialized_result = json.dumps(result_payload, ensure_ascii=False)
         from app.core.ocr_v2.structured import structured_max_output_bytes
         serialized_size = len(serialized_result.encode("utf-8"))
@@ -599,6 +682,14 @@ def _run_structured_document_job(
             update_job(job_id, status=JobState.failed, finished_at=datetime.now(timezone.utc), progress=100, total_pages=len(result.pages), completed_pages=sum(page.status in {"SUCCESS", "BLANK"} for page in result.pages), failed_pages=[page.page_index for page in result.pages if page.status not in {"SUCCESS", "BLANK"}], current_page=None, page_statuses=page_statuses, warnings=list(result.warnings), error="Structured document result did not pass validation.", error_code="STRUCTURED_OUTPUT_INVALID", result={"artifact_key": result_key, "artifact_name": f"{Path(source_name or 'document').stem}.json", "artifact_content_type": "application/json"}, message=f"{profile} validation failed")
     except JobCancelledException:
         update_job(job_id, status=JobState.cancelled, finished_at=datetime.now(timezone.utc), current_page=None, error_code="CANCELLED", message=f"{profile} job cancelled")
+    except DocumentExtractionEngineConfigurationError:
+        update_job(job_id, status=JobState.failed, finished_at=datetime.now(timezone.utc), current_page=None, error="Document Extraction engine configuration is invalid.", error_code="INVALID_CONFIGURATION", message="Document Extraction job configuration is invalid")
+    except DocumentExtractionEngineUnavailableError:
+        update_job(job_id, status=JobState.failed, finished_at=datetime.now(timezone.utc), current_page=None, error="Document Extraction engine is unavailable.", error_code="ENGINE_UNAVAILABLE", message="Document Extraction engine is unavailable")
+    except PdfToMarkdownEngineConfigurationError:
+        update_job(job_id, status=JobState.failed, finished_at=datetime.now(timezone.utc), current_page=None, error="PDF-to-Markdown engine configuration is invalid.", error_code="INVALID_CONFIGURATION", message="PDF-to-Markdown job configuration is invalid")
+    except PdfToMarkdownEngineUnavailableError:
+        update_job(job_id, status=JobState.failed, finished_at=datetime.now(timezone.utc), current_page=None, error="PDF-to-Markdown engine is unavailable.", error_code="ENGINE_UNAVAILABLE", message="PDF-to-Markdown engine is unavailable")
     except Exception:
         logger.exception("OCR_V2_STRUCTURED_FAILURE job_id=%s profile=%s stage=%s", job_id, profile, stage)
         update_job(job_id, status=JobState.failed, finished_at=datetime.now(timezone.utc), current_page=None, error="Structured document processing failed.", error_code="STRUCTURED_ENGINE_UNAVAILABLE" if stage == "STRUCTURED_PROCESSING" else "ENGINE_FAILURE", message=f"{profile} job failed")
@@ -615,6 +706,7 @@ def editor_extract_job(
         password: str | None = None,
         source_name: str | None = None,
         ocr_v2: bool = False,
+        consumer: str = "legacy",
 ) -> None:
     job = get_job(job_id)
     if job is None:
@@ -660,7 +752,17 @@ def editor_extract_job(
                 message=f"OCR V2 editor page {done} of {total} analyzed",
             )
 
-        result = (extract_document_v2 if ocr_v2 else extract_document)(
+        if ocr_v2 and consumer == EDITOR_OCR_CONSUMER_GENERAL_EDITOR:
+            extractor = execute_editor_ocr
+        elif ocr_v2:
+            # Studio and legacy/private callers remain on the existing
+            # internal editor V2 implementation. The selector is scoped to
+            # the explicitly marked General Editor consumer only.
+            extractor = extract_document_v2
+        else:
+            extractor = extract_document
+
+        result = extractor(
             input_path,
             password,
             cancellation_check=lambda: check_cancellation(job_id),
@@ -686,6 +788,16 @@ def editor_extract_job(
             status=JobState.cancelled,
             finished_at=datetime.now(timezone.utc),
             message="Editor extraction cancelled",
+        )
+        return
+    except EditorOcrEngineConfigurationError:
+        update_job(
+            job_id,
+            status=JobState.failed,
+            finished_at=datetime.now(timezone.utc),
+            error="Editor OCR engine configuration is invalid.",
+            error_code="INVALID_CONFIGURATION",
+            message="Editor OCR engine configuration is invalid",
         )
         return
     except Exception as exc:
@@ -795,7 +907,7 @@ def editor_compile_job(
 
 
 def _markup_public_error(exc: Exception) -> tuple[str, str]:
-    if isinstance(exc, EngineUnavailableError):
+    if isinstance(exc, (OcrMarkupEngineConfigurationError, OcrMarkupEngineUnavailableError, EngineUnavailableError)):
         return "ENGINE_UNAVAILABLE", "The OCR engine is currently unavailable."
     if isinstance(exc, WordGeometryUnavailableError):
         return "WORD_GEOMETRY_NOT_AVAILABLE", "Text selection is unavailable because genuine word geometry was not produced."
@@ -844,13 +956,6 @@ def _run_markup_v2_job(
             return
         update_job(job_id, status=JobState.running, started_at=datetime.now(timezone.utc), progress=0, total_pages=job.total_pages, message="OCR-aware markup started")
         download_to_path(source_key, input_path)
-        from app.core.ocr_v2.markup import MarkupAction, MarkupMode, apply_ocr_markup
-
-        try:
-            selected_action = MarkupAction(action)
-            selected_mode = MarkupMode(mode)
-        except ValueError as exc:
-            raise ValueError("invalid markup action or mode") from exc
 
         cleaned_color = color.strip().lstrip("#")
         if len(cleaned_color) != 6:
@@ -861,7 +966,7 @@ def _run_markup_v2_job(
             check_cancellation(job_id)
             update_job(job_id, progress=int(done / max(1, total) * 90), total_pages=total, completed_pages=done, current_page=max(0, done - 1), message=f"OCR-aware markup analyzing page {done}/{total}")
 
-        execution = apply_ocr_markup(input_path, output_path, action=selected_action, query=query, language=language, language_mode=language_mode, languages=languages or [], language_usage=language_usage or {}, mode=selected_mode, color=rgb, cancellation_check=lambda: check_cancellation(job_id), progress_callback=on_progress)
+        execution = execute_ocr_markup(input_path, output_path, action=action, query=query, language=language, language_mode=language_mode, languages=languages or [], language_usage=language_usage or {}, mode=mode, color=rgb, cancellation_check=lambda: check_cancellation(job_id), progress_callback=on_progress)
         check_cancellation(job_id)
         output_key = f"jobs/ocr_v2/markup/{action}/{job_id}.pdf"
         upload_path(output_path, output_key, content_type="application/pdf")

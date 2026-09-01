@@ -61,6 +61,25 @@ The worker exposes health endpoints at `/health`, `/health/live`, and `/health/r
 - `PORT`
 - `REDIS_URL`
 - `ALLOWED_ORIGINS`
+- `OCR_TEXT_ENGINE` – OCR Text V2 execution selector (`internal` by default;
+  `sdk` is an explicit opt-in when the independently installed
+  `platen-document` package is available).
+- `SEARCHABLE_PDF_ENGINE` – Searchable PDF V2 execution selector (`internal`
+  by default; `sdk` is an explicit opt-in when the independently installed
+  `platen-document` package is available).
+- `DOCUMENT_EXTRACTION_ENGINE` – Document Extraction V2 execution selector
+  (`internal` by default; `sdk` is an explicit opt-in when the independently
+  installed `platen-document` package is available).
+- `PDF_TO_MARKDOWN_ENGINE` – PDF-to-Markdown V2 execution selector (`internal`
+  by default; `sdk` is an explicit opt-in when the independently installed
+  `platen-document` package is available).
+- `OCR_MARKUP_ENGINE` – OCR-aware Highlight/Underline/Strikeout V2 execution
+  selector (`internal` by default; `sdk` is an explicit opt-in when the
+  independently installed `platen-document` package is available).
+- `EDITOR_OCR_ENGINE` – General Editor OCR V2 execution selector (`internal`
+  by default; `sdk` is an explicit opt-in when the independently installed
+  `platen-document` package is available). Studio editor extraction remains on
+  the internal path in this milestone.
 
 ## Project Structure
 
