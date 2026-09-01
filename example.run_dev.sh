@@ -11,10 +11,10 @@ export REDIS_URL=redis://localhost:6379/0
 export FRONTEND_URL=http://localhost:3000
 export BACKEND_URL=http://localhost:8080
 
-export R2_BUCKET=pdfnest-storage
-export R2_ACCESS_KEY=XXXXXXXXXXXXXXXXXXXXXXXXXX
-export R2_SECRET_KEY=XXXXXXXXXXXXXXXXXXXXXXXXXX
-export R2_ENDPOINT=https://XXXXXXXXXXXXXXXXXXXXXXXXXX.r2.cloudflarestorage.com
+# Remote-storage settings must be supplied by the shell or an ignored local
+# environment file; credentials and provider endpoints do not belong in this
+# tracked example launcher.
+export R2_BUCKET="${R2_BUCKET:-pdfnest-storage}"
 
 uv run uvicorn app.main:app --reload &
 UVICORN_PID=$!
