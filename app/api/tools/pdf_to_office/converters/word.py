@@ -4,11 +4,15 @@ import os
 import sys
 import tempfile
 import subprocess
+from typing import Any
 import fitz
 from docx import Document
 
 from app.core.ocr_v2.native import NativeDecision, NativeExtractor, NativeValidator
-from app.core.ocr_v2.structured import StructuredDocumentProcessor, StructuredElement, StructuredElementType
+from app.core.pdf_to_word_ocr_engine import (
+    configured_pdf_to_word_ocr_engine,
+    execute_pdf_to_word_ocr,
+)
 
 
 def _get_pdf2docx_worker_count() -> int:
@@ -71,21 +75,28 @@ def _requires_structured_ocr(pdf_path: str) -> bool:
     return False
 
 
-def _add_structured_element(doc: Document, element: StructuredElement) -> None:
+def _structured_element_type(element: Any) -> str:
+    """Read the canonical element value across internal and SDK enum types."""
+
+    return str(getattr(getattr(element, "type", None), "value", getattr(element, "type", ""))).upper()
+
+
+def _add_structured_element(doc: Document, element: Any) -> None:
     """Map only structure represented by the canonical structured result."""
-    if element.type is StructuredElementType.HEADING:
+    element_type = _structured_element_type(element)
+    if element_type == "HEADING":
         doc.add_heading(element.text, level=max(1, min(9, element.level or 1)))
-    elif element.type in (StructuredElementType.PARAGRAPH, StructuredElementType.TEXT_BLOCK):
+    elif element_type in {"PARAGRAPH", "TEXT_BLOCK"}:
         if element.text:
             doc.add_paragraph(element.text)
-    elif element.type is StructuredElementType.LIST:
+    elif element_type == "LIST":
         items = element.data.get("items", [])
         style = "List Number" if element.ordered else "List Bullet"
         for item in items:
             text = str(item.get("text", "")).strip()
             if text:
                 doc.add_paragraph(text, style=style)
-    elif element.type is StructuredElementType.TABLE:
+    elif element_type == "TABLE":
         headers = element.data.get("headers", [])
         rows = element.data.get("rows", [])
         table_rows = ([headers] if headers else []) + list(rows)
@@ -97,19 +108,18 @@ def _add_structured_element(doc: Document, element: StructuredElement) -> None:
                 cells = table.add_row().cells
                 for index, cell in enumerate(row):
                     cells[index].text = str(cell.get("text", ""))
-    elif element.type is StructuredElementType.CAPTION:
+    elif element_type == "CAPTION":
         paragraph = doc.add_paragraph()
         run = paragraph.add_run(element.text)
         run.italic = True
-    elif element.type is StructuredElementType.FORMULA:
+    elif element_type == "FORMULA":
         # Only genuine structured formula text reaches this mapper.  Current
         # local Tesseract structured output deliberately does not fabricate it.
         if element.text:
             doc.add_paragraph(element.text)
 
 
-def _convert_structured_to_word(pdf_path: str, output_path: str, language: str) -> None:
-    result = StructuredDocumentProcessor().process_document(pdf_path, language=language)
+def _write_structured_result_to_word(result: Any, output_path: str) -> None:
     doc_out = Document()
     for page_index, page in enumerate(result.pages):
         elements = {element.element_id: element for element in page.elements}
@@ -121,7 +131,16 @@ def _convert_structured_to_word(pdf_path: str, output_path: str, language: str) 
     doc_out.save(output_path)
 
 
+def _convert_structured_to_word(pdf_path: str, output_path: str, language: str) -> None:
+    result = execute_pdf_to_word_ocr(pdf_path, language=language)
+    _write_structured_result_to_word(result, output_path)
+
+
 def convert_to_word(pdf_path: str, output_path: str, language: str = "eng") -> None:
+    # Validate the consumer selector even when this document takes the native
+    # route, so an invalid deployment configuration cannot be hidden by the
+    # absence of an OCR fallback on a particular input.
+    configured_pdf_to_word_ocr_engine()
     doc = fitz.open(pdf_path)
     try:
         structured = _requires_structured_ocr(pdf_path)

@@ -73,6 +73,10 @@ The worker exposes health endpoints at `/health`, `/health/live`, and `/health/r
 - `PDF_TO_MARKDOWN_ENGINE` – PDF-to-Markdown V2 execution selector (`internal`
   by default; `sdk` is an explicit opt-in when the independently installed
   `platen-document` package is available).
+- `PDF_TO_WORD_OCR_ENGINE` – PDF-to-Word OCR/scanned fallback selector
+  (`internal` by default; `sdk` is an explicit opt-in when the independently
+  installed `platen-document` package is available). Trusted native PDF-to-
+  Word conversion remains on the existing `pdf2docx` path.
 - `OCR_MARKUP_ENGINE` – OCR-aware Highlight/Underline/Strikeout V2 execution
   selector (`internal` by default; `sdk` is an explicit opt-in when the
   independently installed `platen-document` package is available).
@@ -80,6 +84,10 @@ The worker exposes health endpoints at `/health`, `/health/live`, and `/health/r
   by default; `sdk` is an explicit opt-in when the independently installed
   `platen-document` package is available). Studio editor extraction remains on
   the internal path in this milestone.
+
+- LEGACY_EDITOR_OCR_ENGINE=internal|sdk controls the ordinary /edit-pdf OCR
+  and document extraction fallback only. It is independent from
+  EDITOR_OCR_ENGINE and defaults to internal.
 
 ## Project Structure
 

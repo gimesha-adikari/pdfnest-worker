@@ -26,7 +26,7 @@ class ExtractRequest(BaseModel):
     file_password: str | None = None
     source_name: str | None = None
     ocr_v2: bool = False
-    consumer: Literal["general_editor", "studio", "legacy"] = EDITOR_OCR_CONSUMER_LEGACY
+    consumer: Literal["general_editor", "studio", "legacy", "legacy_editor"] = EDITOR_OCR_CONSUMER_LEGACY
 
 
 class CompileRequest(BaseModel):

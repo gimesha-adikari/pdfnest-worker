@@ -65,6 +65,17 @@ def test_runtime_config_rejects_invalid_pdf_to_markdown_engine_selector(monkeypa
         validate_runtime_config()
 
 
+def test_runtime_config_rejects_invalid_pdf_to_word_ocr_engine_selector(monkeypatch):
+    monkeypatch.delenv("OCR_TEXT_ENGINE", raising=False)
+    monkeypatch.delenv("SEARCHABLE_PDF_ENGINE", raising=False)
+    monkeypatch.delenv("DOCUMENT_EXTRACTION_ENGINE", raising=False)
+    monkeypatch.delenv("PDF_TO_MARKDOWN_ENGINE", raising=False)
+    monkeypatch.setenv("PDF_TO_WORD_OCR_ENGINE", "not-an-engine")
+
+    with pytest.raises(ValueError, match="PDF_TO_WORD_OCR_ENGINE"):
+        validate_runtime_config()
+
+
 def test_runtime_config_rejects_invalid_ocr_markup_engine_selector(monkeypatch):
     monkeypatch.delenv("OCR_TEXT_ENGINE", raising=False)
     monkeypatch.delenv("SEARCHABLE_PDF_ENGINE", raising=False)
@@ -85,4 +96,18 @@ def test_runtime_config_rejects_invalid_editor_ocr_engine_selector(monkeypatch):
     monkeypatch.setenv("EDITOR_OCR_ENGINE", "not-an-engine")
 
     with pytest.raises(ValueError, match="EDITOR_OCR_ENGINE"):
+        validate_runtime_config()
+
+
+def test_runtime_config_rejects_invalid_legacy_editor_ocr_engine_selector(monkeypatch):
+    monkeypatch.delenv("OCR_TEXT_ENGINE", raising=False)
+    monkeypatch.delenv("SEARCHABLE_PDF_ENGINE", raising=False)
+    monkeypatch.delenv("DOCUMENT_EXTRACTION_ENGINE", raising=False)
+    monkeypatch.delenv("PDF_TO_MARKDOWN_ENGINE", raising=False)
+    monkeypatch.delenv("PDF_TO_WORD_OCR_ENGINE", raising=False)
+    monkeypatch.delenv("OCR_MARKUP_ENGINE", raising=False)
+    monkeypatch.delenv("EDITOR_OCR_ENGINE", raising=False)
+    monkeypatch.setenv("LEGACY_EDITOR_OCR_ENGINE", "not-an-engine")
+
+    with pytest.raises(ValueError, match="LEGACY_EDITOR_OCR_ENGINE"):
         validate_runtime_config()

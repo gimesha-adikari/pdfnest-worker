@@ -50,6 +50,11 @@ from app.core.editor_ocr_engine import (
     EditorOcrEngineConfigurationError,
     execute_editor_ocr,
 )
+from app.core.legacy_editor_ocr_engine import (
+    LEGACY_EDITOR_CONSUMER,
+    LegacyEditorOcrEngineConfigurationError,
+    execute_legacy_editor_ocr,
+)
 from app.core.storage import build_key, delete_object, download_to_path, upload_path, upload_text
 from app.core.actor_heartbeat import start_actor_heartbeat
 from app.jobs.cancellation import JobCancelledException, check_cancellation
@@ -752,7 +757,9 @@ def editor_extract_job(
                 message=f"OCR V2 editor page {done} of {total} analyzed",
             )
 
-        if ocr_v2 and consumer == EDITOR_OCR_CONSUMER_GENERAL_EDITOR:
+        if consumer == LEGACY_EDITOR_CONSUMER:
+            extractor = execute_legacy_editor_ocr
+        elif ocr_v2 and consumer == EDITOR_OCR_CONSUMER_GENERAL_EDITOR:
             extractor = execute_editor_ocr
         elif ocr_v2:
             # Studio and legacy/private callers remain on the existing
@@ -762,12 +769,12 @@ def editor_extract_job(
         else:
             extractor = extract_document
 
-        result = extractor(
-            input_path,
-            password,
-            cancellation_check=lambda: check_cancellation(job_id),
-            page_progress_callback=report_editor_page if ocr_v2 else None,
-        )
+        extractor_kwargs: dict[str, Any] = {
+            "cancellation_check": lambda: check_cancellation(job_id),
+        }
+        if ocr_v2:
+            extractor_kwargs["page_progress_callback"] = report_editor_page
+        result = extractor(input_path, password, **extractor_kwargs)
         check_cancellation(job_id)
 
         # The extract layout is public editor data. Storage keys remain inside
@@ -790,7 +797,10 @@ def editor_extract_job(
             message="Editor extraction cancelled",
         )
         return
-    except EditorOcrEngineConfigurationError:
+    except (
+        EditorOcrEngineConfigurationError,
+        LegacyEditorOcrEngineConfigurationError,
+    ):
         update_job(
             job_id,
             status=JobState.failed,
@@ -805,9 +815,9 @@ def editor_extract_job(
             job_id,
             status=JobState.failed,
             finished_at=datetime.now(timezone.utc),
-            error="OCR V2 editor extraction failed." if ocr_v2 else str(exc),
-            error_code="ENGINE_UNAVAILABLE" if isinstance(exc, EngineUnavailableError) else ("EDITOR_EXTRACTION_INVALID" if ocr_v2 else None),
-            message="OCR V2 editor extraction failed" if ocr_v2 else "Editor extraction failed",
+            error="OCR V2 editor extraction failed." if (ocr_v2 or consumer == LEGACY_EDITOR_CONSUMER) else str(exc),
+            error_code="ENGINE_UNAVAILABLE" if isinstance(exc, EngineUnavailableError) else ("EDITOR_EXTRACTION_INVALID" if (ocr_v2 or consumer == LEGACY_EDITOR_CONSUMER) else None),
+            message="OCR V2 editor extraction failed" if (ocr_v2 or consumer == LEGACY_EDITOR_CONSUMER) else "Editor extraction failed",
         )
         if is_non_retryable_error(exc):
             logger.warning("Non-retryable PDF error in job %s: %s", job_id, exc)

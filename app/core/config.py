@@ -52,15 +52,19 @@ def validate_runtime_config() -> None:
     from app.core.searchable_pdf_engine import configured_searchable_pdf_engine
     from app.core.document_extraction_engine import configured_document_extraction_engine
     from app.core.pdf_to_markdown_engine import configured_pdf_to_markdown_engine
+    from app.core.pdf_to_word_ocr_engine import configured_pdf_to_word_ocr_engine
     from app.core.ocr_markup_engine import configured_ocr_markup_engine
     from app.core.editor_ocr_engine import configured_editor_ocr_engine
+    from app.core.legacy_editor_ocr_engine import configured_legacy_editor_ocr_engine
 
     configured_ocr_text_engine()
     configured_searchable_pdf_engine()
     configured_document_extraction_engine()
     configured_pdf_to_markdown_engine()
+    configured_pdf_to_word_ocr_engine()
     configured_ocr_markup_engine()
     configured_editor_ocr_engine()
+    configured_legacy_editor_ocr_engine()
     if not is_managed_environment():
         return
 
