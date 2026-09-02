@@ -111,3 +111,18 @@ def test_runtime_config_rejects_invalid_legacy_editor_ocr_engine_selector(monkey
 
     with pytest.raises(ValueError, match="LEGACY_EDITOR_OCR_ENGINE"):
         validate_runtime_config()
+
+
+def test_runtime_config_rejects_invalid_legacy_markup_ocr_engine_selector(monkeypatch):
+    monkeypatch.delenv("OCR_TEXT_ENGINE", raising=False)
+    monkeypatch.delenv("SEARCHABLE_PDF_ENGINE", raising=False)
+    monkeypatch.delenv("DOCUMENT_EXTRACTION_ENGINE", raising=False)
+    monkeypatch.delenv("PDF_TO_MARKDOWN_ENGINE", raising=False)
+    monkeypatch.delenv("PDF_TO_WORD_OCR_ENGINE", raising=False)
+    monkeypatch.delenv("OCR_MARKUP_ENGINE", raising=False)
+    monkeypatch.delenv("EDITOR_OCR_ENGINE", raising=False)
+    monkeypatch.delenv("LEGACY_EDITOR_OCR_ENGINE", raising=False)
+    monkeypatch.setenv("LEGACY_MARKUP_OCR_ENGINE", "not-an-engine")
+
+    with pytest.raises(ValueError, match="LEGACY_MARKUP_OCR_ENGINE"):
+        validate_runtime_config()

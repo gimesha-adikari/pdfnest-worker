@@ -49,6 +49,27 @@ def test_ocr_mode_is_explicit_and_does_not_use_native(monkeypatch):
     assert document._selection_word_items(page, fitz.Rect(0, 0, 100, 100), "ocr") == ocr
 
 
+def test_precomputed_ocr_words_avoid_a_second_legacy_ocr_pass(monkeypatch):
+    source = fitz.open()
+    page = source.new_page(width=300, height=300)
+    words = [{"rect": fitz.Rect(10, 10, 80, 30), "text": "SDK", "conf": 95.0}]
+    monkeypatch.setattr(
+        document,
+        "ocr_words_for_page",
+        lambda *_: (_ for _ in ()).throw(AssertionError("legacy OCR must not run twice")),
+    )
+
+    document.apply_markup(
+        source,
+        [{"x": 0, "y": 0, "width": 120, "height": 60, "page": 1, "color": "#800080"}],
+        action="highlight",
+        mode="ocr",
+        ocr_word_items_by_page={0: words},
+    )
+    assert source[0].get_drawings()
+    source.close()
+
+
 def test_no_text_selection_completes_without_processor_error():
     source = fitz.open()
     source.new_page(width=300, height=300)

@@ -88,6 +88,10 @@ The worker exposes health endpoints at `/health`, `/health/live`, and `/health/r
 - LEGACY_EDITOR_OCR_ENGINE=internal|sdk controls the ordinary /edit-pdf OCR
   and document extraction fallback only. It is independent from
   EDITOR_OCR_ENGINE and defaults to internal.
+- LEGACY_MARKUP_OCR_ENGINE=internal|sdk controls the ordinary legacy
+  /highlight-pdf, /underline-pdf, and /strikeout-pdf OCR markup fallback only.
+  It is independent from OCR_MARKUP_ENGINE and all Editor selectors, defaults
+  to internal, and does not control Studio markup.
 
 ## Project Structure
 

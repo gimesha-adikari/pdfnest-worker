@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Callable, Literal
+from typing import Any, Callable, Literal, Mapping
 
 import fitz
 
@@ -93,14 +93,22 @@ def _underline_words(page: fitz.Page, word_items: list[dict], color: tuple[float
         )
 
 
-def _selection_word_items(page: fitz.Page, selection_rect: fitz.Rect, mode: MarkupMode) -> list[dict]:
+def _selection_word_items(
+        page: fitz.Page,
+        selection_rect: fitz.Rect,
+        mode: MarkupMode,
+        ocr_word_items: list[dict[str, Any]] | None = None,
+) -> list[dict]:
     mode = (mode or "smart").strip().lower()
 
     if mode == "text":
         return native_words_in_rect(page, selection_rect)
 
     if mode == "ocr":
-        ocr_items, _ = ocr_words_for_page(page)
+        if ocr_word_items is not None:
+            ocr_items = ocr_word_items
+        else:
+            ocr_items, _ = ocr_words_for_page(page)
         return [
             item
             for item in ocr_items
@@ -114,7 +122,10 @@ def _selection_word_items(page: fitz.Page, selection_rect: fitz.Rect, mode: Mark
         if native:
             return native
 
-        ocr_items, _ = ocr_words_for_page(page)
+        if ocr_word_items is not None:
+            ocr_items = ocr_word_items
+        else:
+            ocr_items, _ = ocr_words_for_page(page)
         return [
             item
             for item in ocr_items
@@ -132,6 +143,7 @@ def apply_markup(
         action: MarkupAction,
         mode: MarkupMode = "smart",
         progress_callback: Callable[[int, int], None] | None = None,
+        ocr_word_items_by_page: Mapping[int, list[dict[str, Any]]] | None = None,
 ) -> None:
     total = max(1, len(boxes))
     mode = (mode or "smart").strip().lower()
@@ -171,7 +183,16 @@ def apply_markup(
             if mode == "manual":
                 _draw_highlight_rect(page, selection_rect, color, opacity=0.35)
             else:
-                selected = _selection_word_items(page, selection_rect, mode)
+                selected = _selection_word_items(
+                    page,
+                    selection_rect,
+                    mode,
+                    ocr_word_items=(
+                        ocr_word_items_by_page.get(page_num - 1, [])
+                        if ocr_word_items_by_page is not None
+                        else None
+                    ),
+                )
                 if selected:
                     _highlight_words(page, selected, color)
                 else:
@@ -181,7 +202,16 @@ def apply_markup(
             if mode == "manual":
                 _draw_strike_line(page, selection_rect, color)
             else:
-                selected = _selection_word_items(page, selection_rect, mode)
+                selected = _selection_word_items(
+                    page,
+                    selection_rect,
+                    mode,
+                    ocr_word_items=(
+                        ocr_word_items_by_page.get(page_num - 1, [])
+                        if ocr_word_items_by_page is not None
+                        else None
+                    ),
+                )
                 if selected:
                     _strike_words(page, selected, color)
                 else:
@@ -191,7 +221,16 @@ def apply_markup(
             if mode == "manual":
                 _draw_manual_underline(page, selection_rect, color)
             else:
-                selected = _selection_word_items(page, selection_rect, mode)
+                selected = _selection_word_items(
+                    page,
+                    selection_rect,
+                    mode,
+                    ocr_word_items=(
+                        ocr_word_items_by_page.get(page_num - 1, [])
+                        if ocr_word_items_by_page is not None
+                        else None
+                    ),
+                )
                 if selected:
                     _underline_words(page, selected, color)
                 else:
@@ -216,6 +255,40 @@ def process_markup_pdf(
     doc = open_document(input_path, password)
     try:
         apply_markup(doc, boxes, action=action, mode=mode, progress_callback=progress_callback)
+        doc.save(output_path, deflate=True, garbage=4)
+    finally:
+        doc.close()
+
+
+def process_markup_pdf_with_ocr_words(
+        input_path: str,
+        output_path: str,
+        boxes: list[dict],
+        action: MarkupAction,
+        mode: MarkupMode = "smart",
+        password: str | None = None,
+        progress_callback: Callable[[int, int], None] | None = None,
+        ocr_word_items_by_page: Mapping[int, list[dict[str, Any]]] | None = None,
+) -> None:
+    """Apply the historical markup projection to caller-supplied OCR words.
+
+    The legacy markup product owns the annotation projection.  SDK-backed OCR
+    callers use this seam to provide canonical words without invoking the
+    historical per-page Tesseract helper a second time.  A missing mapping
+    retains the existing behavior; an explicit empty page mapping means that
+    page produced no selectable SDK words and must not trigger a fallback OCR
+    pass.
+    """
+    doc = open_document(input_path, password)
+    try:
+        apply_markup(
+            doc,
+            boxes,
+            action=action,
+            mode=mode,
+            progress_callback=progress_callback,
+            ocr_word_items_by_page=ocr_word_items_by_page,
+        )
         doc.save(output_path, deflate=True, garbage=4)
     finally:
         doc.close()

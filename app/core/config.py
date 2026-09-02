@@ -56,6 +56,7 @@ def validate_runtime_config() -> None:
     from app.core.ocr_markup_engine import configured_ocr_markup_engine
     from app.core.editor_ocr_engine import configured_editor_ocr_engine
     from app.core.legacy_editor_ocr_engine import configured_legacy_editor_ocr_engine
+    from app.core.legacy_markup_ocr_engine import configured_legacy_markup_ocr_engine
 
     configured_ocr_text_engine()
     configured_searchable_pdf_engine()
@@ -65,6 +66,7 @@ def validate_runtime_config() -> None:
     configured_ocr_markup_engine()
     configured_editor_ocr_engine()
     configured_legacy_editor_ocr_engine()
+    configured_legacy_markup_ocr_engine()
     if not is_managed_environment():
         return
 

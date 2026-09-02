@@ -55,6 +55,11 @@ from app.core.legacy_editor_ocr_engine import (
     LegacyEditorOcrEngineConfigurationError,
     execute_legacy_editor_ocr,
 )
+from app.core.legacy_markup_ocr_engine import (
+    LEGACY_MARKUP_CONSUMER,
+    LegacyMarkupOcrEngineConfigurationError,
+    execute_legacy_markup,
+)
 from app.core.storage import build_key, delete_object, download_to_path, upload_path, upload_text
 from app.core.actor_heartbeat import start_actor_heartbeat
 from app.jobs.cancellation import JobCancelledException, check_cancellation
@@ -71,6 +76,21 @@ NON_RETRYABLE_ERRORS = (
     fitz.FileDataError,
     fitz.EmptyFileError,
 )
+
+
+def _markup_processing_route(payload: dict[str, Any]) -> str:
+    """Select a markup caller before choosing any OCR implementation.
+
+    Ordinary legacy routes carry the explicit consumer marker.  Studio keeps
+    its existing ``ocr_v2`` marker and therefore cannot inherit the legacy
+    selector through a shared helper.
+    """
+
+    if payload.get("consumer") == LEGACY_MARKUP_CONSUMER:
+        return LEGACY_MARKUP_CONSUMER
+    if payload.get("ocr_v2"):
+        return "studio_ocr_v2"
+    return "historical"
 
 
 def is_non_retryable_error(exc: Exception) -> bool:
@@ -1073,7 +1093,19 @@ def _run_markup_job(
                 message=f"{action.title()} processing {done}/{total}",
             )
 
-        if payload.get("ocr_v2"):
+        route = _markup_processing_route(payload)
+        if route == LEGACY_MARKUP_CONSUMER:
+            execute_legacy_markup(
+                input_path=input_path,
+                output_path=output_pdf_path,
+                boxes=boxes,
+                action=action,
+                mode=mode,
+                password=file_password,
+                cancellation_check=lambda: check_cancellation(job_id),
+                progress_callback=on_progress,
+            )
+        elif route == "studio_ocr_v2":
             from app.api.tools.markup.document import process_markup_pdf_v2_regions
             process_markup_pdf_v2_regions(
                 input_path=input_path,
@@ -1120,6 +1152,16 @@ def _run_markup_job(
             status=JobState.cancelled,
             finished_at=datetime.now(timezone.utc),
             message=f"{action.title()} job cancelled",
+        )
+        return
+    except LegacyMarkupOcrEngineConfigurationError:
+        update_job(
+            job_id,
+            status=JobState.failed,
+            finished_at=datetime.now(timezone.utc),
+            error="Legacy markup OCR engine configuration is invalid.",
+            error_code="INVALID_CONFIGURATION",
+            message=f"{action.title()} engine configuration is invalid",
         )
         return
     except Exception as exc:
