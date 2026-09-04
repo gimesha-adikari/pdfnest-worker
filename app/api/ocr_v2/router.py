@@ -65,7 +65,7 @@ def _request_model(request_id: str, profile: str, language: str | None, routing_
         raise HTTPException(status_code=422, detail={"code": "UNSUPPORTED_LANGUAGE", "message": "Choose one or more installed OCR languages."}) from exc
 
 
-def _markup_preview_request_model(request_id: str, profile: str, language: str | None, routing_policy: str, language_mode: str = "EXPLICIT", languages: list[str] | None = None) -> OCRV2MarkupPreviewRequest:
+def _markup_preview_request_model(request_id: str, profile: str, language: str | None, routing_policy: str, language_mode: str = "EXPLICIT", languages: list[str] | None = None, page_index: int | None = None) -> OCRV2MarkupPreviewRequest:
     if profile != OCRV2Profile.MARKUP_V2.value:
         raise HTTPException(status_code=422, detail={"code": "INVALID_INPUT", "message": "This endpoint only accepts MARKUP_V2"})
     if not language or not language.strip():
@@ -78,6 +78,7 @@ def _markup_preview_request_model(request_id: str, profile: str, language: str |
             language_mode=language_mode,
             languages=languages or [],
             routing_policy=routing_policy,
+            page_index=page_index,
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail={"code": "UNSUPPORTED_LANGUAGE", "message": "Choose one or more installed OCR languages."}) from exc
@@ -91,6 +92,64 @@ def _max_bytes() -> int:
 def _max_pages() -> int:
     value = int(os.getenv("OCR_V2_MAX_PAGES", os.getenv("MAX_PAGES_OCR", "150")))
     return max(1, value)
+
+
+def _prepare_page_scoped_preview_source(input_path: str, page_index: int | None) -> tuple[str, int | None]:
+    """Create a temporary one-page derivative for visible-page OCR preview.
+
+    The source remains application-owned and is never exposed. A page-scoped
+    derivative keeps preview OCR bounded while preserving the existing OCR
+    engine and projection contracts, including page rotation and CropBox data.
+    """
+
+    if page_index is None:
+        return input_path, None
+
+    try:
+        with fitz.open(input_path) as source:
+            page_count = len(source)
+            if page_index >= page_count:
+                raise HTTPException(status_code=422, detail={"code": "INVALID_INPUT", "message": "The requested preview page is unavailable"})
+            fd, selected_path = tempfile.mkstemp(prefix="pdfnest-ocr-v2-page-", suffix=".pdf")
+            os.close(fd)
+            try:
+                with fitz.open() as selected:
+                    selected.insert_pdf(source, from_page=page_index, to_page=page_index)
+                    selected.save(selected_path, garbage=3, deflate=True)
+            except Exception:
+                try:
+                    os.remove(selected_path)
+                except OSError:
+                    pass
+                raise
+            return selected_path, page_count
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=415, detail={"code": "INVALID_INPUT", "message": "This PDF page could not be prepared for preview"}) from exc
+
+
+def _restore_page_scoped_preview(result: object, page_count: int, page_index: int) -> object:
+    """Project the selected derivative back into the original document indexes."""
+
+    if not isinstance(result, dict):
+        return result
+    pages = result.get("pages")
+    if not isinstance(pages, list):
+        return result
+    restored_pages: list[object] = []
+    for page in pages[:1]:
+        if not isinstance(page, dict):
+            continue
+        restored = dict(page)
+        restored["page_index"] = page_index
+        restored["page_number"] = page_index + 1
+        restored["page_id"] = f"page-{page_index}"
+        restored_pages.append(restored)
+    restored_result = dict(result)
+    restored_result["page_count"] = page_count
+    restored_result["pages"] = restored_pages
+    return restored_result
 
 
 async def _stage_pdf(upload: UploadFile) -> str:
@@ -275,20 +334,28 @@ async def markup_preview(
     language_mode: str = Form("EXPLICIT"),
     languages: list[str] | None = Form(None),
     routing_policy: str = Form("FAST"),
+    page_index: int | None = Form(None),
 ) -> OCRV2MarkupPreviewResponse:
     if not _REQUEST_ID_RE.fullmatch(request_id):
         raise HTTPException(status_code=422, detail={"code": "INVALID_INPUT", "message": "Invalid request identifier"})
     try:
-        contract = _markup_preview_request_model(request_id, profile, language, routing_policy, language_mode, languages)
+        contract = _markup_preview_request_model(request_id, profile, language, routing_policy, language_mode, languages, page_index)
     except HTTPException as exc:
         if isinstance(exc.detail, dict) and exc.detail.get("code") == "UNSUPPORTED_LANGUAGE":
             return JSONResponse(status_code=exc.status_code, content=exc.detail)
         raise
     path = await _stage_pdf(file)
     check_cancel, cleanup_cancel = create_route_cancellation_checker(request)
+    preview_path = path
+    derivative_page_count: int | None = None
     try:
-        result = await _run_markup_preview(path, contract, check_cancel)
+        preview_path, derivative_page_count = _prepare_page_scoped_preview_source(path, contract.page_index)
+        result = await _run_markup_preview(preview_path, contract, check_cancel)
+        if contract.page_index is not None and derivative_page_count is not None:
+            result = _restore_page_scoped_preview(result, derivative_page_count, contract.page_index)
         return OCRV2MarkupPreviewResponse(**result)
+    except HTTPException:
+        raise
     except JobCancelledException as exc:
         raise HTTPException(status_code=499, detail={"code": "CANCELLED", "message": "Selectable text preparation was cancelled"}) from exc
     except OcrMarkupEngineConfigurationError as exc:
@@ -309,6 +376,11 @@ async def markup_preview(
             os.remove(path)
         except OSError:
             pass
+        if preview_path != path:
+            try:
+                os.remove(preview_path)
+            except OSError:
+                pass
 
 
 async def _run_worker(path: str, contract: OCRV2WorkerRequest, check_cancel: object) -> object:

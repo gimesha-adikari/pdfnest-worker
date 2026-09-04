@@ -86,6 +86,7 @@ class OCRV2MarkupPreviewRequest(BaseModel):
     languages: list[str] = Field(default_factory=list, max_length=16)
     language_usage: dict[str, float] = Field(default_factory=dict, max_length=32)
     routing_policy: OCRV2RoutingPolicy = OCRV2RoutingPolicy.FAST
+    page_index: int | None = Field(default=None, ge=0, le=10000)
 
     @model_validator(mode="after")
     def normalize_language_policy(self) -> "OCRV2MarkupPreviewRequest":
