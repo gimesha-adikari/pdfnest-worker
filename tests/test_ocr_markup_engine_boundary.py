@@ -196,12 +196,14 @@ def test_markup_actor_delegates_standalone_v2_work_to_family_boundary(
         "EXPLICIT",
         ["eng"],
         {},
+        {"page": 1, "source": "ocr", "coordinate_space": "pdf_points_visible_cropbox_top_left", "page_width": 100, "page_height": 100, "rects": [{"x": 10, "y": 10, "width": 20, "height": 10}], "word_ids": ["word-1"], "text": "Alpha"},
     )
 
     assert calls["action"] == "highlight"
     assert calls["mode"] == "smart"
     assert calls["language"] == "eng"
     assert calls["languages"] == ["eng"]
+    assert calls["selection"]["page"] == 1
     assert calls["cancellation_check"] is not None
     assert calls["progress_callback"] is not None
     assert updates[-1]["status"] == JobState.succeeded

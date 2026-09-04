@@ -211,6 +211,7 @@ def ocr_v2_job(
         language_mode: str = "EXPLICIT",
         languages: list[str] | None = None,
         language_usage: dict[str, float] | None = None,
+        markup_selection: dict[str, object] | None = None,
 ) -> None:
     """Run one durable OCR V2 job through the existing Dramatiq worker."""
     if profile == "SEARCHABLE_PDF_V2":
@@ -220,7 +221,7 @@ def ocr_v2_job(
         _run_structured_document_job(job_id, source_key, source_name, language, routing_policy, profile, language_mode, languages or [], language_usage or {})
         return
     if profile == "MARKUP_V2":
-        _run_markup_v2_job(job_id, source_key, source_name, language, markup_action or "", markup_mode, markup_query or "", markup_color, language_mode, languages or [], language_usage or {})
+        _run_markup_v2_job(job_id, source_key, source_name, language, markup_action or "", markup_mode, markup_query or "", markup_color, language_mode, languages or [], language_usage or {}, markup_selection)
         return
     job = get_job(job_id)
     if job is None:
@@ -965,6 +966,7 @@ def _run_markup_v2_job(
         language_mode: str = "EXPLICIT",
         languages: list[str] | None = None,
         language_usage: dict[str, float] | None = None,
+        selection: dict[str, object] | None = None,
 ) -> None:
     job = get_job(job_id)
     if job is None:
@@ -996,7 +998,7 @@ def _run_markup_v2_job(
             check_cancellation(job_id)
             update_job(job_id, progress=int(done / max(1, total) * 90), total_pages=total, completed_pages=done, current_page=max(0, done - 1), message=f"OCR-aware markup analyzing page {done}/{total}")
 
-        execution = execute_ocr_markup(input_path, output_path, action=action, query=query, language=language, language_mode=language_mode, languages=languages or [], language_usage=language_usage or {}, mode=mode, color=rgb, cancellation_check=lambda: check_cancellation(job_id), progress_callback=on_progress)
+        execution = execute_ocr_markup(input_path, output_path, action=action, query=query, selection=selection, language=language, language_mode=language_mode, languages=languages or [], language_usage=language_usage or {}, mode=mode, color=rgb, cancellation_check=lambda: check_cancellation(job_id), progress_callback=on_progress)
         check_cancellation(job_id)
         output_key = f"jobs/ocr_v2/markup/{action}/{job_id}.pdf"
         upload_path(output_path, output_key, content_type="application/pdf")

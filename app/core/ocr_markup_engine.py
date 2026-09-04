@@ -14,9 +14,13 @@ frozen internal implementation.
 from __future__ import annotations
 
 import logging
+import math
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
+
+import pymupdf as fitz
 
 from app.core.ocr_v2.errors import (
     AnnotationWriteError,
@@ -46,6 +50,40 @@ class OcrMarkupEngineConfigurationError(ValueError):
 
 class OcrMarkupEngineUnavailableError(EngineUnavailableError):
     """The explicitly selected OCR-aware markup engine cannot be loaded."""
+
+
+@dataclass(frozen=True)
+class ExplicitMarkupExecutionResult:
+    action: str
+    mode: str
+    page_count: int
+    selection: dict[str, Any]
+
+    def to_dict(self) -> dict[str, Any]:
+        page_index = int(self.selection["page"]) - 1
+        rects = list(self.selection["rects"])
+        return {
+            "schema_version": "ocr_v2_markup_result.v1",
+            "action": self.action,
+            "mode": self.mode,
+            "source_policy": "BROWSER_SELECTION_CANONICAL_PDF_POINTS",
+            "page_count": self.page_count,
+            "selection_count": 1,
+            "selections": [{
+                "page_index": page_index,
+                "matched_text": str(self.selection.get("text", "")),
+                "word_ids": list(self.selection.get("word_ids", [])),
+                "group_rects": rects,
+                "source_type": str(self.selection.get("source", "")),
+                "provenance": ["browser-selection"],
+            }],
+            "page_sources": [{
+                "page_index": page_index,
+                "source_type": str(self.selection.get("source", "")),
+                "word_geometry": True,
+                "reading_order": bool(self.selection.get("word_ids")),
+            }],
+        }
 
 
 def configured_ocr_markup_engine(raw: str | None = None) -> str:
@@ -190,7 +228,8 @@ def execute_ocr_markup(
     output_path: str | Path,
     *,
     action: str | object,
-    query: str,
+    query: str = "",
+    selection: Mapping[str, Any] | None = None,
     language: str = "eng",
     language_mode: str | None = None,
     languages: Sequence[str] | None = None,
@@ -201,6 +240,18 @@ def execute_ocr_markup(
     progress_callback: ProgressCallback | None = None,
 ) -> Any:
     """Execute standalone V2 Highlight, Underline, or Strikeout."""
+
+    if selection is not None:
+        return execute_ocr_markup_selection(
+            input_path,
+            output_path,
+            action=action,
+            mode=mode,
+            selection=selection,
+            color=color,
+            cancellation_check=cancellation_check,
+            progress_callback=progress_callback,
+        )
 
     selected = configured_ocr_markup_engine()
     logger.info("OCR_V2_MARKUP_ENGINE consumer=ocr_markup engine=%s", selected)
@@ -218,6 +269,101 @@ def execute_ocr_markup(
         color=color,
         cancellation_check=cancellation_check,
         progress_callback=progress_callback,
+    )
+
+
+def _explicit_selection_rects(selection: Mapping[str, Any], page: Any) -> list[Any]:
+    coordinate_space = str(selection.get("coordinate_space", ""))
+    if coordinate_space != "pdf_points_visible_cropbox_top_left":
+        raise ValueError("unsupported browser selection coordinate space")
+    page_width = float(selection.get("page_width", 0))
+    page_height = float(selection.get("page_height", 0))
+    if not math.isfinite(page_width) or not math.isfinite(page_height) or page_width <= 0 or page_height <= 0:
+        raise ValueError("browser selection page geometry is invalid")
+    if abs(page.rect.width - page_width) > 0.5 or abs(page.rect.height - page_height) > 0.5:
+        raise ValueError("browser selection page geometry does not match the PDF page")
+
+    raw_rects = selection.get("rects")
+    if not isinstance(raw_rects, (list, tuple)) or not raw_rects:
+        raise ValueError("browser selection has no rectangles")
+    rects: list[Any] = []
+    for raw_rect in raw_rects:
+        if not isinstance(raw_rect, Mapping):
+            raise ValueError("browser selection rectangle is invalid")
+        x = float(raw_rect.get("x", 0))
+        y = float(raw_rect.get("y", 0))
+        width = float(raw_rect.get("width", 0))
+        height = float(raw_rect.get("height", 0))
+        if not all(math.isfinite(value) for value in (x, y, width, height)) or width <= 0 or height <= 0 or x < -0.5 or y < -0.5 or x + width > page_width + 0.5 or y + height > page_height + 0.5:
+            raise ValueError("browser selection rectangle is outside the PDF page")
+        left = max(0.0, min(page_width, x))
+        top = max(0.0, min(page_height, y))
+        right = max(left, min(page_width, x + width))
+        bottom = max(top, min(page_height, y + height))
+        if right <= left or bottom <= top:
+            raise ValueError("browser selection rectangle is empty")
+        rects.append(fitz.Rect(left, top, right, bottom))
+    return rects
+
+
+def execute_ocr_markup_selection(
+    input_path: str | Path,
+    output_path: str | Path,
+    *,
+    action: str | object,
+    mode: str | object = "smart",
+    selection: Mapping[str, Any],
+    color: tuple[float, float, float] = (1.0, 1.0, 0.0),
+    cancellation_check: CancellationCheck | None = None,
+    progress_callback: ProgressCallback | None = None,
+) -> ExplicitMarkupExecutionResult:
+    """Apply already-normalized browser selection geometry without OCR."""
+
+    action_value = _enum_value(action)
+    if action_value not in {"highlight", "underline", "strikeout"}:
+        raise ValueError("unsupported markup action")
+    page_number = int(selection.get("page", 0))
+    if page_number < 1:
+        raise ValueError("browser selection page is invalid")
+    if str(selection.get("source", "")) not in {"native", "ocr"}:
+        raise ValueError("browser selection source is invalid")
+    if cancellation_check:
+        cancellation_check()
+
+    with fitz.open(str(input_path)) as document:
+        if page_number > len(document):
+            raise ValueError("browser selection page is unavailable")
+        page = document[page_number - 1]
+        quads = _explicit_selection_rects(selection, page)
+        if action_value == "highlight":
+            annotation = page.add_highlight_annot(quads)
+        elif action_value == "underline":
+            annotation = page.add_underline_annot(quads)
+        else:
+            annotation = page.add_strikeout_annot(quads)
+        if annotation is None:
+            raise AnnotationWriteError(f"could not write {action_value} annotation")
+        annotation.set_colors(stroke=color)
+        annotation.update()
+        if progress_callback:
+            progress_callback(page_number, len(document))
+        if cancellation_check:
+            cancellation_check()
+        document.save(str(output_path), garbage=4, deflate=True)
+        page_count = len(document)
+
+    return ExplicitMarkupExecutionResult(
+        action=action_value,
+        mode=_enum_value(mode),
+        page_count=page_count,
+        selection={
+            **dict(selection),
+            "page": page_number,
+            "rects": [
+                {"x": rect.x0, "y": rect.y0, "width": rect.width, "height": rect.height}
+                for rect in quads
+            ],
+        },
     )
 
 
@@ -338,5 +484,6 @@ __all__ = [
     "SUPPORTED_OCR_MARKUP_ENGINES",
     "configured_ocr_markup_engine",
     "execute_ocr_markup",
+    "execute_ocr_markup_selection",
     "execute_ocr_markup_preview",
 ]

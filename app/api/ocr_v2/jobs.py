@@ -112,6 +112,7 @@ def submit(request: OCRV2JobSubmitRequest) -> OCRV2JobStatusResponse:
             "markup_mode": request.markup_mode,
             "markup_query": request.markup_query,
             "markup_color": request.markup_color,
+            "markup_selection": request.markup_selection.model_dump(mode="json") if request.markup_selection else None,
         },
         owner_identity=request.owner_identity,
     )
@@ -134,6 +135,7 @@ def submit(request: OCRV2JobSubmitRequest) -> OCRV2JobStatusResponse:
             markup_mode=request.markup_mode,
             markup_query=request.markup_query,
             markup_color=request.markup_color,
+            markup_selection=request.markup_selection.model_dump(mode="json") if request.markup_selection else None,
         )
     except Exception:
         update_job(job.id, status=JobState.failed, error="OCR V2 queue is unavailable.", error_code="TASK_STORAGE_UNAVAILABLE", message="OCR V2 queue submission failed")

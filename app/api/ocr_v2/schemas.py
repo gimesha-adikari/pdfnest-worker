@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import math
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -141,6 +142,41 @@ class OCRV2MarkupPreviewResponse(BaseModel):
     pages: list[OCRV2MarkupPreviewPageResponse]
 
 
+class OCRV2MarkupSelectionRect(BaseModel):
+    x: float
+    y: float
+    width: float
+    height: float
+
+    @model_validator(mode="after")
+    def validate_geometry(self) -> "OCRV2MarkupSelectionRect":
+        if not all(math.isfinite(value) for value in (self.x, self.y, self.width, self.height)) or self.width <= 0 or self.height <= 0:
+            raise ValueError("markup selection rectangles must have finite positive geometry")
+        return self
+
+
+class OCRV2MarkupSelection(BaseModel):
+    page: int = Field(ge=1, le=10000)
+    source: Literal["native", "ocr"]
+    coordinate_space: Literal["pdf_points_visible_cropbox_top_left"]
+    page_width: float = Field(gt=0, le=100000)
+    page_height: float = Field(gt=0, le=100000)
+    rotation: int = Field(default=0, ge=0, le=359)
+    crop_box: list[float] | None = Field(default=None, max_length=8)
+    word_ids: list[str] = Field(default_factory=list, max_length=1000)
+    rects: list[OCRV2MarkupSelectionRect] = Field(min_length=1, max_length=256)
+    text: str = Field(default="", max_length=500)
+
+    @model_validator(mode="after")
+    def validate_page_geometry(self) -> "OCRV2MarkupSelection":
+        if not math.isfinite(self.page_width) or not math.isfinite(self.page_height):
+            raise ValueError("markup selection page geometry must be finite")
+        for rect in self.rects:
+            if rect.x < -0.5 or rect.y < -0.5 or rect.x + rect.width > self.page_width + 0.5 or rect.y + rect.height > self.page_height + 0.5:
+                raise ValueError("markup selection rectangle is outside the page")
+        return self
+
+
 class OCRV2JobSubmitRequest(BaseModel):
     request_id: str = Field(min_length=1, max_length=128)
     profile: OCRV2Profile = OCRV2Profile.OCR_TEXT_V2
@@ -158,6 +194,7 @@ class OCRV2JobSubmitRequest(BaseModel):
     markup_mode: str = Field(default="smart", pattern=r"^(smart|ocr|native)$")
     markup_query: str | None = Field(default=None, max_length=500)
     markup_color: str = Field(default="#FFFF00", pattern=r"^#[0-9A-Fa-f]{6}$")
+    markup_selection: OCRV2MarkupSelection | None = None
 
     @model_validator(mode="after")
     def validate_sources(self) -> "OCRV2JobSubmitRequest":
@@ -168,8 +205,8 @@ class OCRV2JobSubmitRequest(BaseModel):
             raise ValueError("Document OCR profiles require source_key")
         if self.profile is OCRV2Profile.SEARCHABLE_PDF_V2 and not self.source_files:
             raise ValueError("Searchable PDF V2 requires ordered source_files")
-        if self.profile is OCRV2Profile.MARKUP_V2 and (not self.markup_action or not self.markup_query or not self.markup_query.strip()):
-            raise ValueError("Markup V2 requires an action and text query")
+        if self.profile is OCRV2Profile.MARKUP_V2 and (not self.markup_action or (not self.markup_query or not self.markup_query.strip()) and self.markup_selection is None):
+            raise ValueError("Markup V2 requires an action and text query or selection")
         return self
 
 
