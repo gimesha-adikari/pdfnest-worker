@@ -7,6 +7,7 @@ import fitz
 from app.api.tools.editor.document import group_words_by_line, ocr_words_for_page, sample_background_hex
 from app.core.ocr_v2 import OCRV2Worker
 from app.core.ocr_v2.contracts import PageProcessingSource
+from app.core.ocr_v2.errors import TextNotFoundError
 from app.core.ocr_v2.markup import MarkupAction as OCRV2MarkupAction, MarkupMode as OCRV2MarkupMode, _annotate, select_regions
 from app.core.ocr_v2.routing import RoutePolicy
 from app.core.ocr_v2.validation import OCRProfile
@@ -294,6 +295,25 @@ def process_markup_pdf_with_ocr_words(
         doc.close()
 
 
+def _select_studio_regions_with_boxes(
+        result: Any,
+        boxes: list[dict],
+        mode: OCRV2MarkupMode,
+) -> list[tuple[dict, Any]]:
+    """Resolve each Studio box independently so its identity survives selection."""
+    resolved: list[tuple[dict, Any]] = []
+    for box in boxes:
+        try:
+            selections = select_regions(result, [box], mode=mode)
+        except TextNotFoundError:
+            continue
+        resolved.extend((box, selection) for selection in selections)
+    if not resolved:
+        # Preserve the existing aggregate empty-selection error contract.
+        select_regions(result, boxes, mode=mode)
+    return resolved
+
+
 def process_markup_pdf_v2_regions(
         input_path: str,
         output_path: str,
@@ -323,19 +343,16 @@ def process_markup_pdf_v2_regions(
     if mode.strip().lower() == "manual":
         process_markup_pdf(input_path, output_path, boxes, action, mode="manual", password=password, progress_callback=progress_callback)
         return {"source_policy": "MANUAL_RECTANGLE", "selection_count": 0}
-    selected = select_regions(result, boxes, mode=OCRV2MarkupMode(mode.strip().lower()))
+    selected = _select_studio_regions_with_boxes(result, boxes, OCRV2MarkupMode(mode.strip().lower()))
     with fitz.open(input_path) as document:
-        for selection in selected:
-            matching_box = next(
-                (
-                    box for box in boxes
-                    if int(box.get("page", 1)) - 1 == selection.page_index
-                    and float(box.get("width", 0)) > 0
-                    and float(box.get("height", 0)) > 0
-                ),
-                None,
-            )
-            color = normalize_hex(matching_box.get("color", "#FFFF00")) if matching_box else (1.0, 1.0, 0.0)
+        for box, selection in selected:
+            color = normalize_hex(box.get("color", "#FFFF00"))
             _annotate(document[selection.page_index], selection, OCRV2MarkupAction(action), color)
         document.save(output_path, deflate=True, garbage=4)
-    return {"source_policy": "OCR_V2_CANONICAL_WORDS", "selection_count": len(selected), "selections": [selection.to_dict() for selection in selected]}
+    selection_payloads = []
+    for box, selection in selected:
+        payload = selection.to_dict()
+        payload["region_id"] = box.get("id")
+        payload["color"] = list(normalize_hex(box.get("color", "#FFFF00")))
+        selection_payloads.append(payload)
+    return {"source_policy": "OCR_V2_CANONICAL_WORDS", "selection_count": len(selected), "selections": selection_payloads}

@@ -50,6 +50,15 @@ from app.core.editor_ocr_engine import (
     EditorOcrEngineConfigurationError,
     execute_editor_ocr,
 )
+from app.core.studio_editor_extraction_engine import (
+    STUDIO_EDITOR_EXTRACTION_CONSUMER,
+    StudioEditorExtractionEngineConfigurationError,
+    execute_studio_editor_extraction,
+)
+from app.core.studio_markup_region_ocr_engine import (
+    StudioMarkupRegionOcrEngineConfigurationError,
+    execute_studio_markup_region_ocr,
+)
 from app.core.legacy_editor_ocr_engine import (
     LEGACY_EDITOR_CONSUMER,
     LegacyEditorOcrEngineConfigurationError,
@@ -782,10 +791,9 @@ def editor_extract_job(
             extractor = execute_legacy_editor_ocr
         elif ocr_v2 and consumer == EDITOR_OCR_CONSUMER_GENERAL_EDITOR:
             extractor = execute_editor_ocr
+        elif ocr_v2 and consumer == STUDIO_EDITOR_EXTRACTION_CONSUMER:
+            extractor = execute_studio_editor_extraction
         elif ocr_v2:
-            # Studio and legacy/private callers remain on the existing
-            # internal editor V2 implementation. The selector is scoped to
-            # the explicitly marked General Editor consumer only.
             extractor = extract_document_v2
         else:
             extractor = extract_document
@@ -818,10 +826,17 @@ def editor_extract_job(
             message="Editor extraction cancelled",
         )
         return
-    except (
-        EditorOcrEngineConfigurationError,
-        LegacyEditorOcrEngineConfigurationError,
-    ):
+    except StudioEditorExtractionEngineConfigurationError:
+        update_job(
+            job_id,
+            status=JobState.failed,
+            finished_at=datetime.now(timezone.utc),
+            error="Studio editor extraction engine configuration is invalid.",
+            error_code="INVALID_CONFIGURATION",
+            message="Studio editor extraction engine configuration is invalid",
+        )
+        return
+    except (EditorOcrEngineConfigurationError, LegacyEditorOcrEngineConfigurationError):
         update_job(
             job_id,
             status=JobState.failed,
@@ -1108,14 +1123,14 @@ def _run_markup_job(
                 progress_callback=on_progress,
             )
         elif route == "studio_ocr_v2":
-            from app.api.tools.markup.document import process_markup_pdf_v2_regions
-            process_markup_pdf_v2_regions(
+            execute_studio_markup_region_ocr(
                 input_path=input_path,
                 output_path=output_pdf_path,
                 boxes=boxes,
                 action=action,  # type: ignore[arg-type]
                 mode=mode,      # type: ignore[arg-type]
                 password=file_password,
+                cancellation_check=lambda: check_cancellation(job_id),
                 progress_callback=on_progress,
             )
         else:
@@ -1162,6 +1177,16 @@ def _run_markup_job(
             status=JobState.failed,
             finished_at=datetime.now(timezone.utc),
             error="Legacy markup OCR engine configuration is invalid.",
+            error_code="INVALID_CONFIGURATION",
+            message=f"{action.title()} engine configuration is invalid",
+        )
+        return
+    except StudioMarkupRegionOcrEngineConfigurationError:
+        update_job(
+            job_id,
+            status=JobState.failed,
+            finished_at=datetime.now(timezone.utc),
+            error="Studio region markup OCR engine configuration is invalid.",
             error_code="INVALID_CONFIGURATION",
             message=f"{action.title()} engine configuration is invalid",
         )

@@ -55,6 +55,8 @@ def validate_runtime_config() -> None:
     from app.core.pdf_to_word_ocr_engine import configured_pdf_to_word_ocr_engine
     from app.core.ocr_markup_engine import configured_ocr_markup_engine
     from app.core.editor_ocr_engine import configured_editor_ocr_engine
+    from app.core.studio_editor_extraction_engine import configured_studio_editor_extraction_engine
+    from app.core.studio_markup_region_ocr_engine import configured_studio_markup_region_ocr_engine
     from app.core.legacy_editor_ocr_engine import configured_legacy_editor_ocr_engine
     from app.core.legacy_markup_ocr_engine import configured_legacy_markup_ocr_engine
 
@@ -65,6 +67,8 @@ def validate_runtime_config() -> None:
     configured_pdf_to_word_ocr_engine()
     configured_ocr_markup_engine()
     configured_editor_ocr_engine()
+    configured_studio_editor_extraction_engine()
+    configured_studio_markup_region_ocr_engine()
     configured_legacy_editor_ocr_engine()
     configured_legacy_markup_ocr_engine()
     if not is_managed_environment():

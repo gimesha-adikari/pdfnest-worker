@@ -99,6 +99,20 @@ def test_runtime_config_rejects_invalid_editor_ocr_engine_selector(monkeypatch):
         validate_runtime_config()
 
 
+def test_runtime_config_rejects_invalid_studio_editor_extraction_engine_selector(monkeypatch):
+    monkeypatch.setenv("STUDIO_EDITOR_EXTRACTION_ENGINE", "not-an-engine")
+
+    with pytest.raises(ValueError, match="STUDIO_EDITOR_EXTRACTION_ENGINE"):
+        validate_runtime_config()
+
+
+def test_runtime_config_rejects_invalid_studio_markup_region_ocr_engine_selector(monkeypatch):
+    monkeypatch.setenv("STUDIO_MARKUP_REGION_OCR_ENGINE", "not-an-engine")
+
+    with pytest.raises(ValueError, match="STUDIO_MARKUP_REGION_OCR_ENGINE"):
+        validate_runtime_config()
+
+
 def test_runtime_config_rejects_invalid_legacy_editor_ocr_engine_selector(monkeypatch):
     monkeypatch.delenv("OCR_TEXT_ENGINE", raising=False)
     monkeypatch.delenv("SEARCHABLE_PDF_ENGINE", raising=False)

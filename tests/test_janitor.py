@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import tempfile
 import time
+from uuid import uuid4
 from app.api.tools.editor.utils import get_temp_dir
 from app.core.janitor import sweep_worker_temp_files
 
@@ -52,3 +53,34 @@ def test_worker_janitor_symlink_safety() -> None:
     finally:
         if os.path.exists(external_file):
             os.remove(external_file)
+
+
+def test_worker_janitor_preserves_local_storage_root() -> None:
+    storage_root = os.path.join(tempfile.gettempdir(), "pdfnest-storage")
+    studio_dir = os.path.join(storage_root, "studio")
+    sources_dir = os.path.join(studio_dir, "sources")
+    root_preexisting = os.path.exists(storage_root)
+    studio_preexisting = os.path.exists(studio_dir)
+    sources_preexisting = os.path.exists(sources_dir)
+    marker = os.path.join(sources_dir, f"janitor-regression-{uuid4().hex}.pdf")
+    os.makedirs(sources_dir, exist_ok=True)
+    with open(marker, "w") as f:
+        f.write("local Studio object")
+
+    old_time = time.time() - 7200
+    os.utime(storage_root, (old_time, old_time))
+    os.utime(marker, (old_time, old_time))
+
+    try:
+        evicted = sweep_worker_temp_files(file_ttl_seconds=3600)
+        assert evicted == 0
+        assert os.path.exists(marker)
+    finally:
+        if os.path.exists(marker):
+            os.remove(marker)
+        if not sources_preexisting and os.path.isdir(sources_dir) and not os.listdir(sources_dir):
+            os.rmdir(sources_dir)
+        if not studio_preexisting and os.path.isdir(studio_dir) and not os.listdir(studio_dir):
+            os.rmdir(studio_dir)
+        if not root_preexisting and os.path.isdir(storage_root) and not os.listdir(storage_root):
+            os.rmdir(storage_root)

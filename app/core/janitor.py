@@ -16,6 +16,14 @@ ALLOWED_WORKER_PREFIXES = (
     "pdf2docx_",
 )
 
+# The shared local object store is durable application state, not a worker
+# scratch directory. It intentionally lives under /tmp for local development,
+# so the janitor must not treat the `pdfnest-` prefix as sufficient ownership
+# evidence for this exact directory.
+PERSISTENT_WORKER_DIRECTORIES = {
+    "pdfnest-storage",
+}
+
 
 def sweep_worker_temp_files(file_ttl_seconds: int = 3600) -> int:
     now = time.time()
@@ -33,6 +41,8 @@ def sweep_worker_temp_files(file_ttl_seconds: int = 3600) -> int:
 
         for name in entries:
             if check_prefix and not name.startswith(ALLOWED_WORKER_PREFIXES):
+                continue
+            if check_prefix and name in PERSISTENT_WORKER_DIRECTORIES:
                 continue
 
             full_path = os.path.join(dir_path, name)

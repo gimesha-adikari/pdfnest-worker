@@ -220,7 +220,7 @@ def test_editor_actor_routes_general_editor_only_to_selected_boundary(
     assert updates[-1]["status"] == JobState.succeeded
 
 
-def test_editor_actor_keeps_studio_on_internal_v2_path(
+def test_editor_actor_routes_studio_to_its_own_boundary(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -231,14 +231,16 @@ def test_editor_actor_keeps_studio_on_internal_v2_path(
     monkeypatch.setattr(
         actors,
         "execute_editor_ocr",
-        lambda *_args, **_kwargs: pytest.fail("Studio must not use the General Editor SDK boundary"),
+        lambda *_args, **_kwargs: pytest.fail(
+            "Studio must not use the General Editor SDK boundary"
+        ),
     )
 
-    def internal_execute(*_args: object, **_kwargs: object) -> dict[str, object]:
-        calls.append("internal")
+    def studio_execute(*_args: object, **_kwargs: object) -> dict[str, object]:
+        calls.append("studio")
         return {"success": True}
 
-    monkeypatch.setattr(actors, "extract_document_v2", internal_execute)
+    monkeypatch.setattr(actors, "execute_studio_editor_extraction", studio_execute)
 
     actors.editor_extract_job(
         "123e4567-e89b-12d3-a456-426614174001",
@@ -249,5 +251,5 @@ def test_editor_actor_keeps_studio_on_internal_v2_path(
         "studio",
     )
 
-    assert calls == ["internal"]
+    assert calls == ["studio"]
     assert updates[-1]["status"] == JobState.succeeded
