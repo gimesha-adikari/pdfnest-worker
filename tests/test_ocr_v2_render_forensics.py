@@ -130,6 +130,43 @@ def test_renderer_uses_unicode_capable_font_for_non_ascii_ocr_tokens(tmp_path: P
         assert [word[4] for word in document[0].get_text("words")] == ["€&"]
 
 
+def test_renderer_preserves_tamil_and_sinhala_script_tokens(tmp_path: Path) -> None:
+    image_path = tmp_path / "script-tokens.png"
+    Image.new("RGB", (400, 240), "white").save(image_path)
+    source = tmp_path / "source.pdf"
+    normalized = build_image_source_pdf([image_path], source)[0]
+    geometry = PageGeometry(normalized.page_width, normalized.page_height, pixel_width=normalized.width, pixel_height=normalized.height)
+    tokens = (
+        OCRToken("token-ta", "தமிழ்", Rect(30, 40, 40, 12)),
+        OCRToken("token-si", "සිංහල", Rect(80, 40, 40, 12)),
+    )
+    page = PageResult(
+        page_index=0,
+        page_id="page-0",
+        geometry=geometry,
+        content_classification=PageContentClassification.IMAGE_SCAN,
+        processing_source=PageProcessingSource.OCR_RECOGNITION,
+        status=PageStatus.SUCCESS,
+        text="தமிழ் සිංහල",
+        tokens=tokens,
+        reading_order=("token-ta", "token-si"),
+        language=LanguageMetadata(("ta", "si"), (), "REQUESTED_ONLY", (), "NOT_DETECTED"),
+        capabilities=frozenset({ResultCapability.TEXT.value, ResultCapability.WORD_GEOMETRY.value, ResultCapability.READING_ORDER.value}),
+    )
+    result = DocumentResult(
+        schema_version="ocr_v2.1",
+        result_id="script-font-regression",
+        source=SourceMetadata(str(source), 1, source.name),
+        pages=(page,),
+        capabilities=frozenset({ResultCapability.TEXT.value, ResultCapability.WORD_GEOMETRY.value, ResultCapability.READING_ORDER.value}),
+        provenance=(Provenance("script-font-regression"),),
+    )
+    output = tmp_path / "rendered.pdf"
+    SearchablePdfRenderer().render(source, result, output)
+    with fitz.open(output) as document:
+        assert [word[4] for word in document[0].get_text("words")] == ["தமிழ்", "සිංහල"]
+
+
 def test_validator_retains_distinct_text_and_visual_substages(tmp_path: Path) -> None:
     _, source, result = _searchable_fixture(tmp_path)
 

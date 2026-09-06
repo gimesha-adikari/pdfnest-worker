@@ -22,6 +22,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libopenjp2-7 \
     zlib1g \
     fonts-dejavu-core \
+    fonts-noto-core \
+    fonts-noto-cjk \
     libglib2.0-0 \
     libnss3 \
     libx11-6 \
