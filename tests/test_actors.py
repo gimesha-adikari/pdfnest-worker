@@ -20,10 +20,39 @@ from app.core.ocr_v2.errors import RenderingNotEligibleError
 
 def test_actor_time_limits():
     assert editor_extract_job.options.get("time_limit") == 600_000
+    assert editor_extract_job.options.get("max_retries") == 0
     assert editor_compile_job.options.get("time_limit") == 600_000
     assert markup_highlight_job.options.get("time_limit") == 900_000
     assert markup_underline_job.options.get("time_limit") == 900_000
     assert markup_strikeout_job.options.get("time_limit") == 900_000
+
+
+def test_stuck_job_timeout_and_lease_release():
+    from app.jobs.limiter import acquire_lease, LEASE_KEY_PREFIX
+
+    job = create_job("editor_extract", owner_identity="user_test_stuck")
+    update_job(job.id, status=JobState.running, progress=0, message="Editor extraction started")
+
+    # Simulate lease acquired
+    acquire_lease(job.id, "user_test_stuck")
+    assert redis_client.exists(f"{LEASE_KEY_PREFIX}{job.id}")
+
+    # Set updated_at to 200 seconds ago (exceeding default 180s)
+    from app.jobs.store import job_key
+    stale_time = utcnow() - timedelta(seconds=200)
+    job_record = get_job(job.id)
+    assert job_record is not None
+    job_record.updated_at = stale_time
+    redis_client.set(job_key(job.id), job_record.model_dump_json())
+
+    # Calling get_job should detect stuck job and transition it to failed
+    timed_out_job = get_job(job.id)
+    assert timed_out_job is not None
+    assert timed_out_job.status == JobState.failed
+    assert "terminated unexpectedly or job timed out" in timed_out_job.error
+
+    # Verify lease was released
+    assert not redis_client.exists(f"{LEASE_KEY_PREFIX}{job.id}")
 
 
 def test_is_non_retryable_error_classification():

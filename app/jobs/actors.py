@@ -735,7 +735,7 @@ def _run_structured_document_job(
         if claimed:
             _cleanup_input_objects([source_key])
         cleanup_paths(input_path)
-@dramatiq.actor(queue_name="editor", max_retries=3, time_limit=600_000)
+@dramatiq.actor(queue_name="editor", max_retries=0, time_limit=600_000)
 def editor_extract_job(
         job_id: str,
         source_key: str,

@@ -169,6 +169,33 @@ def get_job(job_id: str) -> JobRecord | None:
                             pipe.multi()
                             pipe.set(k, current_job.model_dump_json(), ex=settings.job_ttl_seconds)
                             pipe.execute()
+
+                            try:
+                                from app.jobs.limiter import release_lease
+                                release_lease(current_job.id, current_job.owner_identity)
+                            except Exception as lease_err:
+                                logger.warning("Failed to release lease for stuck job %s: %s", current_job.id, lease_err)
+
+                            try:
+                                task_key = f"pdfnest:tasks:{current_job.id}"
+                                existing_task_raw = redis_client.get(task_key)
+                                existing_task = json.loads(existing_task_raw) if existing_task_raw else {}
+                                task_data = {
+                                    "id": current_job.id,
+                                    "status": "FAILED",
+                                    "progress": current_job.progress,
+                                    "resultKey": "",
+                                    "resultUrl": "",
+                                    "ownerIdentity": existing_task.get("ownerIdentity", current_job.owner_identity or ""),
+                                    "reservationId": existing_task.get("reservationId", ""),
+                                    "downloadToken": existing_task.get("downloadToken", ""),
+                                    "error": current_job.error,
+                                    "updatedAt": int(current_job.updated_at.timestamp()),
+                                }
+                                redis_client.set(task_key, json.dumps(task_data), ex=3600)
+                            except Exception as sync_err:
+                                logger.warning("Failed to sync stuck task %s: %s", current_job.id, sync_err)
+
                             return current_job
                         else:
                             pipe.unwatch()

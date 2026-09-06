@@ -110,7 +110,7 @@ class Settings:
     port: int = int(os.getenv("PORT", "8000"))
     redis_url: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
     job_ttl_seconds: int = int(os.getenv("JOB_TTL_SECONDS", "86400"))
-    stuck_job_timeout_seconds: int = int(os.getenv("STUCK_JOB_TIMEOUT_SECONDS", "1200"))
+    stuck_job_timeout_seconds: int = int(os.getenv("STUCK_JOB_TIMEOUT_SECONDS", "180"))
     global_heavy_execution_limit: int = int(os.getenv("GLOBAL_HEAVY_EXECUTION_LIMIT", os.getenv("MAX_CONCURRENT_HEAVY_JOBS", "4")))
     per_identity_heavy_execution_limit: int = int(os.getenv("PER_IDENTITY_HEAVY_EXECUTION_LIMIT", "2"))
     heavy_lease_ttl_seconds: int = int(os.getenv("HEAVY_LEASE_TTL_SECONDS", "600"))
