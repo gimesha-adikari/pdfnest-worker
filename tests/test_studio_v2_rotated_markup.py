@@ -66,15 +66,14 @@ def test_studio_v2_smart_markup_on_all_rotations(tmp_path: Path, rotation: int, 
     # Simulate user dragging over the visually rendered text in displayed page coordinates:
     display_box = _canonical_to_display(400, 300, rotation, canonical_target)
 
-    # Frontend converts display box to canonical coordinates before sending to worker:
-    worker_box = _display_to_canonical(400, 300, rotation, display_box)
+    # Studio V2 sends visible display coordinates directly:
     payload_box = {
         "id": f"reg-{rotation}-{action}",
         "page": 1,
-        "x": worker_box["x"],
-        "y": worker_box["y"],
-        "width": worker_box["width"],
-        "height": worker_box["height"],
+        "x": display_box["x"],
+        "y": display_box["y"],
+        "width": display_box["width"],
+        "height": display_box["height"],
         "color": "#FFFF00",
     }
 
@@ -124,14 +123,14 @@ def test_studio_v2_manual_markup_on_all_rotations(tmp_path: Path, rotation: int,
 
     canonical_target = {"x": 55.0, "y": 58.0, "width": 240.0, "height": 30.0}
     display_box = _canonical_to_display(400, 300, rotation, canonical_target)
-    worker_box = _display_to_canonical(400, 300, rotation, display_box)
+    # Studio V2 sends visible display coordinates directly:
     payload_box = {
         "id": f"reg-manual-{rotation}-{action}",
         "page": 1,
-        "x": worker_box["x"],
-        "y": worker_box["y"],
-        "width": worker_box["width"],
-        "height": worker_box["height"],
+        "x": display_box["x"],
+        "y": display_box["y"],
+        "width": display_box["width"],
+        "height": display_box["height"],
         "color": "#FFFF00",
     }
 

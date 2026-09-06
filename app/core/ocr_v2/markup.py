@@ -279,9 +279,11 @@ def select_regions(
 
 def _annotate(page: fitz.Page, selection: MarkupSelection, action: MarkupAction, color: tuple[float, float, float]) -> None:
     try:
-        # PyMuPDF accepts rectangles here and converts them to axis-aligned
-        # annotation quads while retaining the canonical PDF-point geometry.
-        quads = [fitz.Rect(rect.x, rect.y, rect.x1, rect.y1) for rect in selection.group_rects]
+        derotation = page.derotation_matrix if getattr(page, "rotation", 0) else None
+        if derotation is not None:
+            quads = [fitz.Rect(rect.x, rect.y, rect.x1, rect.y1) * derotation for rect in selection.group_rects]
+        else:
+            quads = [fitz.Rect(rect.x, rect.y, rect.x1, rect.y1) for rect in selection.group_rects]
         if action is MarkupAction.HIGHLIGHT:
             annotation = page.add_highlight_annot(quads)
         elif action is MarkupAction.UNDERLINE:

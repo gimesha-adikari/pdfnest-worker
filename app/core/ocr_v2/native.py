@@ -6,6 +6,8 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+import pymupdf as fitz
+
 from .contracts import PageContentClassification, PageGeometry
 
 
@@ -44,18 +46,23 @@ class NativeExtractor:
         items: list[dict[str, Any]] = []
         page_width = max(float(page.rect.width), 0.0)
         page_height = max(float(page.rect.height), 0.0)
+        page_rotation = getattr(page, "rotation", 0)
+        rotation_matrix = page.rotation_matrix if page_rotation else None
         for index, word in enumerate(words):
             if len(word) < 5 or not str(word[4]).strip():
                 continue
+            word_rect = fitz.Rect(word[:4])
+            if rotation_matrix is not None:
+                word_rect *= rotation_matrix
             # PyMuPDF can return glyph boxes that extend by a few points past
             # the visible crop box when text is positioned at an edge. Keep
             # the extractor's real geometry, clipped to the visible page
             # contract, instead of allowing one edge glyph to invalidate an
             # otherwise trustworthy native-text result.
-            x0 = min(max(float(word[0]), 0.0), page_width)
-            y0 = min(max(float(word[1]), 0.0), page_height)
-            x1 = min(max(float(word[2]), x0), page_width)
-            y1 = min(max(float(word[3]), y0), page_height)
+            x0 = min(max(float(word_rect.x0), 0.0), page_width)
+            y0 = min(max(float(word_rect.y0), 0.0), page_height)
+            x1 = min(max(float(word_rect.x1), x0), page_width)
+            y1 = min(max(float(word_rect.y1), y0), page_height)
             if x1 <= x0 or y1 <= y0:
                 continue
             items.append(

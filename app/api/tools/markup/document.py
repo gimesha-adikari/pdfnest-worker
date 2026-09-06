@@ -350,7 +350,7 @@ def process_markup_pdf_v2_regions(
             mode="manual",
             password=password,
             progress_callback=progress_callback,
-            canonical_boxes=True,
+            canonical_boxes=False,
         )
         return {"source_policy": "MANUAL_RECTANGLE", "selection_count": 0}
     selected = _select_studio_regions_with_boxes(result, boxes, OCRV2MarkupMode(mode.strip().lower()))
