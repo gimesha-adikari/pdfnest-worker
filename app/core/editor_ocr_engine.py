@@ -65,6 +65,8 @@ def _internal_execute(
     *,
     cancellation_check: CancellationCheck | None,
     page_progress_callback: PageProgressCallback | None,
+    language_mode: str,
+    languages: tuple[str, ...],
 ) -> Any:
     """Call the unchanged internal Editor V2 implementation."""
 
@@ -75,6 +77,8 @@ def _internal_execute(
         password,
         cancellation_check=cancellation_check,
         page_progress_callback=page_progress_callback,
+        language_mode=language_mode,
+        languages=languages,
     )
 
 
@@ -121,6 +125,9 @@ def _raise_failed_page(result: Any) -> None:
         return
     if getattr(failed, "failure_code", None) == "EngineUnavailableError":
         raise EngineUnavailableError("OCR V2 editor extraction engine is unavailable")
+    if getattr(failed, "failure_code", None) == "LanguageDetectionUncertainError":
+        from app.core.editor_language import EditorLanguageRequiredError
+        raise EditorLanguageRequiredError("automatic language detection was uncertain")
     raise RuntimeError("OCR V2 editor extraction failed for a page")
 
 
@@ -130,13 +137,19 @@ def _sdk_execute(
     *,
     cancellation_check: CancellationCheck | None,
     page_progress_callback: PageProgressCallback | None,
+    language_mode: str,
+    languages: tuple[str, ...],
 ) -> dict[str, Any]:
+    from app.core.editor_language import EditorLanguageRequiredError, editor_language_intent
+    intent = editor_language_intent(language_mode, languages)
     processor = _sdk_processor()
     try:
         result = processor.extract_text(
             input_path,
             password=password,
-            language="eng",
+            language=intent.expression,
+            language_mode=intent.mode,
+            languages=intent.languages,
             profile=_sdk_profile(),
             # The existing Editor V2 path explicitly uses the Tesseract route.
             routing_policy="FAST",
@@ -144,11 +157,13 @@ def _sdk_execute(
             page_progress_callback=page_progress_callback,
         )
     except Exception as exc:
+        if type(exc).__name__ == "LanguageDetectionUncertainError":
+            raise EditorLanguageRequiredError(str(exc)) from exc
         _translate_sdk_exception(exc)
         raise
 
     _raise_failed_page(result)
-    return project_editor_result(result)
+    projected = project_editor_result(result); projected["language_mode"] = intent.mode; projected["languages"] = list(intent.languages); return projected
 
 
 def execute_editor_ocr(
@@ -157,9 +172,13 @@ def execute_editor_ocr(
     *,
     cancellation_check: CancellationCheck | None = None,
     page_progress_callback: PageProgressCallback | None = None,
+    language_mode: str = "EXPLICIT",
+    languages: list[str] | tuple[str, ...] | None = None,
 ) -> Any:
     """Execute General Editor OCR V2 through the selected implementation."""
 
+    from app.core.editor_language import editor_language_intent
+    intent = editor_language_intent(language_mode, languages)
     selected = configured_editor_ocr_engine()
     logger.info("OCR_V2_EDITOR_ENGINE consumer=general_editor engine=%s", selected)
     if selected == "internal":
@@ -168,12 +187,16 @@ def execute_editor_ocr(
             password,
             cancellation_check=cancellation_check,
             page_progress_callback=page_progress_callback,
+            language_mode=intent.mode,
+            languages=intent.languages,
         )
     return _sdk_execute(
         input_path,
         password,
         cancellation_check=cancellation_check,
         page_progress_callback=page_progress_callback,
+        language_mode=intent.mode,
+        languages=intent.languages,
     )
 
 

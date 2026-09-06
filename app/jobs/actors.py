@@ -55,6 +55,7 @@ from app.core.studio_editor_extraction_engine import (
     StudioEditorExtractionEngineConfigurationError,
     execute_studio_editor_extraction,
 )
+from app.core.editor_language import EditorLanguageConfigurationError, EditorLanguageRequiredError
 from app.core.studio_markup_region_ocr_engine import (
     StudioMarkupRegionOcrEngineConfigurationError,
     execute_studio_markup_region_ocr,
@@ -742,6 +743,8 @@ def editor_extract_job(
         source_name: str | None = None,
         ocr_v2: bool = False,
         consumer: str = "legacy",
+        language_mode: str = "EXPLICIT",
+        languages: list[str] | None = None,
 ) -> None:
     job = get_job(job_id)
     if job is None:
@@ -803,6 +806,8 @@ def editor_extract_job(
         }
         if ocr_v2:
             extractor_kwargs["page_progress_callback"] = report_editor_page
+            extractor_kwargs["language_mode"] = language_mode
+            extractor_kwargs["languages"] = languages or ["eng"]
         result = extractor(input_path, password, **extractor_kwargs)
         check_cancellation(job_id)
 
@@ -835,6 +840,12 @@ def editor_extract_job(
             error_code="INVALID_CONFIGURATION",
             message="Studio editor extraction engine configuration is invalid",
         )
+        return
+    except EditorLanguageRequiredError:
+        update_job(job_id, status=JobState.failed, finished_at=datetime.now(timezone.utc), error="Automatic language detection was uncertain. Choose an OCR language and retry.", error_code="LANGUAGE_REQUIRED", message="Editor OCR language selection required")
+        return
+    except EditorLanguageConfigurationError:
+        update_job(job_id, status=JobState.failed, finished_at=datetime.now(timezone.utc), error="Editor OCR language configuration is invalid.", error_code="INVALID_CONFIGURATION", message="Editor OCR language configuration is invalid")
         return
     except (EditorOcrEngineConfigurationError, LegacyEditorOcrEngineConfigurationError):
         update_job(

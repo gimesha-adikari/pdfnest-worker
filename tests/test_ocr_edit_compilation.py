@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
 import tempfile
 import fitz
 from app.api.tools.editor.document import compile_document, extract_document
@@ -77,3 +79,61 @@ def test_compile_document_ocr_scanned_page_text_replacement():
         # The replacement text MUST be rendered onto the compiled PDF page!
         assert "REPLACEMENT OCR TEXT SUCCESS" in out_text
         assert "ORIGINAL OCR TEXT" not in out_text
+
+
+def test_compile_document_output_opens_preserves_page_count_and_unchanged_page():
+    """Independently validate a native edit and an untouched scanned page."""
+    with tempfile.TemporaryDirectory() as tmp:
+        source_path = f"{tmp}/source.pdf"
+        output_path = f"{tmp}/output.pdf"
+        layout_path = f"{tmp}/layout.json"
+        doc = fitz.open()
+        native = doc.new_page(width=400, height=500)
+        native.insert_text((72, 100), "ORIGINAL NATIVE", fontsize=18, fontname="helv")
+        scanned = doc.new_page(width=400, height=500)
+        pix = fitz.Pixmap(fitz.csRGB, fitz.Rect(0, 0, 400, 500), False)
+        pix.clear_with(232)
+        scanned.insert_image(scanned.rect, pixmap=pix)
+        doc.save(source_path)
+        doc.close()
+
+        with fitz.open(source_path) as source:
+            rect = source[0].search_for("ORIGINAL NATIVE")[0]
+            unchanged_before = bytes(source[1].get_pixmap(matrix=fitz.Matrix(0.5, 0.5)).samples)
+        layout = {
+            "schema_version": "ocr_v2_editor_layout.v1",
+            "pages": [
+                {
+                    "page_num": 1,
+                    "width": 400,
+                    "height": 500,
+                    "kind": "text",
+                    "elements": [{
+                        "id": "native-p1-e1",
+                        "text": "UPDATED NATIVE",
+                        "original_text": "ORIGINAL NATIVE",
+                        "x": rect.x0,
+                        "y": rect.y0,
+                        "width": rect.width,
+                        "height": rect.height,
+                        "size": 18,
+                        "font": "helv",
+                    }],
+                },
+                {"page_num": 2, "width": 400, "height": 500, "kind": "scanned", "is_ocr": True, "elements": []},
+            ],
+        }
+        with open(layout_path, "w", encoding="utf-8") as handle:
+            json.dump(layout, handle)
+
+        compile_document(source_path, output_path, layout_path)
+
+        with fitz.open(output_path) as output:
+            assert output.page_count == 2
+            compiled_text = output[0].get_text()
+            assert "UPDATED" in compiled_text
+            assert "NATIVE" in compiled_text
+            assert "ORIGINAL" not in compiled_text
+            assert bytes(output[1].get_pixmap(matrix=fitz.Matrix(0.5, 0.5)).samples) == unchanged_before
+        if qpdf := shutil.which("qpdf"):
+            subprocess.run([qpdf, "--check", output_path], check=True, capture_output=True, text=True)

@@ -417,6 +417,8 @@ def extract_document_v2(
     password: str | None = None,
     cancellation_check: Callable[[], None] | None = None,
     page_progress_callback: Callable[[int, int, Any], None] | None = None,
+    language_mode: str = "EXPLICIT",
+    languages: list[str] | tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     """Extract editor layout through the shared OCR V2 canonical result.
 
@@ -428,21 +430,34 @@ def extract_document_v2(
         route_policy=RoutePolicy(preferred_engine="tesseract_v2", fallback_engine="tesseract_v2"),
         max_raster_pixels=25_000_000,
     )
-    result = worker.process_document(
+    from app.core.editor_language import EditorLanguageRequiredError, editor_language_intent
+    from app.core.ocr_v2.errors import LanguageDetectionUncertainError
+    intent = editor_language_intent(language_mode, languages)
+    try:
+        result = worker.process_document(
         input_path,
         password=password,
-        language="eng",
+        language=intent.expression,
+        language_mode=intent.mode,
+        languages=intent.languages,
         profile=OCRProfile.OCR_TEXT_V2,
         cancellation_check=cancellation_check,
         page_progress_callback=page_progress_callback,
-    )
+        )
+    except LanguageDetectionUncertainError as exc:
+        raise EditorLanguageRequiredError(str(exc)) from exc
     failed = first_failed_editor_page(result)
     if failed is not None:
         if failed.failure_code == "EngineUnavailableError":
             raise EngineUnavailableError("OCR V2 editor extraction engine is unavailable")
+        if failed.failure_code == "LanguageDetectionUncertainError":
+            raise EditorLanguageRequiredError("automatic language detection was uncertain")
         raise RuntimeError("OCR V2 editor extraction failed for a page")
 
-    return project_editor_result(result)
+    projected = project_editor_result(result)
+    projected["language_mode"] = intent.mode
+    projected["languages"] = list(intent.languages)
+    return projected
 
 
 def is_element_dirty(element: dict[str, Any]) -> bool:

@@ -4,7 +4,7 @@ from typing import Literal
 
 from fastapi import APIRouter, HTTPException, status
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
 from app.core.editor_ocr_engine import (
@@ -27,6 +27,8 @@ class ExtractRequest(BaseModel):
     source_name: str | None = None
     ocr_v2: bool = False
     consumer: Literal["general_editor", "studio", "legacy", "legacy_editor"] = EDITOR_OCR_CONSUMER_LEGACY
+    language_mode: Literal["AUTO", "EXPLICIT"] = "EXPLICIT"
+    languages: list[Literal["eng", "sin", "tam"]] = Field(default_factory=lambda: ["eng"], min_length=1, max_length=3)
 
 
 class CompileRequest(BaseModel):
@@ -55,6 +57,8 @@ async def extract_layout(payload: ExtractRequest) -> JobSubmissionResponse:
         source_name,
         payload.ocr_v2,
         payload.consumer,
+        payload.language_mode,
+        payload.languages,
     )
     logger.info("Dispatched extract job %s for %s", job.id, source_name)
 
