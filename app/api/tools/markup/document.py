@@ -145,6 +145,7 @@ def apply_markup(
         mode: MarkupMode = "smart",
         progress_callback: Callable[[int, int], None] | None = None,
         ocr_word_items_by_page: Mapping[int, list[dict[str, Any]]] | None = None,
+        canonical_boxes: bool = False,
 ) -> None:
     total = max(1, len(boxes))
     mode = (mode or "smart").strip().lower()
@@ -166,13 +167,12 @@ def apply_markup(
             continue
 
         page = doc[page_num - 1]
-        # Studio sends rectangles in the visible page coordinate system. PDF
-        # drawing/text APIs use an unrotated page context, so derotate the
-        # selection and temporarily draw with page rotation disabled. CropBox
-        # coordinates are intentionally relative to the visible crop, not the
-        # original uncropped MediaBox.
+        # Legacy manual callers send rectangles in the visible page coordinate
+        # system and require derotation matrix transformation. Studio V2 sends
+        # canonical top-left CropBox PDF points, which are already in unrotated
+        # space and must not be derotated twice.
         page_rotation = page.rotation
-        derotation = page.derotation_matrix if page_rotation else None
+        derotation = page.derotation_matrix if (page_rotation and not canonical_boxes) else None
         if page_rotation:
             page.set_rotation(0)
         selection_rect = fitz.Rect(x, y, x + width, y + height)
@@ -252,10 +252,11 @@ def process_markup_pdf(
         mode: MarkupMode = "smart",
         password: str | None = None,
         progress_callback: Callable[[int, int], None] | None = None,
+        canonical_boxes: bool = False,
 ) -> None:
     doc = open_document(input_path, password)
     try:
-        apply_markup(doc, boxes, action=action, mode=mode, progress_callback=progress_callback)
+        apply_markup(doc, boxes, action=action, mode=mode, progress_callback=progress_callback, canonical_boxes=canonical_boxes)
         doc.save(output_path, deflate=True, garbage=4)
     finally:
         doc.close()
@@ -341,7 +342,16 @@ def process_markup_pdf_v2_regions(
         page_progress_callback=lambda done, total, _page: progress_callback(done, total) if progress_callback else None,
     )
     if mode.strip().lower() == "manual":
-        process_markup_pdf(input_path, output_path, boxes, action, mode="manual", password=password, progress_callback=progress_callback)
+        process_markup_pdf(
+            input_path,
+            output_path,
+            boxes,
+            action,
+            mode="manual",
+            password=password,
+            progress_callback=progress_callback,
+            canonical_boxes=True,
+        )
         return {"source_policy": "MANUAL_RECTANGLE", "selection_count": 0}
     selected = _select_studio_regions_with_boxes(result, boxes, OCRV2MarkupMode(mode.strip().lower()))
     with fitz.open(input_path) as document:
