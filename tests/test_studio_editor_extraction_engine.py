@@ -89,7 +89,7 @@ def test_sdk_studio_editor_path_uses_public_processor_projection_and_callbacks(
     monkeypatch.setenv(engine.STUDIO_EDITOR_EXTRACTION_ENGINE_ENV, "sdk")
     monkeypatch.setattr(engine, "_sdk_processor", lambda: FakeProcessor())
     monkeypatch.setattr(engine, "_sdk_profile", lambda: "OCR_TEXT_V2")
-    monkeypatch.setattr(engine, "project_editor_result", lambda result: projected)
+    monkeypatch.setattr(engine, "project_studio_editor_result", lambda result: projected)
     monkeypatch.setattr(
         engine,
         "_internal_execute",

@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 from typing import Any, Callable
 
-from app.core.editor_ocr_projection import first_failed_editor_page, project_editor_result
+from app.core.editor_ocr_projection import first_failed_editor_page, project_studio_editor_result
 from app.core.ocr_v2.errors import EngineUnavailableError
 
 
@@ -144,7 +144,10 @@ def _sdk_execute(
         _translate_sdk_exception(exc)
         raise
     _raise_failed_page(result)
-    projected = project_editor_result(result); projected["language_mode"] = intent.mode; projected["languages"] = list(intent.languages); return projected
+    projected = project_studio_editor_result(result)
+    projected["language_mode"] = intent.mode
+    projected["languages"] = list(intent.languages)
+    return projected
 
 
 def execute_studio_editor_extraction(

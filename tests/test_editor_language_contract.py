@@ -27,7 +27,8 @@ def test_sdk_selector_forwards_equivalent_language_intent(monkeypatch, tmp_path,
     monkeypatch.setenv(selector, "sdk")
     monkeypatch.setattr(module, "_sdk_processor", lambda: Processor())
     monkeypatch.setattr(module, "_sdk_profile", lambda: "OCR_TEXT_V2")
-    monkeypatch.setattr(module, "project_editor_result", lambda result: {"schema_version": "ocr_v2_editor_layout.v1", "pages": []})
+    projection_name = "project_studio_editor_result" if module is studio else "project_editor_result"
+    monkeypatch.setattr(module, projection_name, lambda result: {"schema_version": "ocr_v2_editor_layout.v1", "pages": []})
     function = general.execute_editor_ocr if module is general else studio.execute_studio_editor_extraction
     projected = function(tmp_path / "source.pdf", language_mode=mode, languages=languages)
     assert calls["language"] == ("auto" if mode == "AUTO" else "+".join(languages))

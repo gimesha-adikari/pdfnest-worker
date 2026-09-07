@@ -131,9 +131,95 @@ def project_editor_result(result: Any) -> dict[str, Any]:
     }
 
 
+def _studio_native_dimensions(page_result: Any) -> tuple[float, float]:
+    """Return the unrotated CropBox width/height for a native SDK page.
+
+    ``PageGeometry`` exposes the visible page dimensions.  A quarter-turn
+    therefore swaps the visible width/height relative to the unrotated PDF
+    coordinate system in which the SDK native boxes are reported.
+    """
+
+    geometry = page_result.geometry
+    rotation = int(getattr(geometry, "rotation", 0) or 0) % 360
+    if rotation in (90, 270):
+        return float(geometry.height), float(geometry.width)
+    return float(geometry.width), float(geometry.height)
+
+
+def _studio_visible_rect(rect: dict[str, Any], page_result: Any) -> dict[str, Any]:
+    """Map one canonical native rectangle into Studio visible page space."""
+
+    x = float(rect["x"])
+    y = float(rect["y"])
+    width = float(rect["width"])
+    height = float(rect["height"])
+    page_width, page_height = _studio_native_dimensions(page_result)
+    rotation = int(getattr(page_result.geometry, "rotation", 0) or 0) % 360
+
+    if rotation == 90:
+        visible = (page_height - y - height, x, height, width)
+    elif rotation == 180:
+        visible = (page_width - x - width, page_height - y - height, width, height)
+    elif rotation == 270:
+        visible = (y, page_width - x - width, height, width)
+    else:
+        visible = (x, y, width, height)
+
+    projected = dict(rect)
+    projected["x"], projected["y"], projected["width"], projected["height"] = visible
+    return projected
+
+
+def _project_studio_native_elements(elements: list[dict[str, Any]], page_result: Any) -> None:
+    """Transform every geometry-bearing field in the editor element contract."""
+
+    geometry_collections = (
+        "word_geometry",
+        "line_geometry",
+        "block_geometry",
+        "selection_geometry",
+        "selection_boxes",
+        "original_text_geometry",
+    )
+    for element in elements:
+        element.update(_studio_visible_rect(element, page_result))
+        for key in geometry_collections:
+            value = element.get(key)
+            if not isinstance(value, list):
+                continue
+            element[key] = [
+                _studio_visible_rect(item, page_result)
+                if isinstance(item, dict) and {"x", "y", "width", "height"}.issubset(item)
+                else item
+                for item in value
+            ]
+
+
+def project_studio_editor_result(result: Any) -> dict[str, Any]:
+    """Project an SDK result into Studio's visible editor layout contract.
+
+    The public SDK deliberately keeps native PDF text geometry canonical so
+    callers such as the General Editor compiler can pass it directly to
+    PyMuPDF.  Studio's canvas, however, positions overlays directly against
+    the visibly rotated CropBox and has no downstream transform.  Native SDK
+    pages are therefore mapped here, at the Studio adapter boundary.  OCR
+    pages already use rendered visible coordinates and are copied unchanged.
+    """
+
+    projected = project_editor_result(result)
+    for page_result, page in zip(result.pages, projected["pages"]):
+        source = str(_value(getattr(page_result, "processing_source", None)))
+        if source != "NATIVE_EXTRACTION":
+            continue
+        _project_studio_native_elements(page["elements"], page_result)
+
+    return projected
+
+
 __all__ = [
     "canonical_editor_elements",
     "editor_page_kind",
     "first_failed_editor_page",
     "project_editor_result",
+    "project_studio_editor_result",
 ]
