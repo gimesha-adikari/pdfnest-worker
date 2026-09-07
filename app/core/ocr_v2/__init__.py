@@ -8,7 +8,7 @@ later API integration can adopt after managed/runtime validation.
 from .contracts import *
 from .geometry import PreparedRaster, RasterPreparer, normalize_rotation, page_geometry_from_pdf, pixel_rect_to_points
 from .image_pages import build_image_source_pdf, normalize_image
-from .native import NativeDecision, NativeExtractor, NativeValidator
+from .native import NativeDecision, NativeExtractor, NativeGeometryMode, NativeValidator
 from .orchestration import OCRV2Worker
 from .profiles import product_verdict, searchable_pdf_reason
 from .routing import OCRRouter, RoutePlan, RoutePolicy
@@ -17,5 +17,5 @@ from .markup import MarkupAction, MarkupExecutionResult, MarkupMode, MarkupSelec
 from .language_policy import BoundedLanguageDetector, LanguageDecisionStatus, LanguageCandidateRanker, OCRLanguageMode, OCRLanguagePolicy, canonicalize_language_ids
 
 __all__ = [
-    "OCRV2Worker", "OCRProfile", "OCRRouter", "RoutePlan", "RoutePolicy", "NativeDecision", "NativeExtractor", "NativeValidator", "PreparedRaster", "RasterPreparer", "normalize_rotation", "page_geometry_from_pdf", "pixel_rect_to_points", "normalize_image", "build_image_source_pdf", "product_verdict", "searchable_pdf_reason", "profile_disposition", "require_profile", "validate_document", "validate_page", "MarkupAction", "MarkupExecutionResult", "MarkupMode", "MarkupSelection", "MarkupSourceType", "apply_ocr_markup", "select_query", "select_regions", "OCRLanguageMode", "OCRLanguagePolicy", "LanguageDecisionStatus", "LanguageCandidateRanker", "BoundedLanguageDetector", "canonicalize_language_ids",
+    "OCRV2Worker", "OCRProfile", "OCRRouter", "RoutePlan", "RoutePolicy", "NativeDecision", "NativeExtractor", "NativeGeometryMode", "NativeValidator", "PreparedRaster", "RasterPreparer", "normalize_rotation", "page_geometry_from_pdf", "pixel_rect_to_points", "normalize_image", "build_image_source_pdf", "product_verdict", "searchable_pdf_reason", "profile_disposition", "require_profile", "validate_document", "validate_page", "MarkupAction", "MarkupExecutionResult", "MarkupMode", "MarkupSelection", "MarkupSourceType", "apply_ocr_markup", "select_query", "select_regions", "OCRLanguageMode", "OCRLanguagePolicy", "LanguageDecisionStatus", "LanguageCandidateRanker", "BoundedLanguageDetector", "canonicalize_language_ids",
 ]

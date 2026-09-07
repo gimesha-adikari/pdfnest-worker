@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any
 
 import pymupdf as fitz
@@ -40,14 +41,38 @@ class NativeValidationResult:
 _SUSPICIOUS_RE = re.compile(r"[\ufffd\u200b\u200c\u200d]")
 
 
+class NativeGeometryMode(str, Enum):
+    """Select the coordinate contract for native word extraction.
+
+    ``LEGACY_VISIBLE`` preserves the existing shared internal behavior used by
+    Studio and the other frozen OCR V2 consumers. ``CANONICAL_PDF`` keeps
+    PyMuPDF's CropBox-relative, unrotated PDF-point rectangles for the
+    standalone General Editor/compiler contract.
+    """
+
+    LEGACY_VISIBLE = "legacy_visible"
+    CANONICAL_PDF = "canonical_pdf"
+
+
 class NativeExtractor:
+    def __init__(
+        self,
+        *,
+        geometry_mode: NativeGeometryMode | str = NativeGeometryMode.LEGACY_VISIBLE,
+    ) -> None:
+        self.geometry_mode = NativeGeometryMode(geometry_mode)
+
     def extract(self, page: Any, page_index: int) -> NativeExtractionCandidate:
         words = page.get_text("words") or []
         items: list[dict[str, Any]] = []
         page_width = max(float(page.rect.width), 0.0)
         page_height = max(float(page.rect.height), 0.0)
         page_rotation = getattr(page, "rotation", 0)
-        rotation_matrix = page.rotation_matrix if page_rotation else None
+        rotation_matrix = (
+            page.rotation_matrix
+            if page_rotation and self.geometry_mode is NativeGeometryMode.LEGACY_VISIBLE
+            else None
+        )
         for index, word in enumerate(words):
             if len(word) < 5 or not str(word[4]).strip():
                 continue

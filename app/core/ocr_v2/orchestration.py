@@ -26,7 +26,7 @@ from .contracts import (
 from .errors import LanguageDetectionUncertainError, OCRCancellationError, OCRTimeoutError
 from .geometry import RasterPreparer, page_geometry_from_pdf
 from .language_policy import FusedLanguageDetector, LanguageDecisionStatus, OCRLanguageMode, OCRLanguagePolicy
-from .native import NativeDecision, NativeExtractor, NativeValidator
+from .native import NativeDecision, NativeExtractor, NativeGeometryMode, NativeValidator
 from .normalization import normalize_page_output
 from .routing import OCRRouter, RoutePolicy
 from .telemetry import emit
@@ -52,6 +52,7 @@ class OCRV2Worker:
         raster_preparer: RasterPreparer | None = None,
         native_extractor: NativeExtractor | None = None,
         native_validator: NativeValidator | None = None,
+        native_geometry_mode: NativeGeometryMode | str = NativeGeometryMode.LEGACY_VISIBLE,
         route_policy: RoutePolicy | None = None,
         max_raster_pixels: int | None = None,
     ) -> None:
@@ -60,7 +61,7 @@ class OCRV2Worker:
             "ppocrv6_medium_v2": PPOCRv6MediumAdapter(),
         })
         self.raster_preparer = raster_preparer or RasterPreparer(200)
-        self.native_extractor = native_extractor or NativeExtractor()
+        self.native_extractor = native_extractor or NativeExtractor(geometry_mode=native_geometry_mode)
         self.native_validator = native_validator or NativeValidator()
         self.router = OCRRouter(self.adapters, route_policy)
         self.max_raster_pixels = max_raster_pixels

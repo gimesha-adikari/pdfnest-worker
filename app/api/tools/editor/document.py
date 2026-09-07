@@ -16,6 +16,7 @@ from app.core.editor_ocr_projection import (
     project_editor_result,
 )
 from app.core.ocr_v2.errors import EngineUnavailableError
+from app.core.ocr_v2.native import NativeGeometryMode
 from app.core.ocr_v2.orchestration import OCRV2Worker
 from app.core.ocr_v2.routing import RoutePolicy
 from app.core.ocr_v2.validation import OCRProfile
@@ -419,15 +420,23 @@ def extract_document_v2(
     page_progress_callback: Callable[[int, int, Any], None] | None = None,
     language_mode: str = "EXPLICIT",
     languages: list[str] | tuple[str, ...] | None = None,
+    native_geometry_mode: NativeGeometryMode | str = NativeGeometryMode.LEGACY_VISIBLE,
 ) -> dict[str, Any]:
     """Extract editor layout through the shared OCR V2 canonical result.
 
     This is an explicit V2 editor mode.  The legacy ``extract_document``
     function remains available to V1 routes and retains its historical direct
     OCR behavior until parity/migration is separately approved.
+
+    ``native_geometry_mode`` defaults to the shared legacy-visible contract so
+    existing Studio and frozen OCR V2 callers remain unchanged. The General
+    Editor selector passes ``NativeGeometryMode.CANONICAL_PDF`` explicitly;
+    that mode keeps native word rectangles in the unrotated PDF coordinate
+    system consumed directly by the editor compiler.
     """
     worker = OCRV2Worker(
         route_policy=RoutePolicy(preferred_engine="tesseract_v2", fallback_engine="tesseract_v2"),
+        native_geometry_mode=native_geometry_mode,
         max_raster_pixels=25_000_000,
     )
     from app.core.editor_language import EditorLanguageRequiredError, editor_language_intent

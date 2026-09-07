@@ -15,6 +15,7 @@ from typing import Any, Callable
 
 from app.core.editor_ocr_projection import first_failed_editor_page, project_editor_result
 from app.core.ocr_v2.errors import EngineUnavailableError
+from app.core.ocr_v2.native import NativeGeometryMode
 
 
 EDITOR_OCR_ENGINE_ENV = "EDITOR_OCR_ENGINE"
@@ -79,6 +80,7 @@ def _internal_execute(
         page_progress_callback=page_progress_callback,
         language_mode=language_mode,
         languages=languages,
+        native_geometry_mode=NativeGeometryMode.CANONICAL_PDF,
     )
 
 
