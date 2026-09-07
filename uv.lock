@@ -965,7 +965,7 @@ requires-dist = [
     { name = "pdf2docx", specifier = ">=0.5.13" },
     { name = "pdfplumber", specifier = ">=0.11.10" },
     { name = "pillow", specifier = ">=12.3.0" },
-    { name = "platen-document", specifier = "==0.1.1" },
+    { name = "platen-document", specifier = "==0.1.2" },
     { name = "psutil", specifier = ">=7.2.2" },
     { name = "pydantic", specifier = ">=2.13.4" },
     { name = "pymupdf", specifier = ">=1.28.0" },
@@ -1072,16 +1072,16 @@ wheels = [
 
 [[package]]
 name = "platen-document"
-version = "0.1.1"
+version = "0.1.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "pdfplumber" },
     { name = "pillow" },
     { name = "pymupdf" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/21/95/890b4f17a61f905c51065d1fd4e104e56b3d0d86979305efc7a363ebe52c/platen_document-0.1.1.tar.gz", hash = "sha256:3cec94f99c0d7ad62143bce3c2c9d3b19e98d8290fbd2086cc75821c5cb62943", size = 77404, upload-time = "2026-09-07T16:08:57.333Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/e4/b5/01879ae0c437151b2927ea3c1aa5be2a9559d776960a64711720fd260f62/platen_document-0.1.2.tar.gz", hash = "sha256:32db230ddb05f2f6b4c63d12b4c9a07a52e48737eabbbde6f1d93bd3960c9d2d", size = 79013, upload-time = "2026-09-07T19:56:14.072Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/15/9e/3784558e60e9eefaa17646cf969f55ea07574eda5609da613d45ff364060/platen_document-0.1.1-py3-none-any.whl", hash = "sha256:eb92bcbd9112a0a0664261388e27defed023b8f209a90d9290754ee97544f183", size = 78583, upload-time = "2026-09-07T16:08:56.086Z" },
+    { url = "https://files.pythonhosted.org/packages/2e/fb/80219f383d977664eae3630abc27afcd53163d39cddfc3fce5908ec07c70/platen_document-0.1.2-py3-none-any.whl", hash = "sha256:53306c7d047e6f336b6b93486ecc5b51dede537d93839b70a768dbd401858c30", size = 78814, upload-time = "2026-09-07T19:56:12.617Z" },
 ]
 
 [[package]]
