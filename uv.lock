@@ -932,6 +932,7 @@ dependencies = [
     { name = "pdf2docx" },
     { name = "pdfplumber" },
     { name = "pillow" },
+    { name = "platen-document" },
     { name = "psutil" },
     { name = "pydantic" },
     { name = "pymupdf" },
@@ -964,6 +965,7 @@ requires-dist = [
     { name = "pdf2docx", specifier = ">=0.5.13" },
     { name = "pdfplumber", specifier = ">=0.11.10" },
     { name = "pillow", specifier = ">=12.3.0" },
+    { name = "platen-document", specifier = "==0.1.0" },
     { name = "psutil", specifier = ">=7.2.2" },
     { name = "pydantic", specifier = ">=2.13.4" },
     { name = "pymupdf", specifier = ">=1.28.0" },
@@ -1066,6 +1068,20 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/18/f0/a5595c1e8c3ae44b9828cb2f0fa8155e5095ef04d6327b8f61cf44a3df85/pillow-12.3.0-cp315-cp315t-win32.whl", hash = "sha256:1657923d2d45afb66526e5b933e5b3052e6bdea196c90d3abb2424e18c77dae8", size = 6474384, upload-time = "2026-07-01T11:56:18.855Z" },
     { url = "https://files.pythonhosted.org/packages/e4/04/62bcd9f844984c5938d3b05264a61d797a29d3e0812341a8204af70bbdee/pillow-12.3.0-cp315-cp315t-win_amd64.whl", hash = "sha256:8cd2f7bdda092d99c9fc2fb7391354f306d01443d22785d0cbfafa2e2c8bb418", size = 7243537, upload-time = "2026-07-01T11:56:21.214Z" },
     { url = "https://files.pythonhosted.org/packages/3d/68/1f3066acedf37673694a7141381d8f811ae97f30d34413d236abe7d489f1/pillow-12.3.0-cp315-cp315t-win_arm64.whl", hash = "sha256:06ff022112bc9cbf83b60f8e028d94ad87b60621706487e65f673de61610ab59", size = 2567491, upload-time = "2026-07-01T11:56:23.506Z" },
+]
+
+[[package]]
+name = "platen-document"
+version = "0.1.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pdfplumber" },
+    { name = "pillow" },
+    { name = "pymupdf" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/e7/d0/28841802972df84e8f99618286dc58386722c4825474046a4125b830b3d5/platen_document-0.1.0.tar.gz", hash = "sha256:1a706dea7ed32e63082ff6dce0b20cd721d3e30bf241aecea903e47157b4a462", size = 74864, upload-time = "2026-09-07T09:31:22.527Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/5e/e6/a3de22eebf809c938add3f2d3b1db6d954f06a134e8096d4d8a2a8eb7162/platen_document-0.1.0-py3-none-any.whl", hash = "sha256:fa779fb8e629d01aa4239fc988b94ba8c9661f0402f2f0cb6ffe592fc26843cf", size = 77945, upload-time = "2026-09-07T09:31:20.957Z" },
 ]
 
 [[package]]
