@@ -640,6 +640,59 @@ def _ocr_table_cells(
     return result
 
 
+def _median_ocr_value(values: Sequence[float]) -> float:
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / 2.0
+
+
+def _body_anchored_ocr_rows(
+    header: _OCRLayoutLine,
+    following_lines: Sequence[_OCRLayoutLine],
+    median_height: float,
+) -> tuple[list[tuple[_OCRLayoutLine, list[list[tuple[str, dict[str, float], dict[str, float]]]]]], list[float]] | None:
+    """Infer column regions from repeated body rows, not header token centers."""
+    column_count = len(header.tokens)
+    if column_count < 3:
+        return None
+
+    body_lines: list[_OCRLayoutLine] = []
+    previous = header
+    for line in following_lines:
+        step = line.layout_bbox["y"] - previous.layout_bbox["y"]
+        if step <= 0 or step > median_height * 6.0 or len(line.tokens) != column_count:
+            break
+        body_lines.append(line)
+        previous = line
+    if not body_lines:
+        return None
+
+    anchors = [
+        _median_ocr_value([_ocr_token_center(line.tokens[column]) for line in body_lines])
+        for column in range(column_count)
+    ]
+    if any(right <= left for left, right in zip(anchors, anchors[1:])):
+        return None
+    boundaries = [(left + right) / 2.0 for left, right in zip(anchors, anchors[1:])]
+
+    rows: list[tuple[_OCRLayoutLine, list[list[tuple[str, dict[str, float], dict[str, float]]]]]] = []
+    for line in body_lines:
+        centers = [_ocr_token_center(token) for token in line.tokens]
+        if any(right <= left for left, right in zip(centers, centers[1:])):
+            break
+        if any(
+            centers[column] >= boundary or centers[column + 1] <= boundary
+            for column, boundary in enumerate(boundaries)
+        ):
+            break
+        rows.append((line, [[token] for token in line.tokens]))
+    if not rows:
+        return None
+    return rows, anchors
+
+
 def _aligned_numeric_ocr_table(
     lines: Sequence[_OCRLayoutLine],
     page_result: PageResult,
@@ -656,26 +709,30 @@ def _aligned_numeric_ocr_table(
     for header_index, header in enumerate(lines):
         if len(header.tokens) < 3 or not any(character.isalpha() for token in header.tokens for character in token[0]):
             continue
-        anchors = [_ocr_token_center(token) for token in header.tokens]
-        gaps = [right - left for left, right in zip(anchors, anchors[1:])]
-        if not gaps or min(gaps) <= 0:
-            continue
-        tolerance = max(12.0, min(gaps) * 0.30)
-        data_rows: list[tuple[_OCRLayoutLine, list[list[tuple[str, dict[str, float], dict[str, float]]]]]] = []
-        previous = header
-        for line in lines[header_index + 1:]:
-            step = line.layout_bbox["y"] - previous.layout_bbox["y"]
-            if step <= 0 or step > median_height * 6.0:
-                break
-            cells = _assign_ocr_row_to_columns(line, anchors, tolerance)
-            if cells is None:
-                break
-            coverage = sum(bool(cell) for cell in cells)
-            minimum_coverage = max(3, (len(anchors) * 4 + 4) // 5)
-            if len(line.tokens) < max(3, (len(anchors) * 3) // 5) or coverage < minimum_coverage:
-                break
-            data_rows.append((line, cells))
-            previous = line
+        body_model = _body_anchored_ocr_rows(header, lines[header_index + 1:], median_height)
+        if body_model is not None:
+            data_rows, anchors = body_model
+        else:
+            anchors = [_ocr_token_center(token) for token in header.tokens]
+            gaps = [right - left for left, right in zip(anchors, anchors[1:])]
+            if not gaps or min(gaps) <= 0:
+                continue
+            tolerance = max(12.0, min(gaps) * 0.30)
+            data_rows = []
+            previous = header
+            for line in lines[header_index + 1:]:
+                step = line.layout_bbox["y"] - previous.layout_bbox["y"]
+                if step <= 0 or step > median_height * 6.0:
+                    break
+                cells = _assign_ocr_row_to_columns(line, anchors, tolerance)
+                if cells is None:
+                    break
+                coverage = sum(bool(cell) for cell in cells)
+                minimum_coverage = max(3, (len(anchors) * 4 + 4) // 5)
+                if len(line.tokens) < max(3, (len(anchors) * 3) // 5) or coverage < minimum_coverage:
+                    break
+                data_rows.append((line, cells))
+                previous = line
         if len(data_rows) < 3:
             continue
 
