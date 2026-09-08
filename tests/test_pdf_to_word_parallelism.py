@@ -8,8 +8,11 @@ from unittest.mock import patch
 from concurrent.futures import ThreadPoolExecutor
 
 from app.api.tools.pdf_to_office.converters.word import (
+    _full_page_image_source_dpi,
     _get_pdf_to_word_raster_dpi,
+    _get_pdf_to_word_raster_dpis,
     _get_pdf2docx_worker_count,
+    _page_pdf_to_word_raster_dpi,
     _requires_structured_ocr,
     convert_to_word,
 )
@@ -42,6 +45,22 @@ def create_large_low_dpi_scan_pdf(path: str) -> None:
     doc = fitz.open()
     page = doc.new_page(width=1200, height=1800)
     page.insert_image(page.rect, stream=_png_bytes(image))
+    doc.save(path)
+    doc.close()
+
+
+def create_multipage_mixed_raster_pdf(path: str) -> None:
+    doc = fitz.open()
+    ordinary = Image.new("RGB", (600, 800), "white")
+    large = Image.new("RGB", (1200, 1800), "white")
+    for label, image, width, height in (
+        ("ordinary page one", ordinary, 600, 800),
+        ("oversized page two", large, 1200, 1800),
+        ("ordinary page three", ordinary, 600, 800),
+    ):
+        page = doc.new_page(width=width, height=height)
+        page.insert_image(page.rect, stream=_png_bytes(image))
+        page.insert_text((20, 40), label)
     doc.save(path)
     doc.close()
 
@@ -89,6 +108,46 @@ def test_large_low_dpi_scan_is_preflighted_before_rasterization():
         create_large_low_dpi_scan_pdf(pdf_path)
 
         assert _get_pdf_to_word_raster_dpi(pdf_path) == 72
+
+
+def test_multipage_preflight_keeps_ordinary_pages_at_default_dpi():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        pdf_path = os.path.join(tmpdir, "multipage-mixed-raster.pdf")
+        create_multipage_mixed_raster_pdf(pdf_path)
+
+        assert _get_pdf_to_word_raster_dpis(pdf_path) == (200, 72, 200)
+
+
+def test_multipage_preflight_passes_page_scoped_dpis_to_one_extraction(monkeypatch):
+    import app.api.tools.pdf_to_office.converters.word as word
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        pdf_path = os.path.join(tmpdir, "multipage-mixed-raster.pdf")
+        docx_path = os.path.join(tmpdir, "multipage-mixed-raster.docx")
+        create_multipage_mixed_raster_pdf(pdf_path)
+        calls = []
+
+        def execute(path, *, language, raster_dpis):
+            calls.append((path, language, raster_dpis))
+            return SimpleNamespace(pages=())
+
+        monkeypatch.setenv("PDF_TO_WORD_OCR_ENGINE", "sdk")
+        monkeypatch.setattr(word, "execute_pdf_to_word_ocr", execute)
+
+        word.convert_to_word(pdf_path, docx_path, language="eng")
+
+        assert calls == [(pdf_path, "eng", (200, 72, 200))]
+        assert os.path.exists(docx_path)
+
+
+def test_invalid_embedded_image_metadata_uses_bounded_budget_fallback():
+    page = SimpleNamespace(
+        rect=SimpleNamespace(width=1200, height=1800),
+        get_images=lambda full: [(7, 0, 0, 1800, 8, "DeviceRGB", "", "", "FlateDecode")],
+    )
+
+    assert _full_page_image_source_dpi(page) is None
+    assert _page_pdf_to_word_raster_dpi(page) == 154
 
 
 def test_ordinary_page_keeps_existing_raster_default():
@@ -148,7 +207,7 @@ def test_native_pdf_bypass_does_not_run_structured_raster_preflight(monkeypatch)
         def fail_preflight(_path):
             raise AssertionError("native PDF-to-Word bypass must not preflight OCR rasterization")
 
-        monkeypatch.setattr(word, "_get_pdf_to_word_raster_dpi", fail_preflight)
+        monkeypatch.setattr(word, "_get_pdf_to_word_raster_dpis", fail_preflight)
         word.convert_to_word(pdf_path, docx_path)
 
         assert os.path.exists(docx_path)

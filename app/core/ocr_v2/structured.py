@@ -774,11 +774,15 @@ class StructuredDocumentProcessor:
         structured_adapter: StructuredEngineAdapter | None = None,
         *,
         raster_dpi: int | None = None,
+        raster_preparer: Any | None = None,
     ) -> None:
         self.structured_adapter = structured_adapter
+        if raster_dpi is not None and raster_preparer is not None:
+            raise ValueError("raster_dpi and raster_preparer are mutually exclusive")
         if raster_dpi is not None and raster_dpi <= 0:
             raise ValueError("raster_dpi must be positive")
         self.raster_dpi = raster_dpi
+        self.raster_preparer = raster_preparer
 
     def process_document(
         self,
@@ -800,8 +804,14 @@ class StructuredDocumentProcessor:
         with fitz.open(str(source_path)) as source_document:
             if len(source_document) == 0 or len(source_document) > structured_max_pages():
                 raise ValueError("structured OCR input exceeds the configured page limit")
+        if self.raster_preparer is not None:
+            raster_preparer = self.raster_preparer
+        elif self.raster_dpi is not None:
+            raster_preparer = RasterPreparer(self.raster_dpi)
+        else:
+            raster_preparer = None
         ocr_worker = OCRV2Worker(
-            raster_preparer=RasterPreparer(self.raster_dpi) if self.raster_dpi is not None else None,
+            raster_preparer=raster_preparer,
             max_raster_pixels=structured_max_raster_pixels(),
         )
         from .routing import RoutePolicy

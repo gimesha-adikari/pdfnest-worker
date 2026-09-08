@@ -135,25 +135,35 @@ def _full_page_image_source_dpi(page: Any) -> float | None:
     return source_dpi
 
 
+def _page_pdf_to_word_raster_dpi(page: Any) -> int:
+    page_dpi = _max_safe_page_raster_dpi(page)
+    if page_dpi < PDF_TO_WORD_DEFAULT_RASTER_DPI:
+        source_dpi = _full_page_image_source_dpi(page)
+        if source_dpi is not None:
+            page_dpi = min(page_dpi, max(1, math.floor(source_dpi)))
+    return page_dpi
+
+
+def _get_pdf_to_word_raster_dpis(pdf_path: str) -> tuple[int, ...]:
+    """Return the safe target DPI for each structured-OCR PDF page."""
+
+    with fitz.open(pdf_path) as doc:
+        return tuple(_page_pdf_to_word_raster_dpi(page) for page in doc)
+
+
 def _get_pdf_to_word_raster_dpi(pdf_path: str) -> int | None:
-    """Preflight structured PDF-to-Word rasterization before allocating pixels.
+    """Return a backward-compatible scalar summary of page-scoped preflight.
 
     Ordinary pages retain the existing 200 DPI behavior.  Only pages whose
     default render exceeds the PDF-to-Word safety budget are reduced.  For a
-    full-page scan, the embedded image resolution is also used as an upper
+    full-page scan, the inferred embedded image resolution is also used as an upper
     bound so a low-DPI scan is not needlessly upsampled into a large raster.
-    ``None`` means that the selected engine should use its normal default.
+    The converter uses ``_get_pdf_to_word_raster_dpis`` so unrelated pages do
+    not inherit this scalar minimum.  ``None`` means that the selected engine
+    should use its normal default.
     """
 
-    selected_dpi = PDF_TO_WORD_DEFAULT_RASTER_DPI
-    with fitz.open(pdf_path) as doc:
-        for page in doc:
-            page_dpi = _max_safe_page_raster_dpi(page)
-            if page_dpi < PDF_TO_WORD_DEFAULT_RASTER_DPI:
-                source_dpi = _full_page_image_source_dpi(page)
-                if source_dpi is not None:
-                    page_dpi = min(page_dpi, max(1, math.floor(source_dpi)))
-                selected_dpi = min(selected_dpi, page_dpi)
+    selected_dpi = min(_get_pdf_to_word_raster_dpis(pdf_path), default=PDF_TO_WORD_DEFAULT_RASTER_DPI)
     return selected_dpi if selected_dpi < PDF_TO_WORD_DEFAULT_RASTER_DPI else None
 
 
@@ -219,8 +229,13 @@ def _convert_structured_to_word(
     language: str,
     *,
     raster_dpi: int | None = None,
+    raster_dpis: tuple[int, ...] | None = None,
 ) -> None:
-    if raster_dpi is None:
+    if raster_dpi is not None and raster_dpis is not None:
+        raise ValueError("raster_dpi and raster_dpis are mutually exclusive")
+    if raster_dpis is not None:
+        result = execute_pdf_to_word_ocr(pdf_path, language=language, raster_dpis=raster_dpis)
+    elif raster_dpi is None:
         result = execute_pdf_to_word_ocr(pdf_path, language=language)
     else:
         result = execute_pdf_to_word_ocr(pdf_path, language=language, raster_dpi=raster_dpi)
@@ -239,8 +254,12 @@ def convert_to_word(pdf_path: str, output_path: str, language: str = "eng") -> N
         doc.close()
 
     if structured:
-        raster_dpi = _get_pdf_to_word_raster_dpi(pdf_path)
-        _convert_structured_to_word(pdf_path, output_path, language, raster_dpi=raster_dpi)
+        raster_dpis = _get_pdf_to_word_raster_dpis(pdf_path)
+        if len(set(raster_dpis)) == 1:
+            raster_dpi = raster_dpis[0] if raster_dpis[0] < PDF_TO_WORD_DEFAULT_RASTER_DPI else None
+            _convert_structured_to_word(pdf_path, output_path, language, raster_dpi=raster_dpi)
+        else:
+            _convert_structured_to_word(pdf_path, output_path, language, raster_dpis=raster_dpis)
         return
 
     workers = _get_pdf2docx_worker_count()

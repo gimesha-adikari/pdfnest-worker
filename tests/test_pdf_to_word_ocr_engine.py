@@ -109,6 +109,61 @@ def test_sdk_selector_forwards_pdf_to_word_raster_dpi(
     }
 
 
+def test_sdk_selector_forwards_page_scoped_pdf_to_word_raster_dpis(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls: dict[str, object] = {}
+
+    class FakeProcessor:
+        def extract_document(self, path: str | Path, **kwargs: object) -> object:
+            calls["path"] = path
+            calls.update(kwargs)
+            return object()
+
+    def sdk_processor(
+        *, raster_dpi: int | None = None, raster_dpis: tuple[int, ...] | None = None
+    ) -> FakeProcessor:
+        calls["raster_dpi"] = raster_dpi
+        calls["raster_dpis"] = raster_dpis
+        return FakeProcessor()
+
+    monkeypatch.setenv(engine.PDF_TO_WORD_OCR_ENGINE_ENV, "sdk")
+    monkeypatch.setattr(engine, "_sdk_processor", sdk_processor)
+
+    result = engine.execute_pdf_to_word_ocr(
+        tmp_path / "source.pdf",
+        language="eng",
+        raster_dpis=(200, 72, 200),
+    )
+
+    assert result is not None
+    assert calls == {
+        "raster_dpi": None,
+        "raster_dpis": (200, 72, 200),
+        "path": tmp_path / "source.pdf",
+        "language": "eng",
+    }
+
+
+def test_page_scoped_raster_preparer_selects_and_caches_by_page() -> None:
+    created: list[int] = []
+
+    class FakePreparer:
+        def __init__(self, dpi: int) -> None:
+            self.dpi = dpi
+            created.append(dpi)
+
+        def prepare(self, page: object) -> tuple[int, object]:
+            return self.dpi, page
+
+    preparer = engine._PageScopedRasterPreparer((200, 72, 200), FakePreparer)
+    pages = [SimpleNamespace(number=index) for index in range(3)]
+
+    assert [preparer.prepare(page)[0] for page in pages] == [200, 72, 200]
+    assert created == [200, 72]
+
+
 def test_sdk_failure_does_not_fall_back_to_internal(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
