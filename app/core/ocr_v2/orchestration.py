@@ -55,9 +55,10 @@ class OCRV2Worker:
         native_geometry_mode: NativeGeometryMode | str = NativeGeometryMode.LEGACY_VISIBLE,
         route_policy: RoutePolicy | None = None,
         max_raster_pixels: int | None = None,
+        table_aware_ocr: bool = False,
     ) -> None:
         self.adapters = dict(adapters or {
-            "tesseract_v2": TesseractAdapter("eng"),
+            "tesseract_v2": TesseractAdapter("eng", table_aware_ocr=table_aware_ocr),
             "ppocrv6_medium_v2": PPOCRv6MediumAdapter(),
         })
         self.raster_preparer = raster_preparer or RasterPreparer(200)
@@ -65,6 +66,7 @@ class OCRV2Worker:
         self.native_validator = native_validator or NativeValidator()
         self.router = OCRRouter(self.adapters, route_policy)
         self.max_raster_pixels = max_raster_pixels
+        self.table_aware_ocr = table_aware_ocr
 
     def _native_output(self, candidate: object) -> UnnormalizedPageOutput:
         native = candidate  # keep the small conversion explicit at this boundary
@@ -94,7 +96,12 @@ class OCRV2Worker:
         policy = OCRLanguagePolicy.from_request(language, mode=language_mode, languages=languages)
         tess_adapter = self.adapters.get("tesseract_v2")
         if isinstance(tess_adapter, TesseractAdapter) and policy.mode is OCRLanguageMode.EXPLICIT and tess_adapter.languages != policy.engine_expression:
-            self.adapters["tesseract_v2"] = TesseractAdapter(policy.engine_expression, timeout=tess_adapter.timeout, tessdata_dir=str(tess_adapter.tessdata_dir) if tess_adapter.tessdata_dir else None)
+            self.adapters["tesseract_v2"] = TesseractAdapter(
+                policy.engine_expression,
+                timeout=tess_adapter.timeout,
+                tessdata_dir=str(tess_adapter.tessdata_dir) if tess_adapter.tessdata_dir else None,
+                table_aware_ocr=tess_adapter.table_aware_ocr,
+            )
         source_path = Path(pdf_path)
         pages: list[PageResult] = []
         provenance: list[Provenance] = []
@@ -154,7 +161,12 @@ class OCRV2Worker:
                         if isinstance(self.adapters.get("tesseract_v2"), TesseractAdapter) and page_policy.mode is OCRLanguageMode.EXPLICIT:
                             base_adapter = self.adapters["tesseract_v2"]
                             if isinstance(base_adapter, TesseractAdapter) and base_adapter.languages != page_policy.engine_expression:
-                                self.adapters["tesseract_v2"] = TesseractAdapter(page_policy.engine_expression, timeout=base_adapter.timeout, tessdata_dir=str(base_adapter.tessdata_dir) if base_adapter.tessdata_dir else None)
+                                self.adapters["tesseract_v2"] = TesseractAdapter(
+                                    page_policy.engine_expression,
+                                    timeout=base_adapter.timeout,
+                                    tessdata_dir=str(base_adapter.tessdata_dir) if base_adapter.tessdata_dir else None,
+                                    table_aware_ocr=base_adapter.table_aware_ocr,
+                                )
                         if policy.mode is OCRLanguageMode.AUTO and route.engine_id != "tesseract_v2":
                             # AUTO detection is a bounded Tesseract probe today;
                             # do not silently pass an unresolved policy to a

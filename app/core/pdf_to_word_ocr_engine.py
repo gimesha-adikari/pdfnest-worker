@@ -90,11 +90,15 @@ def _internal_processor(
         raise ValueError("raster_dpi and raster_dpis are mutually exclusive")
     if raster_dpis is not None:
         return StructuredDocumentProcessor(
-            raster_preparer=_PageScopedRasterPreparer(raster_dpis, RasterPreparer)
+            raster_preparer=_PageScopedRasterPreparer(raster_dpis, RasterPreparer),
+            enable_scanned_table_recognition=True,
         )
     if raster_dpi is None:
-        return StructuredDocumentProcessor()
-    return StructuredDocumentProcessor(raster_dpi=raster_dpi)
+        return StructuredDocumentProcessor(enable_scanned_table_recognition=True)
+    return StructuredDocumentProcessor(
+        raster_dpi=raster_dpi,
+        enable_scanned_table_recognition=True,
+    )
 
 
 def _sdk_processor(
@@ -107,9 +111,7 @@ def _sdk_processor(
     if raster_dpi is not None and raster_dpis is not None:
         raise ValueError("raster_dpi and raster_dpis are mutually exclusive")
     try:
-        from platen_document import DocumentProcessor
-        if raster_dpi is not None:
-            from platen_document import EngineConfiguration
+        from platen_document import DocumentProcessor, EngineConfiguration
     except ModuleNotFoundError as exc:
         if exc.name == "platen_document":
             raise PdfToWordOcrEngineUnavailableError(
@@ -117,14 +119,17 @@ def _sdk_processor(
             ) from exc
         raise
     if raster_dpi is not None:
-        return DocumentProcessor(EngineConfiguration(raster_dpi=raster_dpi))
-    processor = DocumentProcessor()
+        return DocumentProcessor(EngineConfiguration(
+            raster_dpi=raster_dpi,
+            enable_scanned_table_recognition=True,
+        ))
+    processor = DocumentProcessor(EngineConfiguration(enable_scanned_table_recognition=True))
     if raster_dpis is None:
         return processor
 
-    # SDK 0.1.2 exposes one OCR worker inside the public DocumentProcessor,
-    # but its public constructor accepts only one document-wide raster DPI.
-    # Keep the SDK immutable and replace only that worker's preparer with a
+    # The public SDK exposes one OCR worker inside DocumentProcessor, while its
+    # public constructor accepts only one document-wide raster DPI. Keep the
+    # public API boundary intact and replace only that worker's preparer with a
     # page-aware adapter; extract_document still runs exactly once.
     try:
         ocr_worker = processor._structured_processor.ocr_worker

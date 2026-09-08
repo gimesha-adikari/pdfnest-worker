@@ -599,14 +599,154 @@ def _simple_ocr_table(lines: Sequence[_OCRLayoutLine], page_result: PageResult, 
     return table, table_keys
 
 
-def _ocr_structured_elements(page_result: PageResult) -> list[StructuredElement]:
+def _ocr_token_center(token: tuple[str, dict[str, float], dict[str, float]]) -> float:
+    box = token[2]
+    return box["x"] + box["width"] / 2.0
+
+
+def _ocr_token_has_digit(token: tuple[str, dict[str, float], dict[str, float]]) -> bool:
+    return bool(re.search(r"\d", token[0]))
+
+
+def _assign_ocr_row_to_columns(
+    line: _OCRLayoutLine,
+    anchors: Sequence[float],
+    tolerance: float,
+) -> list[list[tuple[str, dict[str, float], dict[str, float]]]] | None:
+    cells: list[list[tuple[str, dict[str, float], dict[str, float]]]] = [[] for _ in anchors]
+    for token in line.tokens:
+        center = _ocr_token_center(token)
+        column = min(range(len(anchors)), key=lambda index: abs(center - anchors[index]))
+        if abs(center - anchors[column]) > tolerance:
+            return None
+        cells[column].append(token)
+    return cells
+
+
+def _ocr_table_cells(
+    cells: Sequence[Sequence[tuple[str, dict[str, float], dict[str, float]]]],
+) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for tokens in cells:
+        if not tokens:
+            result.append({"text": "", "bbox": None, "rowspan": 1, "colspan": 1})
+        else:
+            result.append({
+                "text": " ".join(token[0] for token in tokens),
+                "bbox": _bbox_union([token[1] for token in tokens]),
+                "rowspan": 1,
+                "colspan": 1,
+            })
+    return result
+
+
+def _aligned_numeric_ocr_table(
+    lines: Sequence[_OCRLayoutLine],
+    page_result: PageResult,
+    median_height: float,
+) -> tuple[StructuredElement | None, set[str]]:
+    """Recover a conservative table from repeated, aligned numeric OCR rows.
+
+    This is intentionally separate from the historical four-column/status
+    heuristic.  It needs a header, at least three subsequent rows, stable
+    column anchors, and numeric content in most rows so ordinary prose is not
+    promoted to a table merely because it has multiple OCR tokens.
+    """
+    best: tuple[tuple[int, int, int], _OCRLayoutLine, list[tuple[_OCRLayoutLine, list[list[tuple[str, dict[str, float], dict[str, float]]]]]], list[float]] | None = None
+    for header_index, header in enumerate(lines):
+        if len(header.tokens) < 3 or not any(character.isalpha() for token in header.tokens for character in token[0]):
+            continue
+        anchors = [_ocr_token_center(token) for token in header.tokens]
+        gaps = [right - left for left, right in zip(anchors, anchors[1:])]
+        if not gaps or min(gaps) <= 0:
+            continue
+        tolerance = max(12.0, min(gaps) * 0.30)
+        data_rows: list[tuple[_OCRLayoutLine, list[list[tuple[str, dict[str, float], dict[str, float]]]]]] = []
+        previous = header
+        for line in lines[header_index + 1:]:
+            step = line.layout_bbox["y"] - previous.layout_bbox["y"]
+            if step <= 0 or step > median_height * 6.0:
+                break
+            cells = _assign_ocr_row_to_columns(line, anchors, tolerance)
+            if cells is None:
+                break
+            coverage = sum(bool(cell) for cell in cells)
+            minimum_coverage = max(3, (len(anchors) * 4 + 4) // 5)
+            if len(line.tokens) < max(3, (len(anchors) * 3) // 5) or coverage < minimum_coverage:
+                break
+            data_rows.append((line, cells))
+            previous = line
+        if len(data_rows) < 3:
+            continue
+
+        numeric_rows = sum(sum(_ocr_token_has_digit(token) for token in line.tokens) >= 2 for line, _ in data_rows)
+        if numeric_rows < max(2, (len(data_rows) + 1) // 2):
+            continue
+        row_pitches = [
+            current.layout_bbox["y"] - previous.layout_bbox["y"]
+            for (previous, _), (current, _) in zip(data_rows, data_rows[1:])
+        ]
+        if row_pitches:
+            pitch = sorted(row_pitches)[len(row_pitches) // 2]
+            if any(value < pitch * 0.55 or value > pitch * 1.80 for value in row_pitches):
+                continue
+
+        header_left = min(_ocr_token_center(token) for token in header.tokens)
+        header_right = max(_ocr_token_center(token) for token in header.tokens)
+        data_left = min(line.layout_bbox["x"] for line, _ in data_rows)
+        data_right = max(line.layout_bbox["x"] + line.layout_bbox["width"] for line, _ in data_rows)
+        if min(header_right, data_right) <= max(header_left, data_left):
+            continue
+        score = (len(data_rows), len(anchors), numeric_rows)
+        if best is None or score > best[0]:
+            best = (score, header, data_rows, anchors)
+
+    if best is None:
+        return None, set()
+    _, header, data_rows, anchors = best
+    header_cells = _ocr_table_cells([[(token)] for token in header.tokens])
+    rows = [_ocr_table_cells(cells) for _, cells in data_rows]
+    table_lines = [header, *(line for line, _ in data_rows)]
+    table = StructuredElement(
+        element_id=f"ocr-table-{page_result.page_index}-0",
+        type=StructuredElementType.TABLE,
+        page_index=page_result.page_index,
+        text="\n".join(
+            [" | ".join(cell["text"] for cell in header_cells)]
+            + [" | ".join(cell["text"] for cell in row) for row in rows]
+        ),
+        bbox=_bbox_union([line.source_bbox for line in table_lines]),
+        source="tesseract_ocr_structure",
+        confidence=None,
+        data={
+            "headers": header_cells,
+            "rows": rows,
+            "row_count": len(rows),
+            "column_count": len(anchors),
+            "reconstruction": "aligned-numeric-ocr-table-v1",
+            "layout_bbox": _bbox_union([line.layout_bbox for line in table_lines]),
+        },
+    )
+    return table, {line.line_id for line in table_lines}
+
+
+def _ocr_structured_elements(
+    page_result: PageResult,
+    *,
+    enable_scanned_table_recognition: bool = False,
+) -> list[StructuredElement]:
     lines = _ocr_layout_lines(page_result)
     if not lines:
         return _ocr_elements(page_result)
     page_width, page_height = _layout_dimensions(page_result)
     median_height = _median_line_height(lines)
     heading_levels = {line.line_id: _ocr_heading_level(line, index, lines, page_width, page_height, median_height) for index, line in enumerate(lines)}
-    table, table_line_ids = _simple_ocr_table(lines, page_result, median_height)
+    table = None
+    table_line_ids: set[str] = set()
+    if enable_scanned_table_recognition:
+        table, table_line_ids = _aligned_numeric_ocr_table(lines, page_result, median_height)
+    if table is None:
+        table, table_line_ids = _simple_ocr_table(lines, page_result, median_height)
     elements: list[StructuredElement] = []
     current: list[_OCRLayoutLine] = []
 
@@ -775,6 +915,7 @@ class StructuredDocumentProcessor:
         *,
         raster_dpi: int | None = None,
         raster_preparer: Any | None = None,
+        enable_scanned_table_recognition: bool = False,
     ) -> None:
         self.structured_adapter = structured_adapter
         if raster_dpi is not None and raster_preparer is not None:
@@ -783,6 +924,7 @@ class StructuredDocumentProcessor:
             raise ValueError("raster_dpi must be positive")
         self.raster_dpi = raster_dpi
         self.raster_preparer = raster_preparer
+        self.enable_scanned_table_recognition = enable_scanned_table_recognition
 
     def process_document(
         self,
@@ -813,6 +955,7 @@ class StructuredDocumentProcessor:
         ocr_worker = OCRV2Worker(
             raster_preparer=raster_preparer,
             max_raster_pixels=structured_max_raster_pixels(),
+            table_aware_ocr=self.enable_scanned_table_recognition,
         )
         from .routing import RoutePolicy
         from .validation import OCRProfile
@@ -852,7 +995,10 @@ class StructuredDocumentProcessor:
                         tables = _table_elements(plumber_doc.pages[page_index], page_index)
                         table_boxes = [table.bbox for table in tables]
                         native = [element for element in native if not any(_overlaps(element.bbox, box) for box in table_boxes)]
-                    ocr = _ocr_structured_elements(ocr_page)
+                    ocr = _ocr_structured_elements(
+                        ocr_page,
+                        enable_scanned_table_recognition=self.enable_scanned_table_recognition,
+                    )
                     if classification == PageContentClassification.TEXT_NATIVE.value or ocr_page.processing_source is PageProcessingSource.NATIVE_EXTRACTION:
                         elements = native + tables
                         processing_source = "NATIVE_EXTRACTION"
