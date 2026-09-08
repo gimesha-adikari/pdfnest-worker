@@ -50,38 +50,62 @@ def configured_pdf_to_word_ocr_engine(raw: str | None = None) -> str:
     return normalized
 
 
-def _internal_processor() -> Any:
+def _internal_processor(*, raster_dpi: int | None = None) -> Any:
     """Construct the frozen internal structured processor only in internal mode."""
 
     from app.core.ocr_v2.structured import StructuredDocumentProcessor
 
-    return StructuredDocumentProcessor()
+    if raster_dpi is None:
+        return StructuredDocumentProcessor()
+    return StructuredDocumentProcessor(raster_dpi=raster_dpi)
 
 
-def _sdk_processor() -> Any:
+def _sdk_processor(*, raster_dpi: int | None = None) -> Any:
     """Construct the public standalone SDK processor only in SDK mode."""
 
     try:
         from platen_document import DocumentProcessor
+        if raster_dpi is not None:
+            from platen_document import EngineConfiguration
     except ModuleNotFoundError as exc:
         if exc.name == "platen_document":
             raise PdfToWordOcrEngineUnavailableError(
                 "the selected PDF-to-Word OCR engine is unavailable"
             ) from exc
         raise
-    return DocumentProcessor()
+    if raster_dpi is None:
+        return DocumentProcessor()
+    return DocumentProcessor(EngineConfiguration(raster_dpi=raster_dpi))
 
 
-def _execute_internal(pdf_path: str | Path, *, language: str) -> Any:
-    return _internal_processor().process_document(pdf_path, language=language)
+def _execute_internal(
+    pdf_path: str | Path,
+    *,
+    language: str,
+    raster_dpi: int | None = None,
+) -> Any:
+    if raster_dpi is None:
+        processor = _internal_processor()
+    else:
+        processor = _internal_processor(raster_dpi=raster_dpi)
+    return processor.process_document(pdf_path, language=language)
 
 
-def _execute_sdk(pdf_path: str | Path, *, language: str) -> Any:
+def _execute_sdk(
+    pdf_path: str | Path,
+    *,
+    language: str,
+    raster_dpi: int | None = None,
+) -> Any:
     # ``extract_document`` is the public SDK contract for the canonical
     # structured result.  The result is passed directly to the existing
     # PDFNest-owned DOCX projection; there is no second extraction pass.
     try:
-        return _sdk_processor().extract_document(pdf_path, language=language)
+        if raster_dpi is None:
+            processor = _sdk_processor()
+        else:
+            processor = _sdk_processor(raster_dpi=raster_dpi)
+        return processor.extract_document(pdf_path, language=language)
     except PdfToWordOcrEngineUnavailableError:
         raise
     except Exception as exc:
@@ -93,16 +117,22 @@ def _execute_sdk(pdf_path: str | Path, *, language: str) -> Any:
         ) from exc
 
 
-def execute_pdf_to_word_ocr(pdf_path: str | Path, *, language: str = "eng") -> Any:
+def execute_pdf_to_word_ocr(
+    pdf_path: str | Path,
+    *,
+    language: str = "eng",
+    raster_dpi: int | None = None,
+) -> Any:
     """Extract the canonical document result for the OCR fallback."""
 
     selected = configured_pdf_to_word_ocr_engine()
     logger.info(
-        "OCR_V2_PDF_TO_WORD_OCR_ENGINE consumer=pdf_to_word engine=%s",
+        "OCR_V2_PDF_TO_WORD_OCR_ENGINE consumer=pdf_to_word engine=%s raster_dpi=%s",
         selected,
+        raster_dpi if raster_dpi is not None else "default",
     )
     executor = _execute_internal if selected == "internal" else _execute_sdk
-    return executor(pdf_path, language=language)
+    return executor(pdf_path, language=language, raster_dpi=raster_dpi)
 
 
 __all__ = [

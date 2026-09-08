@@ -76,6 +76,39 @@ def test_sdk_selector_uses_public_processor_and_not_internal(
     assert calls == {"path": tmp_path / "source.pdf", "language": "eng+sin"}
 
 
+def test_sdk_selector_forwards_pdf_to_word_raster_dpi(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls: dict[str, object] = {}
+
+    class FakeProcessor:
+        def extract_document(self, path: str | Path, **kwargs: object) -> object:
+            calls["path"] = path
+            calls.update(kwargs)
+            return object()
+
+    def sdk_processor(*, raster_dpi: int | None = None) -> FakeProcessor:
+        calls["raster_dpi"] = raster_dpi
+        return FakeProcessor()
+
+    monkeypatch.setenv(engine.PDF_TO_WORD_OCR_ENGINE_ENV, "sdk")
+    monkeypatch.setattr(engine, "_sdk_processor", sdk_processor)
+
+    result = engine.execute_pdf_to_word_ocr(
+        tmp_path / "source.pdf",
+        language="eng",
+        raster_dpi=72,
+    )
+
+    assert result is not None
+    assert calls == {
+        "raster_dpi": 72,
+        "path": tmp_path / "source.pdf",
+        "language": "eng",
+    }
+
+
 def test_sdk_failure_does_not_fall_back_to_internal(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

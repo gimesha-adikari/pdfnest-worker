@@ -37,7 +37,7 @@ from .contracts import (
     PageResult,
     ResultCapability,
 )
-from .geometry import PreparedRaster
+from .geometry import PreparedRaster, RasterPreparer
 from .orchestration import OCRV2Worker
 from .adapters.tesseract import TesseractAdapter
 
@@ -769,8 +769,16 @@ def render_structured_markdown(result: StructuredDocumentResult, *, emit_page_br
 class StructuredDocumentProcessor:
     """Native-first structured document processor using current local engines."""
 
-    def __init__(self, structured_adapter: StructuredEngineAdapter | None = None) -> None:
+    def __init__(
+        self,
+        structured_adapter: StructuredEngineAdapter | None = None,
+        *,
+        raster_dpi: int | None = None,
+    ) -> None:
         self.structured_adapter = structured_adapter
+        if raster_dpi is not None and raster_dpi <= 0:
+            raise ValueError("raster_dpi must be positive")
+        self.raster_dpi = raster_dpi
 
     def process_document(
         self,
@@ -792,7 +800,10 @@ class StructuredDocumentProcessor:
         with fitz.open(str(source_path)) as source_document:
             if len(source_document) == 0 or len(source_document) > structured_max_pages():
                 raise ValueError("structured OCR input exceeds the configured page limit")
-        ocr_worker = OCRV2Worker(max_raster_pixels=structured_max_raster_pixels())
+        ocr_worker = OCRV2Worker(
+            raster_preparer=RasterPreparer(self.raster_dpi) if self.raster_dpi is not None else None,
+            max_raster_pixels=structured_max_raster_pixels(),
+        )
         from .routing import RoutePolicy
         from .validation import OCRProfile
 

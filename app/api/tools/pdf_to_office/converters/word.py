@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import sys
 import tempfile
@@ -13,6 +14,15 @@ from app.core.pdf_to_word_ocr_engine import (
     configured_pdf_to_word_ocr_engine,
     execute_pdf_to_word_ocr,
 )
+
+
+PDF_TO_WORD_DEFAULT_RASTER_DPI = 200
+# The SDK's structured pixel guard runs after PyMuPDF and Pillow have already
+# materialized the raster.  Keep this PDF-to-Word-only preflight below the
+# worker's 1 GiB production ceiling, leaving room for the service and OCR
+# runtime around the raster itself.
+PDF_TO_WORD_MAX_RASTER_PIXELS = 10_000_000
+_FULL_PAGE_IMAGE_AREA_RATIO = 0.95
 
 
 def _get_pdf2docx_worker_count() -> int:
@@ -75,6 +85,78 @@ def _requires_structured_ocr(pdf_path: str) -> bool:
     return False
 
 
+def _raster_pixel_count(page: Any, dpi: int) -> int:
+    scale = dpi / 72.0
+    width = max(1, math.ceil(float(page.rect.width) * scale))
+    height = max(1, math.ceil(float(page.rect.height) * scale))
+    return width * height
+
+
+def _max_safe_page_raster_dpi(page: Any) -> int:
+    """Find the highest pre-render DPI within the PDF-to-Word pixel budget."""
+
+    if _raster_pixel_count(page, 1) > PDF_TO_WORD_MAX_RASTER_PIXELS:
+        raise ValueError("PDF-to-Word page is too large for safe rasterization")
+    if _raster_pixel_count(page, PDF_TO_WORD_DEFAULT_RASTER_DPI) <= PDF_TO_WORD_MAX_RASTER_PIXELS:
+        return PDF_TO_WORD_DEFAULT_RASTER_DPI
+
+    lower, upper = 1, PDF_TO_WORD_DEFAULT_RASTER_DPI
+    while lower < upper:
+        candidate = (lower + upper + 1) // 2
+        if _raster_pixel_count(page, candidate) <= PDF_TO_WORD_MAX_RASTER_PIXELS:
+            lower = candidate
+        else:
+            upper = candidate - 1
+    return lower
+
+
+def _full_page_image_source_dpi(page: Any) -> float | None:
+    """Return the lowest intrinsic DPI of an image covering almost the page."""
+
+    page_area = float(page.rect.width) * float(page.rect.height)
+    if page_area <= 0:
+        return None
+
+    source_dpi: float | None = None
+    for image in page.get_images(full=True):
+        image_width, image_height = int(image[2]), int(image[3])
+        if image_width <= 0 or image_height <= 0:
+            continue
+        for image_rect in page.get_image_rects(image):
+            image_area = float(image_rect.width) * float(image_rect.height)
+            if image_area / page_area < _FULL_PAGE_IMAGE_AREA_RATIO:
+                continue
+            dpi = min(
+                image_width * 72.0 / float(image_rect.width),
+                image_height * 72.0 / float(image_rect.height),
+            )
+            if dpi > 0 and (source_dpi is None or dpi < source_dpi):
+                source_dpi = dpi
+    return source_dpi
+
+
+def _get_pdf_to_word_raster_dpi(pdf_path: str) -> int | None:
+    """Preflight structured PDF-to-Word rasterization before allocating pixels.
+
+    Ordinary pages retain the existing 200 DPI behavior.  Only pages whose
+    default render exceeds the PDF-to-Word safety budget are reduced.  For a
+    full-page scan, the embedded image resolution is also used as an upper
+    bound so a low-DPI scan is not needlessly upsampled into a large raster.
+    ``None`` means that the selected engine should use its normal default.
+    """
+
+    selected_dpi = PDF_TO_WORD_DEFAULT_RASTER_DPI
+    with fitz.open(pdf_path) as doc:
+        for page in doc:
+            page_dpi = _max_safe_page_raster_dpi(page)
+            if page_dpi < PDF_TO_WORD_DEFAULT_RASTER_DPI:
+                source_dpi = _full_page_image_source_dpi(page)
+                if source_dpi is not None:
+                    page_dpi = min(page_dpi, max(1, math.floor(source_dpi)))
+                selected_dpi = min(selected_dpi, page_dpi)
+    return selected_dpi if selected_dpi < PDF_TO_WORD_DEFAULT_RASTER_DPI else None
+
+
 def _structured_element_type(element: Any) -> str:
     """Read the canonical element value across internal and SDK enum types."""
 
@@ -131,8 +213,17 @@ def _write_structured_result_to_word(result: Any, output_path: str) -> None:
     doc_out.save(output_path)
 
 
-def _convert_structured_to_word(pdf_path: str, output_path: str, language: str) -> None:
-    result = execute_pdf_to_word_ocr(pdf_path, language=language)
+def _convert_structured_to_word(
+    pdf_path: str,
+    output_path: str,
+    language: str,
+    *,
+    raster_dpi: int | None = None,
+) -> None:
+    if raster_dpi is None:
+        result = execute_pdf_to_word_ocr(pdf_path, language=language)
+    else:
+        result = execute_pdf_to_word_ocr(pdf_path, language=language, raster_dpi=raster_dpi)
     _write_structured_result_to_word(result, output_path)
 
 
@@ -148,7 +239,8 @@ def convert_to_word(pdf_path: str, output_path: str, language: str = "eng") -> N
         doc.close()
 
     if structured:
-        _convert_structured_to_word(pdf_path, output_path, language)
+        raster_dpi = _get_pdf_to_word_raster_dpi(pdf_path)
+        _convert_structured_to_word(pdf_path, output_path, language, raster_dpi=raster_dpi)
         return
 
     workers = _get_pdf2docx_worker_count()

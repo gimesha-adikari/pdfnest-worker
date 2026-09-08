@@ -1,5 +1,6 @@
 import os
 import tempfile
+from types import SimpleNamespace
 import fitz
 from PIL import Image, ImageDraw, ImageFont
 from docx import Document
@@ -7,6 +8,7 @@ from unittest.mock import patch
 from concurrent.futures import ThreadPoolExecutor
 
 from app.api.tools.pdf_to_office.converters.word import (
+    _get_pdf_to_word_raster_dpi,
     _get_pdf2docx_worker_count,
     _requires_structured_ocr,
     convert_to_word,
@@ -30,6 +32,15 @@ def create_scanned_text_pdf(path: str, text: str = "OCR V2 scanned Word text") -
 
     doc = fitz.open()
     page = doc.new_page(width=900, height=250)
+    page.insert_image(page.rect, stream=_png_bytes(image))
+    doc.save(path)
+    doc.close()
+
+
+def create_large_low_dpi_scan_pdf(path: str) -> None:
+    image = Image.new("RGB", (1200, 1800), "white")
+    doc = fitz.open()
+    page = doc.new_page(width=1200, height=1800)
     page.insert_image(page.rect, stream=_png_bytes(image))
     doc.save(path)
     doc.close()
@@ -72,6 +83,44 @@ def test_get_pdf2docx_worker_count():
         assert _get_pdf2docx_worker_count() == 1
 
 
+def test_large_low_dpi_scan_is_preflighted_before_rasterization():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        pdf_path = os.path.join(tmpdir, "large-low-dpi-scan.pdf")
+        create_large_low_dpi_scan_pdf(pdf_path)
+
+        assert _get_pdf_to_word_raster_dpi(pdf_path) == 72
+
+
+def test_ordinary_page_keeps_existing_raster_default():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        pdf_path = os.path.join(tmpdir, "ordinary.pdf")
+        create_sample_text_pdf(pdf_path, pages=1)
+
+        assert _get_pdf_to_word_raster_dpi(pdf_path) is None
+
+
+def test_large_scan_passes_preflight_dpi_to_single_structured_extraction(monkeypatch):
+    import app.api.tools.pdf_to_office.converters.word as word
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        pdf_path = os.path.join(tmpdir, "large-low-dpi-scan.pdf")
+        docx_path = os.path.join(tmpdir, "large-low-dpi-scan.docx")
+        create_large_low_dpi_scan_pdf(pdf_path)
+        calls = []
+
+        def execute(path, *, language, raster_dpi):
+            calls.append((path, language, raster_dpi))
+            return SimpleNamespace(pages=())
+
+        monkeypatch.setenv("PDF_TO_WORD_OCR_ENGINE", "sdk")
+        monkeypatch.setattr(word, "execute_pdf_to_word_ocr", execute)
+
+        word.convert_to_word(pdf_path, docx_path, language="eng")
+
+        assert calls == [(pdf_path, "eng", 72)]
+        assert os.path.exists(docx_path)
+
+
 def test_convert_to_word_isolated_execution():
     with tempfile.TemporaryDirectory() as tmpdir:
         pdf_path = os.path.join(tmpdir, "test.pdf")
@@ -86,6 +135,23 @@ def test_convert_to_word_isolated_execution():
         final_files = set(os.listdir(os.getcwd()))
         # Verify no intermediate pages-*.json files leaked into CWD
         assert final_files == initial_files
+
+
+def test_native_pdf_bypass_does_not_run_structured_raster_preflight(monkeypatch):
+    import app.api.tools.pdf_to_office.converters.word as word
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        pdf_path = os.path.join(tmpdir, "native.pdf")
+        docx_path = os.path.join(tmpdir, "native.docx")
+        create_sample_text_pdf(pdf_path, pages=1)
+
+        def fail_preflight(_path):
+            raise AssertionError("native PDF-to-Word bypass must not preflight OCR rasterization")
+
+        monkeypatch.setattr(word, "_get_pdf_to_word_raster_dpi", fail_preflight)
+        word.convert_to_word(pdf_path, docx_path)
+
+        assert os.path.exists(docx_path)
 
 
 def test_concurrent_pdf_to_word_no_cwd_collision():
