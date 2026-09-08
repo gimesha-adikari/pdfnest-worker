@@ -253,6 +253,15 @@ def _bbox(x0: float, y0: float, x1: float, y1: float) -> dict[str, float]:
     return {"x": float(x0), "y": float(y0), "width": max(0.0, float(x1 - x0)), "height": max(0.0, float(y1 - y0))}
 
 
+def _raw_bbox(value: Any) -> dict[str, float] | None:
+    if not isinstance(value, (list, tuple)) or len(value) != 4:
+        return None
+    try:
+        return _bbox(float(value[0]), float(value[1]), float(value[2]), float(value[3]))
+    except (TypeError, ValueError):
+        return None
+
+
 def _element_sort_key(element: StructuredElement) -> tuple[float, float, int, str]:
     bbox = (element.data.get("layout_bbox") if element.data else None) or element.bbox or {}
     return (float(bbox.get("y", 0.0)), float(bbox.get("x", 0.0)), element.page_index, element.element_id)
@@ -280,19 +289,41 @@ def _native_elements(page: fitz.Page, page_index: int, base_font_size: float) ->
         bold = False
         italic = False
         spans_for_data: list[dict[str, Any]] = []
+        layout_lines: list[dict[str, Any]] = []
         for line in raw_lines:
+            line_texts: list[str] = []
+            line_spans: list[dict[str, Any]] = []
             for span in line.get("spans", []):
                 text = str(span.get("text", "")).strip()
                 if not text:
                     continue
                 texts.append(text)
+                line_texts.append(text)
                 size = float(span.get("size", 10.0))
                 max_size = max(max_size, size)
                 font = str(span.get("font", ""))
                 flags = int(span.get("flags", 0))
                 bold = bold or is_bold_font(flags, font)
                 italic = italic or is_italic_font(flags, font)
-                spans_for_data.append({"text": text, "font_size": size, "bold": is_bold_font(flags, font), "italic": is_italic_font(flags, font)})
+                span_data = {"text": text, "font_size": size, "bold": is_bold_font(flags, font), "italic": is_italic_font(flags, font)}
+                span_box = _raw_bbox(span.get("bbox"))
+                if span_box is not None:
+                    span_data["bbox"] = span_box
+                spans_for_data.append(span_data)
+                line_spans.append(span_data)
+            line_text = " ".join(line_texts).strip()
+            if line_text:
+                line_box = _raw_bbox(line.get("bbox"))
+                if line_box is None:
+                    span_boxes = [span["bbox"] for span in line_spans if "bbox" in span]
+                    line_box = _bbox_union(span_boxes) if span_boxes else None
+                line_data: dict[str, Any] = {"text": line_text}
+                if line_box is not None:
+                    line_data["bbox"] = line_box
+                    line_data["layout_bbox"] = dict(line_box)
+                if line_spans:
+                    line_data["spans"] = line_spans
+                layout_lines.append(line_data)
         text = " ".join(texts).strip()
         if not text:
             continue
@@ -301,7 +332,7 @@ def _native_elements(page: fitz.Page, page_index: int, base_font_size: float) ->
         heading = classify_heading_level(max_size, base_font_size, bold, text, is_isolated=True)
         element_type = StructuredElementType.HEADING if heading else StructuredElementType.PARAGRAPH
         ordered: bool | None = None
-        data: dict[str, Any] = {"spans": spans_for_data}
+        data: dict[str, Any] = {"spans": spans_for_data, "layout_lines": layout_lines}
         if BULLET_REGEX.match(text) or NUMBERED_LIST_REGEX.match(text):
             element_type = StructuredElementType.LIST
             ordered = bool(NUMBERED_LIST_REGEX.match(text))
@@ -334,6 +365,15 @@ def _ocr_elements(page_result: PageResult) -> list[StructuredElement]:
                 "line_ids": list(block.line_ids),
                 "line_geometry_available": True,
                 "word_geometry_available": bool(page_result.tokens),
+                "layout_lines": [
+                    {
+                        "text": line.text,
+                        "bbox": {"x": line.bbox.x, "y": line.bbox.y, "width": line.bbox.width, "height": line.bbox.height},
+                        "layout_bbox": {"x": line.bbox.x, "y": line.bbox.y, "width": line.bbox.width, "height": line.bbox.height},
+                    }
+                    for line in page_result.lines
+                    if line.id in block.line_ids
+                ],
             },
         ))
     if not elements and page_result.text.strip():
@@ -791,6 +831,7 @@ def _ocr_structured_elements(
     page_result: PageResult,
     *,
     enable_scanned_table_recognition: bool = False,
+    enable_legacy_table_reconstruction: bool = True,
 ) -> list[StructuredElement]:
     lines = _ocr_layout_lines(page_result)
     if not lines:
@@ -802,7 +843,7 @@ def _ocr_structured_elements(
     table_line_ids: set[str] = set()
     if enable_scanned_table_recognition:
         table, table_line_ids = _aligned_numeric_ocr_table(lines, page_result, median_height)
-    if table is None:
+    if table is None and enable_legacy_table_reconstruction:
         table, table_line_ids = _simple_ocr_table(lines, page_result, median_height)
     elements: list[StructuredElement] = []
     current: list[_OCRLayoutLine] = []
@@ -818,7 +859,15 @@ def _ocr_structured_elements(
             bbox=_bbox_union([line.source_bbox for line in current]),
             source="tesseract_ocr_structure",
             confidence=0.72,
-            data={"line_ids": [line.line_id for line in current], "layout_geometry_available": True, "layout_bbox": _bbox_union([line.layout_bbox for line in current])},
+            data={
+                "line_ids": [line.line_id for line in current],
+                "layout_geometry_available": True,
+                "layout_bbox": _bbox_union([line.layout_bbox for line in current]),
+                "layout_lines": [
+                    {"text": line.text, "bbox": dict(line.source_bbox), "layout_bbox": dict(line.layout_bbox)}
+                    for line in current
+                ],
+            },
         ))
         current.clear()
 
@@ -925,34 +974,241 @@ def _validate_result(pages: tuple[StructuredPage, ...]) -> dict[str, Any]:
     return {"valid": not issues, "issues": issues}
 
 
+_MARKDOWN_LIST_MARKER = re.compile(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)")
+
+
+def _element_layout_box(element: Any) -> dict[str, float] | None:
+    data = getattr(element, "data", {}) or {}
+    box = data.get("layout_bbox") or getattr(element, "bbox", None)
+    if not isinstance(box, Mapping):
+        return None
+    try:
+        return {
+            "x": float(box.get("x", 0.0)),
+            "y": float(box.get("y", 0.0)),
+            "width": max(0.0, float(box.get("width", 0.0))),
+            "height": max(0.0, float(box.get("height", 0.0))),
+        }
+    except (TypeError, ValueError):
+        return None
+
+
+def _layout_item_box(item: Any) -> dict[str, float] | None:
+    if isinstance(item, Mapping):
+        box = item.get("layout_bbox") or item.get("bbox")
+        if not isinstance(box, Mapping):
+            return None
+        try:
+            return {
+                "x": float(box.get("x", 0.0)),
+                "y": float(box.get("y", 0.0)),
+                "width": max(0.0, float(box.get("width", 0.0))),
+                "height": max(0.0, float(box.get("height", 0.0))),
+            }
+        except (TypeError, ValueError):
+            return None
+    return _element_layout_box(item)
+
+
+def _cluster_layout_items(
+    items: Sequence[Any],
+    *,
+    page_width: float,
+    minimum_gap: float,
+    gap_ratio: float,
+) -> list[list[Any]]:
+    threshold = max(minimum_gap, page_width * gap_ratio)
+    clusters: list[list[Any]] = []
+    anchors: list[float] = []
+    for item in sorted(items, key=lambda value: (_layout_item_box(value) or {}).get("x", 0.0)):
+        box = _layout_item_box(item)
+        if box is None:
+            continue
+        if not clusters or box["x"] - anchors[-1] > threshold:
+            clusters.append([item])
+            anchors.append(box["x"])
+            continue
+        clusters[-1].append(item)
+        anchors[-1] = sum((_layout_item_box(value) or {"x": box["x"]})["x"] for value in clusters[-1]) / len(clusters[-1])
+    return clusters
+
+
+def _layout_text_blocks(element: StructuredElement, page_width: float) -> list[str]:
+    """Return paragraph blocks in reading order using retained line geometry."""
+
+    data = element.data or {}
+    raw_lines = data.get("layout_lines", [])
+    if not isinstance(raw_lines, list):
+        return [element.text] if element.text else []
+    lines = [
+        line
+        for line in raw_lines
+        if isinstance(line, Mapping) and str(line.get("text", "")).strip() and _layout_item_box(line) is not None
+    ]
+    if len(lines) < 2:
+        return [element.text] if element.text else []
+    clusters = _cluster_layout_items(lines, page_width=page_width, minimum_gap=12.0, gap_ratio=0.04)
+    if len(clusters) < 2 or any(len(cluster) < 2 for cluster in clusters):
+        return [" ".join(str(line.get("text", "")).strip() for line in sorted(lines, key=lambda value: (_layout_item_box(value) or {}).get("y", 0.0)))]
+    return [
+        " ".join(str(line.get("text", "")).strip() for line in sorted(cluster, key=lambda value: (_layout_item_box(value) or {}).get("y", 0.0)))
+        for cluster in clusters
+    ]
+
+
+def _page_layout_order(page: Any) -> list[StructuredElement]:
+    """Order separate text blocks by column bands when geometry proves columns."""
+
+    by_id = {element.element_id: element for element in page.elements}
+    ordered = [by_id[element_id] for element_id in page.reading_order if element_id in by_id]
+    if len(ordered) < 4:
+        return ordered
+    geometry = getattr(page, "geometry", {}) or {}
+    try:
+        page_width = float(geometry.get("width", 0.0))
+    except (AttributeError, TypeError, ValueError):
+        page_width = 0.0
+    if page_width <= 0.0:
+        page_width = max((_element_layout_box(element) or {}).get("x", 0.0) + (_element_layout_box(element) or {}).get("width", 0.0) for element in ordered)
+    text_types = {StructuredElementType.PARAGRAPH, StructuredElementType.TEXT_BLOCK}
+    candidates = [
+        element
+        for element in ordered
+        if element.type in text_types
+        and (box := _element_layout_box(element)) is not None
+        and box["width"] <= page_width * 0.65
+    ]
+    if len(candidates) < 4:
+        return ordered
+    clusters = _cluster_layout_items(candidates, page_width=page_width, minimum_gap=24.0, gap_ratio=0.12)
+    columns = [cluster for cluster in clusters if len(cluster) >= 2]
+    if len(columns) < 2:
+        return ordered
+    column_anchors = [sum((_element_layout_box(item) or {"x": 0.0})["x"] for item in column) / len(column) for column in columns]
+    column_start = min((_element_layout_box(item) or {"y": 0.0})["y"] for column in columns for item in column)
+    column_end = max(
+        (_element_layout_box(item) or {"y": 0.0, "height": 0.0})["y"] + (_element_layout_box(item) or {"height": 0.0})["height"]
+        for column in columns
+        for item in column
+    )
+    assignment_tolerance = max(24.0, page_width * 0.12)
+    column_items: list[list[StructuredElement]] = [[] for _ in columns]
+    full_width: list[StructuredElement] = []
+    for element in ordered:
+        box = _element_layout_box(element)
+        if box is None or element.type not in text_types or box["width"] > page_width * 0.65:
+            full_width.append(element)
+            continue
+        if box["y"] + box["height"] < column_start or box["y"] > column_end:
+            full_width.append(element)
+            continue
+        index = min(range(len(column_anchors)), key=lambda value: abs(box["x"] - column_anchors[value]))
+        if abs(box["x"] - column_anchors[index]) > assignment_tolerance:
+            full_width.append(element)
+        else:
+            column_items[index].append(element)
+    if not full_width and not any(column_items):
+        return ordered
+
+    all_column_items = [candidate for column in column_items for candidate in column]
+
+    def grouped(items: Sequence[StructuredElement]) -> list[StructuredElement]:
+        result: list[StructuredElement] = []
+        for index in sorted(range(len(column_items)), key=lambda value: column_anchors[value]):
+            selected = [item for item in items if item in column_items[index]]
+            result.extend(sorted(selected, key=lambda item: (_element_layout_box(item) or {}).get("y", 0.0)))
+        return result
+
+    remaining = list(ordered)
+    result: list[StructuredElement] = []
+    for anchor in sorted(full_width, key=lambda item: (_element_layout_box(item) or {}).get("y", 0.0)):
+        box = _element_layout_box(anchor) or {"y": 0.0}
+        if box["y"] <= column_start:
+            result.append(anchor)
+            remaining.remove(anchor)
+            continue
+        before = [item for item in remaining if item in all_column_items and (_element_layout_box(item) or {}).get("y", 0.0) < box["y"]]
+        result.extend(grouped(before))
+        for item in before:
+            remaining.remove(item)
+        result.append(anchor)
+        remaining.remove(anchor)
+    result.extend(grouped([item for item in remaining if item in all_column_items]))
+    for item in remaining:
+        if item not in result:
+            result.append(item)
+    return result if {item.element_id for item in result} == {item.element_id for item in ordered} else ordered
+
+
+def _markdown_cell(value: Any) -> str:
+    if isinstance(value, Mapping):
+        value = value.get("text", "")
+    text = "" if value is None else str(value)
+    return text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "<br>").replace("|", "\\|")
+
+
+def _markdown_table(element: StructuredElement) -> str:
+    data = element.data or {}
+    headers = [_markdown_cell(cell) for cell in data.get("headers", [])]
+    rows = [[_markdown_cell(cell) for cell in row] for row in data.get("rows", [])]
+    all_rows = ([headers] if headers else []) + rows
+    if not all_rows:
+        return ""
+    columns = max(len(row) for row in all_rows)
+    all_rows = [row + [""] * (columns - len(row)) for row in all_rows]
+    alignments = data.get("alignments", [])
+    markers = []
+    for index in range(columns):
+        alignment = alignments[index] if isinstance(alignments, list) and index < len(alignments) else "left"
+        markers.append({"center": ":---:", "right": "---:"}.get(str(alignment).lower(), "---"))
+    lines = [
+        "| " + " | ".join(all_rows[0]) + " |",
+        "| " + " | ".join(markers) + " |",
+    ]
+    lines.extend("| " + " | ".join(row) + " |" for row in all_rows[1:])
+    return "\n".join(lines)
+
+
+def _markdown_list(element: StructuredElement) -> str:
+    lines: list[str] = []
+    for index, item in enumerate((element.data or {}).get("items", [])):
+        if not isinstance(item, Mapping):
+            item = {"text": item}
+        text = _MARKDOWN_LIST_MARKER.sub("", str(item.get("text", "")).strip())
+        marker = f"{index + 1}." if element.ordered else "-"
+        try:
+            level = max(0, int(item.get("level", 0) or 0))
+        except (TypeError, ValueError):
+            level = 0
+        lines.append(f"{'  ' * level}{marker} {text}".rstrip())
+    return "\n".join(lines)
+
+
 def render_structured_markdown(result: StructuredDocumentResult, *, emit_page_breaks: bool = True) -> str:
-    """Render only canonical structured elements into GFM Markdown."""
+    """Render canonical structured elements into deterministic GFM Markdown."""
+
     chunks: list[str] = []
     for page_index, page in enumerate(result.pages):
         if emit_page_breaks and page_index:
-            chunks.append("\n<!-- pagebreak -->\n")
-        elements = {element.element_id: element for element in page.elements}
-        for element_id in page.reading_order:
-            element = elements[element_id]
+            chunks.append("<!-- pagebreak -->")
+        geometry = getattr(page, "geometry", {}) or {}
+        try:
+            page_width = float(geometry.get("width", 0.0))
+        except (AttributeError, TypeError, ValueError):
+            page_width = 0.0
+        for element in _page_layout_order(page):
             if element.type is StructuredElementType.HEADING:
-                chunks.append(f"{'#' * max(1, min(6, element.level or 1))} {element.text}")
+                chunks.append(f"{'#' * max(1, min(6, element.level or 1))} {element.text}".strip())
             elif element.type in (StructuredElementType.PARAGRAPH, StructuredElementType.TEXT_BLOCK):
-                if element.text:
-                    chunks.append(element.text)
+                chunks.extend(_layout_text_blocks(element, page_width))
             elif element.type is StructuredElementType.LIST:
-                for index, item in enumerate(element.data.get("items", [])):
-                    marker = f"{index + 1}." if element.ordered else "-"
-                    chunks.append(f"{marker} {item.get('text', '')}")
+                rendered = _markdown_list(element)
+                if rendered:
+                    chunks.append(rendered)
             elif element.type is StructuredElementType.TABLE:
-                headers = [str(cell.get("text", "")).replace("|", "\\|") for cell in element.data.get("headers", [])]
-                rows = [[str(cell.get("text", "")).replace("|", "\\|") for cell in row] for row in element.data.get("rows", [])]
-                all_rows = ([headers] if headers else []) + rows
-                if all_rows:
-                    columns = max(len(row) for row in all_rows)
-                    all_rows = [row + [""] * (columns - len(row)) for row in all_rows]
-                    chunks.append("| " + " | ".join(all_rows[0]) + " |")
-                    chunks.append("| " + " | ".join(":---" for _ in range(columns)) + " |")
-                    chunks.extend("| " + " | ".join(row) + " |" for row in all_rows[1:])
+                rendered = _markdown_table(element)
+                if rendered:
+                    chunks.append(rendered)
             elif element.type is StructuredElementType.IMAGE:
                 chunks.append(f"![{element.data.get('alt_text', 'Figure')}]({element.data.get('url', '')})")
             elif element.type is StructuredElementType.CAPTION:
@@ -960,7 +1216,10 @@ def render_structured_markdown(result: StructuredDocumentResult, *, emit_page_br
             elif element.type is StructuredElementType.FORMULA:
                 if element.text:
                     chunks.append(f"$${element.text}$$")
-    return "\n\n".join(chunk for chunk in chunks if chunk).strip() + "\n"
+            elif element.text:
+                chunks.append(element.text)
+    rendered = "\n\n".join(chunk.strip() for chunk in chunks if chunk and chunk.strip())
+    return f"{rendered}\n" if rendered else ""
 
 
 class StructuredDocumentProcessor:
@@ -1055,6 +1314,7 @@ class StructuredDocumentProcessor:
                     ocr = _ocr_structured_elements(
                         ocr_page,
                         enable_scanned_table_recognition=self.enable_scanned_table_recognition,
+                        enable_legacy_table_reconstruction=classification != PageContentClassification.MIXED.value,
                     )
                     if classification == PageContentClassification.TEXT_NATIVE.value or ocr_page.processing_source is PageProcessingSource.NATIVE_EXTRACTION:
                         elements = native + tables

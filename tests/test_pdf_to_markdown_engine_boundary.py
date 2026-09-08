@@ -28,6 +28,102 @@ def test_pdf_to_markdown_engine_rejects_unknown_value(monkeypatch: pytest.Monkey
         engine.configured_pdf_to_markdown_engine()
 
 
+def test_pdf_to_markdown_processors_enable_scanned_table_capability() -> None:
+    internal = engine._internal_processor()
+    sdk = engine._sdk_processor()
+
+    assert internal.enable_scanned_table_recognition is True
+    assert sdk.config.enable_scanned_table_recognition is True
+
+
+@pytest.mark.parametrize("selected", ["internal", "sdk"])
+def test_pdf_to_markdown_reuses_page_scoped_raster_preflight(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    selected: str,
+) -> None:
+    calls: dict[str, object] = {}
+    marker = object()
+
+    class FakeProcessor:
+        def process_document(self, _path: str | Path, **_kwargs: object) -> object:
+            return marker
+
+        def extract_document(self, _path: str | Path, **_kwargs: object) -> object:
+            return marker
+
+        def to_markdown(self, _result: object, *, emit_page_breaks: bool) -> str:
+            assert emit_page_breaks is True
+            return "# markdown"
+
+    def processor_factory(**kwargs: object) -> FakeProcessor:
+        calls.update(kwargs)
+        return FakeProcessor()
+
+    monkeypatch.setenv(engine.PDF_TO_MARKDOWN_ENGINE_ENV, selected)
+    monkeypatch.setattr(engine, "_pdf_to_markdown_raster_dpis", lambda _path: (200, 72, 200))
+    if selected == "internal":
+        monkeypatch.setattr(engine, "_internal_processor", processor_factory)
+        monkeypatch.setattr(engine, "_internal_markdown", lambda _result: "# markdown")
+    else:
+        monkeypatch.setattr(engine, "_sdk_processor", processor_factory)
+
+    execution = engine.execute_pdf_to_markdown(tmp_path / "source.pdf", language="eng")
+
+    assert execution.structured_result is marker
+    assert calls == {"raster_dpis": (200, 72, 200)}
+
+
+@pytest.mark.parametrize("selected", ["internal", "sdk"])
+def test_pdf_to_markdown_projects_original_scanned_table(
+    monkeypatch: pytest.MonkeyPatch,
+    selected: str,
+) -> None:
+    source = Path("/home/gimesha/My_Projects/platen/benchmarks/ocr_eval/fixtures_generated/synth_table_scan.pdf")
+    monkeypatch.setenv(engine.PDF_TO_MARKDOWN_ENGINE_ENV, selected)
+
+    execution = engine.execute_pdf_to_markdown(source, language="eng", routing_policy="FAST")
+
+    tables = [
+        element
+        for page in execution.structured_result.pages
+        for element in page.elements
+        if getattr(element.type, "value", element.type) == "TABLE"
+    ]
+    assert len(tables) == 1
+    table = tables[0]
+    assert table.data["column_count"] == 6
+    assert table.data["row_count"] == 4
+    assert [cell["text"] for cell in table.data["headers"]] == ["ID", "Name", "Q1", "Q2", "Q3", "Total"]
+    assert [[cell["text"] for cell in row] for row in table.data["rows"]] == [
+        ["001", "Alice", "10", "15", "12", "37"],
+        ["002", "Bob", "8", "9", "11", "28"],
+        ["003", "Charlie", "20", "18", "22", "60"],
+        ["004", "Dave", "5", "5", "5", "15"],
+    ]
+    assert execution.markdown.count("| ID | Name | Q1 | Q2 | Q3 | Total |") == 1
+    assert "\n\n| 001 |" not in execution.markdown
+
+
+@pytest.mark.parametrize("selected", ["internal", "sdk"])
+def test_pdf_to_markdown_does_not_turn_mixed_cv_content_into_a_table(
+    monkeypatch: pytest.MonkeyPatch,
+    selected: str,
+) -> None:
+    source = Path("/home/gimesha/My_Projects/platen/pdfnest/tests/fixtures/gimesha_cv.pdf")
+    monkeypatch.setenv(engine.PDF_TO_MARKDOWN_ENGINE_ENV, selected)
+
+    execution = engine.execute_pdf_to_markdown(source, language="eng", routing_policy="FAST")
+
+    assert all(
+        getattr(element.type, "value", element.type) != "TABLE"
+        for page in execution.structured_result.pages
+        for element in page.elements
+    )
+    assert "BankingSystem" in execution.markdown
+    assert "\n| " not in execution.markdown
+
+
 def test_internal_boundary_forwards_structured_controls_and_renders_once(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

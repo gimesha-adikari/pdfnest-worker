@@ -55,12 +55,34 @@ def configured_pdf_to_markdown_engine(raw: str | None = None) -> str:
     return normalized
 
 
-def _internal_processor() -> Any:
+def _pdf_to_markdown_raster_dpis(pdf_path: str | Path) -> tuple[int, ...] | None:
+    """Reuse the validated page-scoped raster preflight for structured Markdown."""
+
+    source_path = Path(pdf_path)
+    if not source_path.is_file():
+        return None
+    from app.api.tools.pdf_to_office.converters.word import (
+        PDF_TO_WORD_DEFAULT_RASTER_DPI,
+        _get_pdf_to_word_raster_dpis,
+    )
+
+    raster_dpis = _get_pdf_to_word_raster_dpis(str(source_path))
+    return raster_dpis if any(dpi != PDF_TO_WORD_DEFAULT_RASTER_DPI for dpi in raster_dpis) else None
+
+
+def _internal_processor(*, raster_dpis: Sequence[int] | None = None) -> Any:
     """Construct the frozen internal structured processor only in internal mode."""
 
     from app.core.ocr_v2.structured import StructuredDocumentProcessor
+    from app.core.ocr_v2.geometry import RasterPreparer
+    from app.core.pdf_to_word_ocr_engine import _PageScopedRasterPreparer
 
-    return StructuredDocumentProcessor()
+    if raster_dpis is None:
+        return StructuredDocumentProcessor(enable_scanned_table_recognition=True)
+    return StructuredDocumentProcessor(
+        raster_preparer=_PageScopedRasterPreparer(raster_dpis, RasterPreparer),
+        enable_scanned_table_recognition=True,
+    )
 
 
 def _internal_markdown(result: Any) -> str:
@@ -71,18 +93,36 @@ def _internal_markdown(result: Any) -> str:
     return render_structured_markdown(result)
 
 
-def _sdk_processor() -> Any:
+def _sdk_processor(*, raster_dpis: Sequence[int] | None = None) -> Any:
     """Construct the public standalone SDK processor only in SDK mode."""
 
     try:
-        from platen_document import DocumentProcessor
+        from platen_document import DocumentProcessor, EngineConfiguration
     except ModuleNotFoundError as exc:
         if exc.name == "platen_document":
             raise PdfToMarkdownEngineUnavailableError(
                 "the standalone platen_document package is not installed"
             ) from exc
         raise
-    return DocumentProcessor()
+    processor = DocumentProcessor(EngineConfiguration(enable_scanned_table_recognition=True))
+    if raster_dpis is None:
+        return processor
+    from app.core.pdf_to_word_ocr_engine import _PageScopedRasterPreparer
+
+    try:
+        ocr_worker = processor._structured_processor.ocr_worker
+        base_preparer = ocr_worker.raster_preparer
+        metadata_policy = base_preparer.dpi_metadata_policy
+        preparer_type = type(base_preparer)
+        ocr_worker.raster_preparer = _PageScopedRasterPreparer(
+            raster_dpis,
+            lambda dpi: preparer_type(dpi, dpi_metadata_policy=metadata_policy),
+        )
+    except AttributeError as exc:
+        raise PdfToMarkdownEngineUnavailableError(
+            "the standalone SDK cannot apply page-scoped Markdown rasterization"
+        ) from exc
+    return processor
 
 
 def _execute_internal(
@@ -96,7 +136,9 @@ def _execute_internal(
     cancellation_check: CancellationCheck | None,
     page_progress_callback: PageProgressCallback | None,
 ) -> PdfToMarkdownExecution:
-    result = _internal_processor().process_document(
+    raster_dpis = _pdf_to_markdown_raster_dpis(pdf_path)
+    processor = _internal_processor(**({"raster_dpis": raster_dpis} if raster_dpis is not None else {}))
+    result = processor.process_document(
         pdf_path,
         language=language,
         language_mode=language_mode,
@@ -120,7 +162,8 @@ def _execute_sdk(
     cancellation_check: CancellationCheck | None,
     page_progress_callback: PageProgressCallback | None,
 ) -> PdfToMarkdownExecution:
-    processor = _sdk_processor()
+    raster_dpis = _pdf_to_markdown_raster_dpis(pdf_path)
+    processor = _sdk_processor(**({"raster_dpis": raster_dpis} if raster_dpis is not None else {}))
     # Extract once, then render the already-produced canonical result.  Calling
     # to_markdown(result) is intentionally render-only and cannot trigger a
     # second OCR/structured pass.
