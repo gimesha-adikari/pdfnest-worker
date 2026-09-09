@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pymupdf as fitz
 from PIL import Image
+from PIL import ImageDraw
 
 from app.api.tools.editor.document import compile_document
 from app.api.tools.markup.document import process_markup_pdf
@@ -62,6 +63,103 @@ def _rotated_mixed_pdf(path: Path) -> tuple[dict, fitz.Rect]:
     document.save(path)
     document.close()
     return layout, visible_rect
+
+
+def _visible_page_rgb(page: fitz.Page) -> Image.Image:
+    pix = page.get_pixmap(matrix=fitz.Matrix(1, 1), alpha=False)
+    return Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+
+
+def _mean_channel_delta(left: tuple[int, int, int], right: tuple[int, int, int]) -> float:
+    return sum(abs(a - b) for a, b in zip(left, right)) / 3.0
+
+
+def test_studio_visible_rotated_ocr_rebuild_preserves_background_orientation(tmp_path: Path) -> None:
+    """A visible raster must not be inserted into a still-rotated page twice."""
+    source = tmp_path / "asymmetric-rotated-source.pdf"
+    layout_path = tmp_path / "asymmetric-studio-layout.json"
+    output = tmp_path / "asymmetric-rotated-output.pdf"
+    combined = tmp_path / "asymmetric-rotated-combined.pdf"
+
+    # Distinct, asymmetric corner colours make a 90/180/270-degree error
+    # visible even when text extraction and /Rotate metadata still look valid.
+    image = Image.new("RGB", (300, 500), "white")
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((0, 0, 74, 124), fill="#df3030")
+    draw.rectangle((225, 0, 299, 124), fill="#2f76dd")
+    draw.rectangle((0, 375, 74, 499), fill="#38a64a")
+    draw.rectangle((225, 375, 299, 499), fill="#e4bc2d")
+    draw.text((95, 230), "Before", fill="black")
+    image_bytes = io.BytesIO()
+    image.save(image_bytes, format="PNG")
+    image.close()
+
+    document = fitz.open()
+    page = document.new_page(width=300, height=500)
+    page.insert_image(page.mediabox, stream=image_bytes.getvalue())
+    page.set_rotation(90)
+    # Center mask deliberately avoids the asymmetric corner sentinels.
+    layout = {
+        "schema_version": "ocr_v2_editor_layout.v1",
+        "ocr_v2": True,
+        "success": True,
+        "geometry_space": "studio_visible",
+        "pages": [{
+            "page_num": 1,
+            "width": page.rect.width,
+            "height": page.rect.height,
+            "kind": "scanned",
+            "is_ocr": True,
+            "elements": [{
+                "id": "asymmetric-line",
+                "text": "After",
+                "original_text": "Before",
+                "x": 230,
+                "y": 235,
+                "width": 64,
+                "height": 24,
+                "size": 12,
+                "font": "helv",
+                "bg_color": "#ffffff",
+                "text_color": "#000000",
+            }],
+        }],
+    }
+    document.save(source)
+    document.close()
+    layout_path.write_text(json.dumps(layout), encoding="utf-8")
+
+    compile_document(str(source), str(output), str(layout_path))
+    # The next Studio mutation must consume the editor result without
+    # reintroducing a visible/native coordinate-space mismatch.
+    process_markup_pdf(
+        str(output),
+        str(combined),
+        [{"id": "combined-highlight", "page": 1, "x": 180, "y": 110, "width": 100, "height": 28, "color": "#FFFF00"}],
+        "highlight",
+        mode="manual",
+    )
+
+    with fitz.open(source) as source_doc, fitz.open(combined) as output_doc:
+        source_page = source_doc[0]
+        output_page = output_doc[0]
+        assert output_page.rotation == source_page.rotation == 90
+        assert output_page.mediabox == source_page.mediabox
+        assert output_page.cropbox == source_page.cropbox
+        assert output_page.rect == source_page.rect
+        assert len(output_page.get_drawings()) >= 1, "the combined markup must be retained"
+
+        source_image = _visible_page_rgb(source_page)
+        output_image = _visible_page_rgb(output_page)
+        assert output_image.size == source_image.size == (500, 300)
+
+        # Samples are deliberately outside the edited middle region. JPEG
+        # re-encoding is allowed a small tolerance, rotation is not.
+        for point in ((25, 25), (475, 25), (25, 275), (475, 275)):
+            assert _mean_channel_delta(source_image.getpixel(point), output_image.getpixel(point)) < 12
+
+        source_image.close()
+        output_image.close()
 
 
 def test_studio_visible_rotated_ocr_edit_is_materialized_in_native_pdf(tmp_path: Path) -> None:

@@ -489,6 +489,23 @@ def _studio_native_element_rect(page: fitz.Page, element: dict[str, Any]) -> fit
     return _studio_visible_rect_to_native(page, visible)
 
 
+def _studio_visible_raster_to_native(image: Image.Image, rotation: int) -> Image.Image:
+    """Return a Studio-visible page raster in native PDF page orientation.
+
+    ``Page.get_pixmap`` applies a page's ``/Rotate`` value, so Studio OCR
+    pages are painted in their visible orientation.  A page that retains that
+    ``/Rotate`` value must receive an inverse-rotated raster in its native
+    CropBox; otherwise a viewer applies rotation a second time.
+    """
+    transforms = {
+        90: Image.Transpose.ROTATE_90,
+        180: Image.Transpose.ROTATE_180,
+        270: Image.Transpose.ROTATE_270,
+    }
+    transform = transforms.get(rotation % 360)
+    return image.transpose(transform) if transform is not None else image
+
+
 def is_element_dirty(element: dict[str, Any]) -> bool:
     """Determine whether a layout element has modified text content or style overrides."""
     if not isinstance(element, dict):
@@ -986,14 +1003,32 @@ def compile_document(
                         continue
 
                 img_bytes = io.BytesIO()
-                img.save(img_bytes, format="JPEG", quality=95)
+                # ``get_pixmap`` is a Studio-visible raster for rotated
+                # pages.  Convert it back to native page orientation before
+                # inserting it into a page that retains /Rotate.  The drawn
+                # edit masks above intentionally remain in visible space.
+                native_img = (
+                    _studio_visible_raster_to_native(img, page.rotation)
+                    if studio_visible_geometry
+                    else img
+                )
+                native_img.save(img_bytes, format="JPEG", quality=95)
+                if native_img is not img:
+                    native_img.close()
+                img.close()
 
                 for item in page.get_images():
                     with suppress(Exception):
                         doc.delete_xref(item[0])
 
                 page.clean_contents()
-                page.insert_image(page.rect, stream=img_bytes.getvalue())
+                # CropBox is expressed in native PDF coordinates.  It is the
+                # matching insertion rectangle for the native raster above;
+                # ``page.rect`` is visible-space on a rotated page.
+                page.insert_image(
+                    page.cropbox if studio_visible_geometry else page.rect,
+                    stream=img_bytes.getvalue(),
+                )
 
                 # Render replacement text and formatting overlays for dirty elements on OCR/scanned page
                 for element in dirty_elements:
