@@ -21,6 +21,7 @@ from app.core.ocr_v2.errors import (
     TextNotFoundError,
     WordGeometryUnavailableError,
 )
+from app.core.studio_markup_telemetry import StudioMarkupProcessingTelemetry
 
 
 STUDIO_MARKUP_REGION_OCR_ENGINE_ENV = "STUDIO_MARKUP_REGION_OCR_ENGINE"
@@ -241,6 +242,17 @@ def _sdk_execute(
     regions = _sdk_regions(boxes, markup_region, rect)
     processor = _sdk_processor()
     selected_mode = markup_mode(mode)
+    telemetry = (
+        StudioMarkupProcessingTelemetry(mode=mode, region_count=len(boxes))
+        if mode != "manual"
+        else None
+    )
+
+    def on_page(done: int, total: int, page: Any) -> None:
+        if telemetry is not None:
+            telemetry.observe_page(page)
+        if progress_callback:
+            progress_callback(done, total)
 
     try:
         execution = processor.apply_markup_regions(
@@ -253,11 +265,7 @@ def _sdk_execute(
             language="eng",
             routing_policy="FAST",
             cancellation_check=cancellation_check,
-            page_progress_callback=(
-                (lambda done, total, _page: progress_callback(done, total))
-                if progress_callback and mode != "manual"
-                else None
-            ),
+            page_progress_callback=on_page if telemetry is not None else None,
             progress_callback=progress_callback if mode == "manual" else None,
         )
     except Exception as exc:
@@ -265,7 +273,25 @@ def _sdk_execute(
         raise
     projected = _project_sdk_result(execution)
     _preserve_empty_selection_contract(execution, projected, mode)
+    if telemetry is not None:
+        # The public SDK delivers PageResult callbacks for extraction. The
+        # page-source fallback keeps this adapter observable for compatible
+        # SDK implementations that return the result but omit callbacks.
+        if not telemetry.processed_page_indexes:
+            for page_source in getattr(execution, "page_sources", ()):
+                telemetry.observe_page_source(page_source)
+        projected["_processing_telemetry"] = telemetry.summary(
+            source_page_count=execution.page_count,
+            selected_page_indexes=list(telemetry.processed_page_indexes),
+        )
     return projected
+
+
+def _attach_processing_engine(result: dict[str, Any], engine: str) -> dict[str, Any]:
+    telemetry = result.get("_processing_telemetry")
+    if isinstance(telemetry, dict):
+        result["_processing_telemetry"] = {**telemetry, "engine": engine}
+    return result
 
 
 def execute_studio_markup_region_ocr(
@@ -285,24 +311,30 @@ def execute_studio_markup_region_ocr(
     normalized_mode = _normalized_mode(mode)
     logger.info("OCR_V2_STUDIO_MARKUP_REGION_ENGINE route=studio_ocr_v2 engine=%s", selected)
     if selected == "internal":
-        return _internal_execute(
+        return _attach_processing_engine(
+            _internal_execute(
+                input_path,
+                output_path,
+                boxes,
+                normalized_action,
+                normalized_mode,
+                password,
+                progress_callback,
+            ),
+            selected,
+        )
+    return _attach_processing_engine(
+        _sdk_execute(
             input_path,
             output_path,
             boxes,
             normalized_action,
             normalized_mode,
             password,
+            cancellation_check,
             progress_callback,
-        )
-    return _sdk_execute(
-        input_path,
-        output_path,
-        boxes,
-        normalized_action,
-        normalized_mode,
-        password,
-        cancellation_check,
-        progress_callback,
+        ),
+        selected,
     )
 
 

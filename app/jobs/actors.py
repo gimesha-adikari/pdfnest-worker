@@ -60,6 +60,7 @@ from app.core.studio_markup_region_ocr_engine import (
     StudioMarkupRegionOcrEngineConfigurationError,
     execute_studio_markup_region_ocr,
 )
+from app.core.studio_markup_telemetry import emit_studio_markup_processing_summary
 from app.core.legacy_editor_ocr_engine import (
     LEGACY_EDITOR_CONSUMER,
     LegacyEditorOcrEngineConfigurationError,
@@ -1111,6 +1112,8 @@ def _run_markup_job(
         boxes = payload.get("boxes", []) or []
         mode = payload.get("mode", "smart")
         file_password = payload.get("file_password")
+        studio_processing_summary: dict[str, object] | None = None
+        studio_processing_engine = "unknown"
 
         def on_progress(done: int, total: int) -> None:
             check_cancellation(job_id)
@@ -1134,7 +1137,7 @@ def _run_markup_job(
                 progress_callback=on_progress,
             )
         elif route == "studio_ocr_v2":
-            execute_studio_markup_region_ocr(
+            studio_result = execute_studio_markup_region_ocr(
                 input_path=input_path,
                 output_path=output_pdf_path,
                 boxes=boxes,
@@ -1144,6 +1147,10 @@ def _run_markup_job(
                 cancellation_check=lambda: check_cancellation(job_id),
                 progress_callback=on_progress,
             )
+            processing_summary = studio_result.get("_processing_telemetry")
+            if isinstance(processing_summary, dict):
+                studio_processing_summary = dict(processing_summary)
+                studio_processing_engine = str(studio_processing_summary.pop("engine", "unknown"))
         else:
             process_markup_pdf(
                 input_path=input_path,
@@ -1158,6 +1165,15 @@ def _run_markup_job(
 
         output_key = build_key(f"jobs/markup/{action}/output", suffix=".pdf")
         upload_path(output_pdf_path, output_key, content_type="application/pdf")
+
+        if studio_processing_summary is not None:
+            emit_studio_markup_processing_summary(
+                job_id=job_id,
+                action=action,
+                mode=str(mode).strip().lower(),
+                engine=studio_processing_engine,
+                summary=studio_processing_summary,
+            )
 
         download_name = f"{action}_{Path(source_name or 'document.pdf').stem}.pdf"
 

@@ -11,6 +11,7 @@ from app.core.ocr_v2.errors import TextNotFoundError
 from app.core.ocr_v2.markup import MarkupAction as OCRV2MarkupAction, MarkupMode as OCRV2MarkupMode, _annotate, select_regions
 from app.core.ocr_v2.routing import RoutePolicy
 from app.core.ocr_v2.validation import OCRProfile
+from app.core.studio_markup_telemetry import StudioMarkupProcessingTelemetry
 from .utils import native_words_for_page, native_words_in_rect, normalize_hex, open_document
 
 
@@ -383,13 +384,26 @@ def process_markup_pdf_v2_regions(
         route_policy=RoutePolicy(preferred_engine="tesseract_v2", fallback_engine="tesseract_v2"),
         max_raster_pixels=25_000_000,
     )
+
+    telemetry = StudioMarkupProcessingTelemetry(
+        mode=mode.strip().lower(),
+        region_count=len(boxes),
+    )
+
+    def on_page(done: int, total: int, page: Any) -> None:
+        # OCRV2Worker invokes this only after the page context has been
+        # constructed and normalized, so these counters measure actual work.
+        telemetry.observe_page(page)
+        if progress_callback:
+            progress_callback(done, total)
+
     result = worker.process_document(
         input_path,
         password=password,
         language="eng",
         profile=OCRProfile.OCR_TEXT_V2,
         page_indices=affected_page_indices,
-        page_progress_callback=lambda done, total, _page: progress_callback(done, total) if progress_callback else None,
+        page_progress_callback=on_page,
     )
     selected = _select_studio_regions_with_boxes(result, boxes, OCRV2MarkupMode(mode.strip().lower()))
     with fitz.open(input_path) as document:
@@ -409,4 +423,8 @@ def process_markup_pdf_v2_regions(
         "affected_page_count": len(affected_page_indices),
         "processed_page_count": len(affected_page_indices),
         "selections": selection_payloads,
+        "_processing_telemetry": telemetry.summary(
+            source_page_count=result.source.page_count,
+            selected_page_indexes=[page.page_index for page in result.pages],
+        ),
     }
