@@ -223,6 +223,7 @@ def test_studio_sdk_projection_leaves_ocr_geometry_visible() -> None:
     )
 
     projected = project_studio_editor_result(result)
+    assert projected["geometry_space"] == "studio_visible"
     projected_word = projected["pages"][0]["elements"][0]["word_geometry"][0]
     assert (projected_word["x"], projected_word["y"], projected_word["width"], projected_word["height"]) == (
         12.0,

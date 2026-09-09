@@ -469,6 +469,26 @@ def extract_document_v2(
     return projected
 
 
+STUDIO_VISIBLE_GEOMETRY_SPACE = "studio_visible"
+
+
+def _studio_visible_rect_to_native(page: fitz.Page, rect: fitz.Rect) -> fitz.Rect:
+    """Map Studio's visible CropBox-relative rectangle into native PDF space."""
+    native = fitz.Rect(rect) * page.derotation_matrix
+    native.normalize()
+    return native
+
+
+def _studio_native_element_rect(page: fitz.Page, element: dict[str, Any]) -> fitz.Rect:
+    visible = fitz.Rect(
+        float(element.get("x", 0)),
+        float(element.get("y", 0)),
+        float(element.get("x", 0)) + float(element.get("width", 0)),
+        float(element.get("y", 0)) + float(element.get("height", 0)),
+    )
+    return _studio_visible_rect_to_native(page, visible)
+
+
 def is_element_dirty(element: dict[str, Any]) -> bool:
     """Determine whether a layout element has modified text content or style overrides."""
     if not isinstance(element, dict):
@@ -923,16 +943,27 @@ def compile_document(
             page = doc[page_idx]
             elements = page_data.get("elements", []) or []
             is_ocr_page = page_data.get("is_ocr", False) or page_data.get("kind") == "scanned"
+            studio_visible_geometry = layout_data.get("geometry_space") == STUDIO_VISIBLE_GEOMETRY_SPACE
 
             if is_ocr_page:
+                dirty_elements = [element for element in elements if is_element_dirty(element)]
+
+                # Studio OCR coordinates are relative to the visibly rotated
+                # CropBox.  OCR/mixed PDFs can also retain an older selectable
+                # text layer, so remove only the edited native regions before
+                # rebuilding the page image. General Editor layouts omit the
+                # marker and retain their existing canonical-PDF behavior.
+                if studio_visible_geometry and dirty_elements:
+                    for element in dirty_elements:
+                        page.add_redact_annot(_studio_native_element_rect(page, element), fill=None)
+                    page.apply_redactions()
+
                 zoom = 2.0
                 pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
                 img = pixmap_to_image(pix)
                 draw = ImageDraw.Draw(img)
 
-                for element in elements:
-                    if not is_element_dirty(element):
-                        continue
+                for element in dirty_elements:
 
                     try:
                         w = float(element.get("width", 0))
@@ -965,9 +996,7 @@ def compile_document(
                 page.insert_image(page.rect, stream=img_bytes.getvalue())
 
                 # Render replacement text and formatting overlays for dirty elements on OCR/scanned page
-                for element in elements:
-                    if not is_element_dirty(element):
-                        continue
+                for element in dirty_elements:
 
                     repl_text = element.get("text", "")
                     if not repl_text:
@@ -978,18 +1007,33 @@ def compile_document(
                     elem_w = float(element.get("width", 0))
                     elem_h = float(element.get("height", 0))
 
+                    if studio_visible_geometry:
+                        native_rect = _studio_native_element_rect(page, element)
+                        target_bbox = [native_rect.x0, native_rect.y0, native_rect.x1, native_rect.y1]
+                        baseline_y = native_rect.y1
+                    else:
+                        native_rect = None
+                        target_bbox = [elem_x, elem_y, elem_x + elem_w, elem_y + elem_h]
+                        baseline_y = elem_y + elem_h * 0.85
+
                     target = {
                         "operation": "replace",
                         "original_substring": element.get("original_text", ""),
                         "replacement_substring": repl_text,
-                        "target_bbox": [elem_x, elem_y, elem_x + elem_w, elem_y + elem_h],
-                        "baseline_y": elem_y + elem_h * 0.85,
+                        "target_bbox": target_bbox,
+                        "baseline_y": baseline_y,
                         "font_info": {
                             "name": element.get("font", "helv"),
                             "size": element.get("size", 10.0),
                             "color": element.get("text_color", "#000000"),
                         },
                     }
+                    if native_rect is not None:
+                        # OCR line boxes may be tall in Studio visible space
+                        # for quarter-turned pages. Keep a longer replacement
+                        # inside the line's native column without changing the
+                        # General Editor renderer's default fitting behavior.
+                        target["max_width"] = native_rect.width
 
                     render_surgical_replacement(page, target, element=element, skip_redaction=True)
 
@@ -1000,19 +1044,41 @@ def compile_document(
                     if not is_element_dirty(element):
                         continue
 
-                    targets = resolve_surgical_targets(page, element)
+                    compile_element = element
+                    native_rect = None
+                    if studio_visible_geometry:
+                        native_rect = _studio_native_element_rect(page, element)
+                        compile_element = dict(element)
+                        compile_element.update({
+                            "x": native_rect.x0,
+                            "y": native_rect.y0,
+                            "width": native_rect.width,
+                            "height": native_rect.height,
+                        })
+
+                    targets = resolve_surgical_targets(page, compile_element)
                     if not targets:
-                        targets = [{
-                            "operation": "replace",
-                            "original_substring": element.get("original_text", ""),
-                            "replacement_substring": element.get("text", ""),
-                            "target_bbox": [
+                        fallback_bbox = (
+                            [native_rect.x0, native_rect.y0, native_rect.x1, native_rect.y1]
+                            if native_rect is not None
+                            else [
                                 float(element.get("x", 0)),
                                 float(element.get("y", 0)),
                                 float(element.get("x", 0)) + float(element.get("width", 0)),
                                 float(element.get("y", 0)) + float(element.get("height", 0)),
-                            ],
-                            "baseline_y": float(element.get("y", 0)) + float(element.get("height", 0)) * 0.85,
+                            ]
+                        )
+                        fallback_baseline = (
+                            native_rect.y1
+                            if native_rect is not None
+                            else float(element.get("y", 0)) + float(element.get("height", 0)) * 0.85
+                        )
+                        targets = [{
+                            "operation": "replace",
+                            "original_substring": element.get("original_text", ""),
+                            "replacement_substring": element.get("text", ""),
+                            "target_bbox": fallback_bbox,
+                            "baseline_y": fallback_baseline,
                             "font_info": {
                                 "name": element.get("font", "helv"),
                                 "size": element.get("size", 10.0),
@@ -1021,7 +1087,10 @@ def compile_document(
                         }]
 
                     for target in targets:
-                        page_targets.append((target, element))
+                        if studio_visible_geometry and target.get("target_bbox"):
+                            bbox = target["target_bbox"]
+                            target["max_width"] = float(bbox[2]) - float(bbox[0])
+                        page_targets.append((target, compile_element))
 
                 # Step 1: Add all redaction annotations on page
                 has_redactions = False
@@ -1158,6 +1227,16 @@ def render_surgical_replacement(
     color_rgb = hex_to_rgb(style["color"])
     replacement_text = str(target.get("replacement_substring", ""))
 
+    max_width = None
+    try:
+        raw_max_width = target.get("max_width")
+        if raw_max_width is not None:
+            max_width = float(raw_max_width)
+            if max_width <= 0:
+                max_width = None
+    except (TypeError, ValueError):
+        max_width = None
+
     orig_width = 0.0
     if target_bbox and len(target_bbox) >= 4:
         orig_width = float(target_bbox[2] - target_bbox[0])
@@ -1202,6 +1281,8 @@ def render_surgical_replacement(
         available_width = max(orig_width, float(page.rect.width) - ins_x - 20.0)
     else:
         available_width = max(orig_width, 100.0)
+    if max_width is not None:
+        available_width = min(available_width, max_width)
 
     if replacement_text and op in ("replace", "insert"):
         unscaled_width = fitz.get_text_length(replacement_text, fontname=font_code, fontsize=font_size)
@@ -1217,6 +1298,13 @@ def render_surgical_replacement(
                 font_size = font_size * scale_ratio
                 font_scaled = True
                 warnings.append(f"Font size adjusted to {font_size:.1f}pt to prevent collision.")
+
+        fitted_width = fitz.get_text_length(replacement_text, fontname=font_code, fontsize=font_size)
+        if max_width is not None and fitted_width > max_width:
+            scale_ratio = max_width / fitted_width
+            font_size = font_size * scale_ratio
+            font_scaled = True
+            warnings.append(f"Font size adjusted to {font_size:.1f}pt to fit the edited Studio text region.")
 
         insert_pt = fitz.Point(ins_x, baseline_y)
         if font_file:

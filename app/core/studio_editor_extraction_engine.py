@@ -59,7 +59,7 @@ def _internal_execute(
 ) -> Any:
     from app.api.tools.editor.document import extract_document_v2
 
-    return extract_document_v2(
+    projected = extract_document_v2(
         str(input_path),
         password,
         cancellation_check=cancellation_check,
@@ -67,6 +67,8 @@ def _internal_execute(
         language_mode=language_mode,
         languages=languages,
     )
+    projected["geometry_space"] = "studio_visible"
+    return projected
 
 
 def _sdk_processor() -> Any:

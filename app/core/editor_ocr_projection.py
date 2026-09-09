@@ -207,6 +207,7 @@ def project_studio_editor_result(result: Any) -> dict[str, Any]:
     """
 
     projected = project_editor_result(result)
+    projected["geometry_space"] = "studio_visible"
     for page_result, page in zip(result.pages, projected["pages"]):
         source = str(_value(getattr(page_result, "processing_source", None)))
         if source != "NATIVE_EXTRACTION":

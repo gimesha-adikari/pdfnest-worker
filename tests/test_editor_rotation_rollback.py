@@ -172,3 +172,5 @@ def test_studio_internal_keeps_legacy_visible_geometry(
     _assert_word_material(_word_material(studio_layout["pages"][0]), legacy_visible_words)
     _assert_word_material(_word_material(general_layout["pages"][0]), _word_material(sdk_layout["pages"][0]))
     assert _word_material(studio_layout["pages"][0]) != _word_material(general_layout["pages"][0])
+    assert studio_layout["geometry_space"] == "studio_visible"
+    assert "geometry_space" not in general_layout
