@@ -299,7 +299,12 @@ def test_internal_manual_same_page_regions_keep_their_own_colors(
 
     result = _run(monkeypatch, "internal", source, output, action=action, mode="manual", boxes=boxes)
 
-    assert result == {"source_policy": "MANUAL_RECTANGLE", "selection_count": 0}
+    assert result == {
+        "source_policy": "MANUAL_RECTANGLE",
+        "selection_count": 0,
+        "affected_page_count": 1,
+        "processed_page_count": 0,
+    }
     assert _drawing_colors(output) == pytest.approx([(1, 0, 0), (0, 0, 1)], abs=0.001)
 
 

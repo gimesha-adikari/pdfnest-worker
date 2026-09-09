@@ -33,6 +33,18 @@ ProgressCallback = Callable[[int, int], None]
 logger = logging.getLogger(__name__)
 
 
+def _affected_page_indices(boxes: list[dict[str, Any]]) -> tuple[int, ...]:
+    pages: set[int] = set()
+    for box in boxes:
+        try:
+            page = int(box.get("page", 0))
+        except (TypeError, ValueError):
+            continue
+        if page > 0:
+            pages.add(page - 1)
+    return tuple(sorted(pages))
+
+
 class LegacyMarkupOcrEngineConfigurationError(ValueError):
     """The legacy markup OCR engine selector is unsupported."""
 
@@ -220,6 +232,7 @@ def _sdk_execute(
 
     try:
         processor = _sdk_processor()
+        affected_page_indices = _affected_page_indices(boxes)
         result = processor.extract_text(
             input_path,
             password=password,
@@ -227,6 +240,7 @@ def _sdk_execute(
             profile=_sdk_profile(),
             routing_policy="FORCE_OCR" if normalized_mode == "ocr" else "FAST",
             cancellation_check=cancellation_check,
+            page_indices=affected_page_indices,
         )
     except JobCancelledException:
         raise

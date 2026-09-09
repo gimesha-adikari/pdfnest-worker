@@ -162,7 +162,7 @@ def test_combined_selector_matrix_runs_both_boundaries_in_one_process(
         selection_material = _selection_material(markup)
         annotations = _annotations(output)
         assert editor_progress == [(1, 2, 0), (2, 2, 1)]
-        assert markup_progress == [(1, 2), (2, 2)]
+        assert markup_progress == [(1, 1)]
         assert [annotation["type"] for annotation in annotations] == ["Highlight", "Highlight"]
         assert [annotation["color"] for annotation in annotations] == pytest.approx(
             [(1, 0, 0), (0, 0, 1)],

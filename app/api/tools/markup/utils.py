@@ -26,13 +26,17 @@ def open_document(input_path: str, password: Optional[str] = None) -> fitz.Docum
     return doc
 
 
-def native_words_in_rect(page: fitz.Page, selection_rect: fitz.Rect) -> list[dict]:
+def native_words_for_page(page: fitz.Page) -> list[dict]:
     words: list[dict] = []
     for item in page.get_text("words"):
         if len(item) < 5:
             continue
         rect = fitz.Rect(item[0], item[1], item[2], item[3])
         text = str(item[4]).strip()
-        if text and rect.intersects(selection_rect):
+        if text:
             words.append({"rect": rect, "text": text})
     return words
+
+
+def native_words_in_rect(page: fitz.Page, selection_rect: fitz.Rect) -> list[dict]:
+    return [item for item in native_words_for_page(page) if item["rect"].intersects(selection_rect)]

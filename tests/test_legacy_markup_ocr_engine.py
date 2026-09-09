@@ -70,6 +70,7 @@ def test_sdk_legacy_markup_extracts_once_and_reuses_public_tokens(
     assert calls["password"] is None
     assert calls["language"] == "eng"
     assert calls["routing_policy"] == "FORCE_OCR"
+    assert calls["page_indices"] == (0,)
     assert calls["markup"]["action"] == "highlight"  # type: ignore[index]
     words = calls["markup"]["ocr_word_items_by_page"][0]  # type: ignore[index]
     assert len(words) == 1

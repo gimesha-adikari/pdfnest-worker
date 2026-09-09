@@ -92,7 +92,14 @@ class OCRV2Worker:
         cancellation_check: CancellationCheck | None = None,
         page_timeout_seconds: float | None = None,
         page_progress_callback: PageProgressCallback | None = None,
+        page_indices: Sequence[int] | None = None,
     ) -> DocumentResult:
+        """Process the complete document or an explicit page subset.
+
+        A subset result keeps the source document's original page indexes and
+        page count. Page-scoped consumers use it as canonical context while
+        the PDF writer continues to preserve the complete input document.
+        """
         policy = OCRLanguagePolicy.from_request(language, mode=language_mode, languages=languages)
         tess_adapter = self.adapters.get("tesseract_v2")
         if isinstance(tess_adapter, TesseractAdapter) and policy.mode is OCRLanguageMode.EXPLICIT and tess_adapter.languages != policy.engine_expression:
@@ -105,12 +112,20 @@ class OCRV2Worker:
         source_path = Path(pdf_path)
         pages: list[PageResult] = []
         provenance: list[Provenance] = []
+        requested_page_indices = None if page_indices is None else tuple(dict.fromkeys(page_indices))
+        if requested_page_indices is not None and any(index < 0 for index in requested_page_indices):
+            raise ValueError("page_indices must contain non-negative zero-based page indexes")
         with fitz.open(str(source_path)) as document:
             if document.needs_pass:
                 if not password or document.authenticate(password) <= 0:
                     raise ValueError("PDF password authentication failed")
             source = SourceMetadata(source_id=str(source_path.resolve()), page_count=len(document), filename=source_path.name)
-            for page_index, page in enumerate(document):
+            if requested_page_indices is None:
+                selected_page_indices = tuple(range(len(document)))
+            else:
+                selected_page_indices = tuple(index for index in requested_page_indices if index < len(document))
+            for page_index in selected_page_indices:
+                page = document[page_index]
                 _check(cancellation_check)
                 started = time.monotonic()
                 page_id = f"page-{page_index}"
@@ -216,10 +231,10 @@ class OCRV2Worker:
                     page_result = PageResult(page_index=page_index, page_id=page_id, geometry=page_geometry_from_pdf(page), content_classification=decision.classification if decision is not None else PageContentClassification.UNKNOWN, processing_source=PageProcessingSource.NONE, status=PageStatus.FAILED, text="", failure_code=type(exc).__name__, failure_message=str(exc))
                     pages.append(page_result)
                 if page_progress_callback is not None:
-                    page_progress_callback(len(pages), len(document), page_result)
+                    page_progress_callback(len(pages), len(selected_page_indices), page_result)
         capabilities = frozenset(capability for page in pages for capability in page.capabilities)
         result = DocumentResult(schema_version="ocr_v2.1", result_id=str(uuid.uuid4()), source=source, pages=tuple(pages), capabilities=capabilities, provenance=tuple({item.producer_id: item for item in provenance}.values()))
-        return validate_document(result, profile)
+        return validate_document(result, profile) if requested_page_indices is None else result
 
 
 def validate_document_placeholder(page: PageResult, profile: OCRProfile):

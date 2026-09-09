@@ -208,6 +208,7 @@ def _project_sdk_result(execution: Any) -> dict[str, Any]:
         "page_count": execution.page_count,
         "document_result_reused": execution.document_result_reused,
         "extraction_performed": execution.extraction_performed,
+        "affected_pages": list(getattr(execution, "affected_pages", ())),
     }
 
 

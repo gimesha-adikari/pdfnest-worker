@@ -11,11 +11,23 @@ from app.core.ocr_v2.errors import TextNotFoundError
 from app.core.ocr_v2.markup import MarkupAction as OCRV2MarkupAction, MarkupMode as OCRV2MarkupMode, _annotate, select_regions
 from app.core.ocr_v2.routing import RoutePolicy
 from app.core.ocr_v2.validation import OCRProfile
-from .utils import native_words_in_rect, normalize_hex, open_document
+from .utils import native_words_for_page, native_words_in_rect, normalize_hex, open_document
 
 
 MarkupAction = Literal["highlight", "underline", "strikeout"]
 MarkupMode = Literal["manual", "smart", "text", "ocr"]
+
+
+def _affected_page_indices(boxes: list[dict]) -> tuple[int, ...]:
+    pages: set[int] = set()
+    for box in boxes:
+        try:
+            page = int(box.get("page", 0))
+        except (TypeError, ValueError):
+            continue
+        if page > 0:
+            pages.add(page - 1)
+    return tuple(sorted(pages))
 
 
 def _draw_highlight_rect(
@@ -99,11 +111,14 @@ def _selection_word_items(
         selection_rect: fitz.Rect,
         mode: MarkupMode,
         ocr_word_items: list[dict[str, Any]] | None = None,
+        native_word_items: list[dict[str, Any]] | None = None,
 ) -> list[dict]:
     mode = (mode or "smart").strip().lower()
 
     if mode == "text":
-        return native_words_in_rect(page, selection_rect)
+        if native_word_items is None:
+            return native_words_in_rect(page, selection_rect)
+        return [item for item in native_word_items if item["rect"].intersects(selection_rect)]
 
     if mode == "ocr":
         if ocr_word_items is not None:
@@ -119,7 +134,11 @@ def _selection_word_items(
         ]
 
     if mode == "smart":
-        native = native_words_in_rect(page, selection_rect)
+        native = (
+            native_words_in_rect(page, selection_rect)
+            if native_word_items is None
+            else [item for item in native_word_items if item["rect"].intersects(selection_rect)]
+        )
         if native:
             return native
 
@@ -149,6 +168,8 @@ def apply_markup(
 ) -> None:
     total = max(1, len(boxes))
     mode = (mode or "smart").strip().lower()
+    native_words_by_page: dict[int, list[dict[str, Any]]] = {}
+    cached_ocr_words_by_page: dict[int, list[dict[str, Any]]] = {}
 
     for index, box in enumerate(boxes, start=1):
         page_num = int(box.get("page", 0))
@@ -175,6 +196,23 @@ def apply_markup(
         derotation = page.derotation_matrix if (page_rotation and not canonical_boxes) else None
         if page_rotation:
             page.set_rotation(0)
+        native_word_items = None
+        ocr_word_items = None
+        if mode not in {"manual", "ocr"}:
+            page_index = page_num - 1
+            if page_index not in native_words_by_page:
+                native_words_by_page[page_index] = native_words_for_page(page)
+            native_word_items = native_words_by_page[page_index]
+        if mode == "smart" and native_word_items:
+            ocr_word_items = None
+        elif mode in {"smart", "ocr"}:
+            page_index = page_num - 1
+            if ocr_word_items_by_page is not None:
+                ocr_word_items = ocr_word_items_by_page.get(page_index, [])
+            elif page_index not in cached_ocr_words_by_page:
+                cached_ocr_words_by_page[page_index] = ocr_words_for_page(page)[0]
+            if ocr_word_items_by_page is None:
+                ocr_word_items = cached_ocr_words_by_page[page_index]
         selection_rect = fitz.Rect(x, y, x + width, y + height)
         if derotation is not None:
             selection_rect *= derotation
@@ -188,11 +226,8 @@ def apply_markup(
                     page,
                     selection_rect,
                     mode,
-                    ocr_word_items=(
-                        ocr_word_items_by_page.get(page_num - 1, [])
-                        if ocr_word_items_by_page is not None
-                        else None
-                    ),
+                    ocr_word_items=ocr_word_items,
+                    native_word_items=native_word_items,
                 )
                 if selected:
                     _highlight_words(page, selected, color)
@@ -207,11 +242,8 @@ def apply_markup(
                     page,
                     selection_rect,
                     mode,
-                    ocr_word_items=(
-                        ocr_word_items_by_page.get(page_num - 1, [])
-                        if ocr_word_items_by_page is not None
-                        else None
-                    ),
+                    ocr_word_items=ocr_word_items,
+                    native_word_items=native_word_items,
                 )
                 if selected:
                     _strike_words(page, selected, color)
@@ -226,11 +258,8 @@ def apply_markup(
                     page,
                     selection_rect,
                     mode,
-                    ocr_word_items=(
-                        ocr_word_items_by_page.get(page_num - 1, [])
-                        if ocr_word_items_by_page is not None
-                        else None
-                    ),
+                    ocr_word_items=ocr_word_items,
+                    native_word_items=native_word_items,
                 )
                 if selected:
                     _underline_words(page, selected, color)
@@ -330,18 +359,8 @@ def process_markup_pdf_v2_regions(
     canonical words once and passes the typed selections to the same
     annotation writer used by the Phase 7 V2 markup product.
     """
-    worker = OCRV2Worker(
-        route_policy=RoutePolicy(preferred_engine="tesseract_v2", fallback_engine="tesseract_v2"),
-        max_raster_pixels=25_000_000,
-    )
-    result = worker.process_document(
-        input_path,
-        password=password,
-        language="eng",
-        profile=OCRProfile.OCR_TEXT_V2,
-        page_progress_callback=lambda done, total, _page: progress_callback(done, total) if progress_callback else None,
-    )
     if mode.strip().lower() == "manual":
+        affected_page_count = len(_affected_page_indices(boxes))
         process_markup_pdf(
             input_path,
             output_path,
@@ -352,7 +371,26 @@ def process_markup_pdf_v2_regions(
             progress_callback=progress_callback,
             canonical_boxes=False,
         )
-        return {"source_policy": "MANUAL_RECTANGLE", "selection_count": 0}
+        return {
+            "source_policy": "MANUAL_RECTANGLE",
+            "selection_count": 0,
+            "affected_page_count": affected_page_count,
+            "processed_page_count": 0,
+        }
+
+    affected_page_indices = _affected_page_indices(boxes)
+    worker = OCRV2Worker(
+        route_policy=RoutePolicy(preferred_engine="tesseract_v2", fallback_engine="tesseract_v2"),
+        max_raster_pixels=25_000_000,
+    )
+    result = worker.process_document(
+        input_path,
+        password=password,
+        language="eng",
+        profile=OCRProfile.OCR_TEXT_V2,
+        page_indices=affected_page_indices,
+        page_progress_callback=lambda done, total, _page: progress_callback(done, total) if progress_callback else None,
+    )
     selected = _select_studio_regions_with_boxes(result, boxes, OCRV2MarkupMode(mode.strip().lower()))
     with fitz.open(input_path) as document:
         for box, selection in selected:
@@ -365,4 +403,10 @@ def process_markup_pdf_v2_regions(
         payload["region_id"] = box.get("id")
         payload["color"] = list(normalize_hex(box.get("color", "#FFFF00")))
         selection_payloads.append(payload)
-    return {"source_policy": "OCR_V2_CANONICAL_WORDS", "selection_count": len(selected), "selections": selection_payloads}
+    return {
+        "source_policy": "OCR_V2_CANONICAL_WORDS",
+        "selection_count": len(selected),
+        "affected_page_count": len(affected_page_indices),
+        "processed_page_count": len(affected_page_indices),
+        "selections": selection_payloads,
+    }

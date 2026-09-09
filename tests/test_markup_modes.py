@@ -70,6 +70,32 @@ def test_precomputed_ocr_words_avoid_a_second_legacy_ocr_pass(monkeypatch):
     source.close()
 
 
+def test_apply_markup_reuses_native_page_context_for_same_page_regions(monkeypatch):
+    source = fitz.open()
+    source.new_page(width=300, height=300)
+    words = [{"rect": fitz.Rect(10, 10, 80, 30), "text": "cached"}]
+    calls = 0
+
+    def native_words_for_page(_page):
+        nonlocal calls
+        calls += 1
+        return words
+
+    monkeypatch.setattr(document, "native_words_for_page", native_words_for_page)
+    document.apply_markup(
+        source,
+        [
+            {"x": 0, "y": 0, "width": 120, "height": 60, "page": 1, "color": "#800080"},
+            {"x": 5, "y": 5, "width": 120, "height": 60, "page": 1, "color": "#800080"},
+        ],
+        action="underline",
+        mode="smart",
+    )
+
+    assert calls == 1
+    source.close()
+
+
 def test_no_text_selection_completes_without_processor_error():
     source = fitz.open()
     source.new_page(width=300, height=300)
@@ -81,3 +107,30 @@ def test_no_text_selection_completes_without_processor_error():
     )
     assert source.page_count == 1
     source.close()
+
+
+def test_studio_v2_manual_regions_skip_shared_ocr_worker(monkeypatch, tmp_path):
+    source = fitz.open()
+    page = source.new_page(width=300, height=300)
+    page.insert_text((10, 30), "Manual only")
+    output_path = str(tmp_path / "manual-region-output.pdf")
+
+    class UnexpectedWorker:
+        def __init__(self, *_args, **_kwargs):
+            raise AssertionError("manual Studio regions must not construct the OCR worker")
+
+    monkeypatch.setattr(document, "OCRV2Worker", UnexpectedWorker)
+    source_path = str(tmp_path / "manual-region-source.pdf")
+    source.save(source_path)
+    source.close()
+
+    result = document.process_markup_pdf_v2_regions(
+        source_path,
+        output_path,
+        [{"page": 1, "x": 10, "y": 10, "width": 80, "height": 20}],
+        action="highlight",
+        mode="manual",
+    )
+    assert result["source_policy"] == "MANUAL_RECTANGLE"
+    assert result["processed_page_count"] == 0
+    assert result["affected_page_count"] == 1

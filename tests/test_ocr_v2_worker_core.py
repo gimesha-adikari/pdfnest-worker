@@ -147,6 +147,27 @@ def test_worker_emits_durable_page_checkpoints_in_source_order(tmp_path: Path) -
     assert checkpoints == [(1, 2, 0, "SUCCESS"), (2, 2, 1, "SUCCESS")]
 
 
+def test_worker_page_scope_preserves_source_indexes_and_page_count(tmp_path: Path) -> None:
+    path = tmp_path / "three-pages.pdf"
+    document = fitz.open()
+    for label in ("Page one", "Page two", "Page three"):
+        document.new_page(width=300, height=200).insert_text((40, 80), label)
+    document.save(str(path))
+    document.close()
+
+    checkpoints: list[tuple[int, int, int]] = []
+    result = OCRV2Worker().process_document(
+        path,
+        language="eng",
+        page_indices=(2,),
+        page_progress_callback=lambda done, total, page: checkpoints.append((done, total, page.page_index)),
+    )
+
+    assert result.source.page_count == 3
+    assert [page.page_index for page in result.pages] == [2]
+    assert checkpoints == [(1, 1, 2)]
+
+
 def test_worker_ocr_and_searchable_renderer_use_canonical_words(tmp_path: Path) -> None:
     source = tmp_path / "scan.pdf"
     output = tmp_path / "searchable.pdf"

@@ -241,9 +241,11 @@ def select_regions(
             height = float(box.get("height", 0))
         except (TypeError, ValueError):
             continue
-        if page_index < 0 or page_index >= len(result.pages) or width <= 0 or height <= 0:
+        if page_index < 0 or width <= 0 or height <= 0:
             continue
-        page = result.pages[page_index]
+        page = next((candidate for candidate in result.pages if candidate.page_index == page_index), None)
+        if page is None:
+            continue
         words = _canonical_words(page, mode)
         if not words:
             if page.text.strip() and "WORD_GEOMETRY" not in page.capabilities:
