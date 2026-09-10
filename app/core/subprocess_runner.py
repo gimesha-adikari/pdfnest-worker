@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import logging
+import locale
 import os
+import selectors
 import signal
 import subprocess
 import time
@@ -24,8 +26,8 @@ def kill_process_group(pgid: int, term_grace_seconds: float = 1.0) -> None:
     except (ProcessLookupError, PermissionError, OSError):
         return
 
-    deadline = time.time() + term_grace_seconds
-    while time.time() < deadline:
+    deadline = time.monotonic() + term_grace_seconds
+    while time.monotonic() < deadline:
         try:
             os.killpg(pgid, 0)
             time.sleep(0.05)
@@ -50,45 +52,60 @@ def run_hardened_subprocess(
     term_grace_seconds: float = 1.0,
     cwd: str | None = None,
     env: dict[str, str] | None = None,
+    max_output_bytes: int = 16 * 1024 * 1024,
 ) -> subprocess.CompletedProcess[str]:
-    """Run a command in its own process group for cancellation and timeout cleanup."""
+    """Run with bounded output capture, cancellation and process-tree cleanup."""
+    if max_output_bytes <= 0:
+        raise ValueError("max_output_bytes must be positive")
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        text=True,
         cwd=cwd,
         env=env,
         start_new_session=True,
     )
 
-    pgid = os.getpgid(proc.pid)
-    deadline = time.time() + timeout
+    pgid = proc.pid  # start_new_session makes the child's PID its process group.
+    deadline = time.monotonic() + timeout
+    output = {"stdout": bytearray(), "stderr": bytearray()}
+    encoding = locale.getpreferredencoding(False)
+    selector = selectors.DefaultSelector()
+    try:
+        for stream, name in ((proc.stdout, "stdout"), (proc.stderr, "stderr")):
+            os.set_blocking(stream.fileno(), False)
+            selector.register(stream, selectors.EVENT_READ, name)
 
-    while True:
-        retcode = proc.poll()
-        if retcode is not None:
-            stdout, stderr = proc.communicate()
-            return subprocess.CompletedProcess(
-                args=cmd,
-                returncode=retcode,
-                stdout=stdout,
-                stderr=stderr,
-            )
-
-        if cancellation_check is not None:
-            try:
+        # Drain while the child runs: waiting for exit first deadlocks once
+        # either pipe fills. Reads and retained output are bounded separately.
+        while selector.get_map() or proc.poll() is None:
+            if cancellation_check is not None:
                 cancellation_check()
-            except Exception as exc:
-                logger.info("[SUBPROCESS HARDENING] Cancellation triggered during execution of %s (PGID: %d)", cmd[0], pgid)
-                kill_process_group(pgid, term_grace_seconds=term_grace_seconds)
-                proc.communicate()
-                raise exc
-
-        if time.time() > deadline:
-            logger.warning("[SUBPROCESS HARDENING] Timeout (%fs) exceeded for %s (PGID: %d)", timeout, cmd[0], pgid)
-            kill_process_group(pgid, term_grace_seconds=term_grace_seconds)
-            stdout, stderr = proc.communicate()
-            raise subprocess.TimeoutExpired(cmd=cmd, timeout=timeout, output=stdout, stderr=stderr)
-
-        time.sleep(0.1)
+            if time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired(
+                    cmd=cmd, timeout=timeout,
+                    output=output["stdout"].decode(encoding, errors="replace"),
+                    stderr=output["stderr"].decode(encoding, errors="replace"),
+                )
+            for key, _ in selector.select(timeout=min(0.05, max(0, deadline - time.monotonic()))):
+                chunk = os.read(key.fileobj.fileno(), 65536)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                captured = output[key.data]
+                if len(captured) + len(chunk) > max_output_bytes:
+                    raise RuntimeError(f"Subprocess {key.data} exceeded {max_output_bytes} bytes")
+                captured.extend(chunk)
+        return subprocess.CompletedProcess(
+            args=cmd, returncode=proc.wait(),
+            stdout=output["stdout"].decode(encoding, errors="replace"),
+            stderr=output["stderr"].decode(encoding, errors="replace"),
+        )
+    except BaseException:
+        kill_process_group(pgid, term_grace_seconds=term_grace_seconds)
+        proc.wait()
+        raise
+    finally:
+        selector.close()
+        proc.stdout.close()
+        proc.stderr.close()
