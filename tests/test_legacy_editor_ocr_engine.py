@@ -326,7 +326,7 @@ def test_legacy_selector_does_not_change_general_editor_or_studio_routing(
     )
     monkeypatch.setattr(
         actors,
-        "extract_document_v2",
+        "execute_studio_editor_extraction",
         lambda *_args, **_kwargs: (calls.append("studio") or {"success": True}),
     )
 
