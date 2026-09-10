@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import math
 import os
 import time
 from typing import Callable
@@ -74,39 +75,10 @@ class WorkerAuthMiddleware(BaseHTTPMiddleware):
 
         now = time.time()
         clock_skew_window = float(os.getenv("WORKER_CLOCK_SKEW_WINDOW", "300"))
-        if abs(now - req_timestamp) > clock_skew_window:
+        if not math.isfinite(req_timestamp) or abs(now - req_timestamp) > clock_skew_window:
             return JSONResponse(
                 status_code=401,
                 content={"detail": "Worker authentication signature timestamp expired or out of bounds"},
-            )
-
-        # Replay protection check
-        clean_expired_nonces(now, clock_skew_window)
-        redis_url = os.getenv("REDIS_URL")
-        nonce_replayed = False
-        if redis_url:
-            try:
-                import redis
-
-                r = redis.Redis.from_url(redis_url, socket_connect_timeout=1)
-                key = f"worker:nonce:{nonce}"
-                if not r.set(key, "1", ex=int(clock_skew_window), nx=True):
-                    nonce_replayed = True
-            except Exception:
-                if nonce in _SEEN_NONCES:
-                    nonce_replayed = True
-                else:
-                    _SEEN_NONCES[nonce] = now
-        else:
-            if nonce in _SEEN_NONCES:
-                nonce_replayed = True
-            else:
-                _SEEN_NONCES[nonce] = now
-
-        if nonce_replayed:
-            return JSONResponse(
-                status_code=401,
-                content={"detail": "Worker authentication nonce replayed"},
             )
 
         # Reconstruct String to Sign
@@ -132,5 +104,36 @@ class WorkerAuthMiddleware(BaseHTTPMiddleware):
                 status_code=401,
                 content={"detail": "Invalid worker authentication signature"},
             )
+
+        # Only authenticated requests may consume a nonce. Reserving it before
+        # signature verification lets invalid requests poison the replay store.
+        clean_expired_nonces(now, clock_skew_window)
+        redis_url = os.getenv("REDIS_URL")
+        nonce_replayed = False
+        if redis_url:
+            try:
+                from redis.asyncio import Redis
+
+                async with Redis.from_url(redis_url, socket_connect_timeout=1, socket_timeout=1) as client:
+                    # A future-dated signature remains valid for up to twice
+                    # the skew window; retain its nonce through that lifetime.
+                    nonce_replayed = not await client.set(
+                        f"worker:nonce:{nonce}", "1", ex=max(1, math.ceil(2 * clock_skew_window)), nx=True
+                    )
+            except Exception:
+                from app.core.config import is_managed_environment
+
+                if is_managed_environment():
+                    return JSONResponse(status_code=503, content={"detail": "Worker replay protection unavailable"})
+                nonce_replayed = nonce in _SEEN_NONCES
+                if not nonce_replayed:
+                    _SEEN_NONCES[nonce] = now + clock_skew_window
+        else:
+            nonce_replayed = nonce in _SEEN_NONCES
+            if not nonce_replayed:
+                _SEEN_NONCES[nonce] = now + clock_skew_window
+
+        if nonce_replayed:
+            return JSONResponse(status_code=401, content={"detail": "Worker authentication nonce replayed"})
 
         return await call_next(request)
