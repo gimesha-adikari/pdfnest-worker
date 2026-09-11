@@ -278,7 +278,6 @@ async def test_production_environment_ignores_simulation_headers(sample_pdf_byte
     """
     pool = PersistentRenderWorkerPool(size=1, render_timeout_s=5.0)
     await pool.start()
-    initial_pid = list(pool.workers.values())[0].pid
 
     prod_settings = Settings(
         enable_persistent_render_pool=True,
@@ -299,7 +298,10 @@ async def test_production_environment_ignores_simulation_headers(sample_pdf_byte
             resp = await client.post("/api/v1/render/page", headers=headers_crash, files=files, data=data)
             assert resp.status_code == 200
             assert resp.headers["content-type"] == "image/jpeg"
-            assert list(pool.workers.values())[0].pid == initial_pid
+            # Normal RSS/render-limit recycling may replace a healthy process.
+            # Simulation headers must cause neither failure nor crash fallback.
+            assert pool.total_crashes == pool.total_timeouts == pool.total_failed == 0
+            assert pool.total_restarts == pool.total_recycled
             assert pool.total_fallbacks == 0
 
             # 2. Simulate Hang header ignored in production
@@ -309,7 +311,10 @@ async def test_production_environment_ignores_simulation_headers(sample_pdf_byte
             resp2 = await client.post("/api/v1/render/page", headers=headers_hang, files=files, data=data)
             assert resp2.status_code == 200
             assert resp2.headers["content-type"] == "image/jpeg"
-            assert list(pool.workers.values())[0].pid == initial_pid
+            # Normal RSS/render-limit recycling may replace a healthy process.
+            # Simulation headers must cause neither failure nor crash fallback.
+            assert pool.total_crashes == pool.total_timeouts == pool.total_failed == 0
+            assert pool.total_restarts == pool.total_recycled
             assert pool.total_fallbacks == 0
 
     await pool.shutdown()
