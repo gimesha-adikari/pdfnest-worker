@@ -57,6 +57,8 @@ def decrypt_data(data: bytes) -> bytes:
             data.startswith(b"%PDF-") or
             data.startswith(b"{") or
             data.startswith(b"[") or
+            data.startswith(b"PK\x03\x04") or
+            data.startswith(b"PK\x05\x06") or
             data.startswith(b"\xff\xd8\xff") or
             data.startswith(b"\x89PNG\r\n\x1a\n") or
             data.startswith(b"RIFF") or
@@ -70,8 +72,10 @@ def decrypt_data(data: bytes) -> bytes:
             return data
         raise RuntimeError("DECRYPTION FAILED: Python worker does not have FILE_ENCRYPTION_KEY set, but the downloaded file is encrypted. Ensure your Dramatiq worker loads the .env file.")
 
-    if len(data) < 12:
-        return data
+    if len(data) < 28:
+        if is_unencrypted:
+            return data
+        raise RuntimeError("DECRYPTION FAILED: Stored object is too short for authenticated decryption")
 
     try:
         aesgcm = AESGCM(key)
