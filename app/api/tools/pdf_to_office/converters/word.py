@@ -4,12 +4,12 @@ import math
 import os
 import sys
 import tempfile
-import subprocess
 from typing import Any
 import fitz
 from docx import Document
 
 from app.core.ocr_v2.native import NativeDecision, NativeExtractor, NativeValidator
+from app.core.subprocess_runner import run_hardened_subprocess
 from app.core.pdf_to_word_ocr_engine import (
     configured_pdf_to_word_ocr_engine,
     execute_pdf_to_word_ocr,
@@ -17,6 +17,7 @@ from app.core.pdf_to_word_ocr_engine import (
 
 
 PDF_TO_WORD_DEFAULT_RASTER_DPI = 200
+PDF_TO_WORD_TIMEOUT_SECONDS = 300
 # The SDK's structured pixel guard runs after PyMuPDF and Pillow have already
 # materialized the raster.  Keep this PDF-to-Word-only preflight below the
 # worker's 1 GiB production ceiling, leaving room for the service and OCR
@@ -55,15 +56,13 @@ def _run_pdf2docx_isolated(pdf_path: str, output_path: str, workers: int) -> Non
             "finally:\n"
             "    cv.close()\n"
         )
-        proc = subprocess.Popen(
+        proc = run_hardened_subprocess(
             [sys.executable, "-c", py_script],
             cwd=job_dir,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            timeout=PDF_TO_WORD_TIMEOUT_SECONDS,
         )
-        _, stderr = proc.communicate()
         if proc.returncode != 0:
-            err_msg = stderr.decode("utf-8", errors="replace").strip()
+            err_msg = proc.stderr.strip()
             raise RuntimeError(f"PDF to Word conversion failed ({proc.returncode}): {err_msg}")
 
 
