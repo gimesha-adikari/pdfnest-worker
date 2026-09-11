@@ -57,6 +57,8 @@ def decrypt_data(data: bytes) -> bytes:
             data.startswith(b"%PDF-") or
             data.startswith(b"{") or
             data.startswith(b"[") or
+            data.startswith(b"PK\x03\x04") or
+            data.startswith(b"PK\x05\x06") or
             data.startswith(b"\xff\xd8\xff") or
             data.startswith(b"\x89PNG\r\n\x1a\n") or
             data.startswith(b"RIFF") or
@@ -70,8 +72,10 @@ def decrypt_data(data: bytes) -> bytes:
             return data
         raise RuntimeError("DECRYPTION FAILED: Python worker does not have FILE_ENCRYPTION_KEY set, but the downloaded file is encrypted. Ensure your Dramatiq worker loads the .env file.")
 
-    if len(data) < 12:
-        return data
+    if len(data) < 28:
+        if is_unencrypted:
+            return data
+        raise RuntimeError("DECRYPTION FAILED: Stored object is too short for authenticated decryption")
 
     try:
         aesgcm = AESGCM(key)
@@ -127,19 +131,17 @@ def get_local_storage_dir() -> str:
     return os.path.abspath(configured or LOCAL_STORAGE_DEFAULT)
 
 def _get_local_file_path(key: str, for_write: bool = False) -> str:
-    primary = os.path.join(get_local_storage_dir(), key.lstrip("/"))
+    # Storage keys are identifiers relative to the configured durable root.
+    # Never fall back to unrelated /tmp files with the same name.
+    if (not key or key.startswith("/") or "\\" in key or "\x00" in key
+            or any(part in {"", ".", ".."} for part in key.split("/"))):
+        raise ValueError("invalid storage key")
+    root = os.path.realpath(get_local_storage_dir())
+    primary = os.path.realpath(os.path.join(root, key))
+    if os.path.commonpath([root, primary]) != root:
+        raise ValueError("storage key escapes configured root")
     if for_write:
         os.makedirs(os.path.dirname(primary), exist_ok=True)
-        return primary
-    if os.path.exists(primary):
-        return primary
-    alt1 = os.path.join("/tmp", key.lstrip("/"))
-    if os.path.exists(alt1):
-        return alt1
-    alt2 = os.path.join("/tmp", os.path.basename(key))
-    if os.path.exists(alt2):
-        return alt2
-    os.makedirs(os.path.dirname(primary), exist_ok=True)
     return primary
 
 def upload_fileobj(fileobj: BinaryIO, key: str, *, content_type: str | None = None) -> str:

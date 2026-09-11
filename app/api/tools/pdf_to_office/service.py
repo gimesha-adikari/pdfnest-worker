@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import shutil
+from functools import partial
+import anyio
 from pathlib import Path
 
 from fastapi import HTTPException, UploadFile
@@ -12,10 +14,20 @@ from .converters import convert_to_excel, convert_to_powerpoint, convert_to_word
 from .models import OfficeOutputFormat
 from .utils import cleanup_paths, create_temp_paths
 
+_office_capacity = anyio.CapacityLimiter(1)
 
 class OfficeConversionService:
     @staticmethod
     async def convert(format: OfficeOutputFormat, file: UploadFile, language: str = "eng") -> FileResponse:
+        # Preserve one conversion at a time while keeping the HTTP event loop
+        # available for readiness, cancellation and other lightweight requests.
+        return await anyio.to_thread.run_sync(
+            partial(OfficeConversionService._convert_sync, format, file, language),
+            limiter=_office_capacity,
+        )
+
+    @staticmethod
+    def _convert_sync(format: OfficeOutputFormat, file: UploadFile, language: str) -> FileResponse:
         file_size = getattr(file, "size", 0) or 10 * 1024 * 1024
         required_bytes = (file_size * 5) + (50 * 1024 * 1024)
         check_disk_space(required_bytes)

@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import pymupdf as fitz
 
 import app.core.document_extraction_engine as engine
 from app.jobs.models import JobState
@@ -200,6 +201,9 @@ def test_pdf_markdown_profile_keeps_internal_structured_processor(
     )
 
     class FakeProcessor:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
         def process_document(self, _path: str | Path, **_kwargs: object) -> object:
             calls.append("internal")
             return result
@@ -211,7 +215,12 @@ def test_pdf_markdown_profile_keeps_internal_structured_processor(
     monkeypatch.setattr("app.jobs.actors.release_lease", lambda _job_id, _owner: None)
     monkeypatch.setattr("app.jobs.actors._cleanup_input_objects", lambda _keys: None)
     monkeypatch.setattr("app.jobs.actors.temp_file_path", lambda **_kwargs: str(tmp_path / "input.pdf"))
-    monkeypatch.setattr("app.jobs.actors.download_to_path", lambda _key, path: Path(path).write_bytes(b"pdf"))
+    def download_fixture(_key: str, path: str) -> None:
+        with fitz.open() as document:
+            document.new_page().insert_text((72, 72), "Valid routing fixture")
+            document.save(path)
+
+    monkeypatch.setattr("app.jobs.actors.download_to_path", download_fixture)
     monkeypatch.setattr("app.jobs.actors.cleanup_paths", lambda *_paths: None)
     monkeypatch.setattr("app.jobs.actors.upload_text", lambda *_args, **_kwargs: None)
     monkeypatch.setattr("app.jobs.actors.update_job", lambda _job_id, **fields: updates.append(fields))

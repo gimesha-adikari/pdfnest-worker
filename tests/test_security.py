@@ -147,3 +147,48 @@ def test_protected_route_reused_nonce():
     res2 = client.post("/api/v1/metadata/read", headers=headers2)
     assert res2.status_code == 401
     assert "nonce replayed" in res2.json()["detail"]
+
+
+def test_invalid_signature_does_not_consume_valid_nonce(monkeypatch):
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    nonce = f"invalid-first-{uuid.uuid4().hex}"
+    valid = generate_headers("POST", "/api/v1/metadata/read", nonce=nonce)
+    invalid = dict(valid, **{"X-Worker-Signature": "0" * 64})
+    assert client.post("/api/v1/metadata/read", headers=invalid).status_code == 401
+    assert client.post("/api/v1/metadata/read", headers=valid).status_code != 401
+
+
+@pytest.mark.parametrize("timestamp", ["nan", "inf", "-inf"])
+def test_nonfinite_timestamp_is_rejected(timestamp, monkeypatch):
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    nonce = uuid.uuid4().hex
+    signed = f"POST\n/api/v1/metadata/read\n{timestamp}\n{nonce}"
+    headers = {
+        "X-Worker-Timestamp": timestamp,
+        "X-Worker-Nonce": nonce,
+        "X-Worker-Signature": hmac.new(SECRET.encode(), signed.encode(), hashlib.sha256).hexdigest(),
+    }
+    assert client.post("/api/v1/metadata/read", headers=headers).status_code == 401
+
+
+def test_future_timestamp_nonce_outlives_full_acceptance_window(monkeypatch):
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    now = time.time()
+    headers = generate_headers("POST", "/api/v1/metadata/read", timestamp=now + 290)
+    monkeypatch.setattr("app.core.security.time.time", lambda: now)
+    assert client.post("/api/v1/metadata/read", headers=headers).status_code != 401
+    monkeypatch.setattr("app.core.security.time.time", lambda: now + 310)
+    assert client.post("/api/v1/metadata/read", headers=headers).status_code == 401
+
+
+def test_managed_replay_store_failure_is_closed(monkeypatch):
+    from redis.asyncio import Redis
+
+    def unavailable(*args, **kwargs):
+        raise ConnectionError("controlled test outage")
+
+    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.setenv("REDIS_URL", "redis://audit.invalid")
+    monkeypatch.setattr(Redis, "from_url", unavailable)
+    response = client.post("/api/v1/metadata/read", headers=generate_headers("POST", "/api/v1/metadata/read"))
+    assert response.status_code == 503
