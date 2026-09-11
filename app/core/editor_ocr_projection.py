@@ -10,6 +10,44 @@ from __future__ import annotations
 from typing import Any
 
 
+def preserve_native_editor_colors(layout: dict[str, Any], source_path: str, password: str | None = None,
+                                  *, visible_geometry: bool = False, cancellation_check=None) -> None:
+    """Recover the editor's line color without changing canonical OCR geometry.
+
+    Canonical OCR tokens deliberately omit font styling. A mixed-color line
+    uses its dominant overlapping span color, matching the editor's single
+    color-per-line contract. OCR text keeps its existing projection unchanged.
+    """
+    native_pages = [page for page in layout.get("pages", [])
+                    if page.get("source") == "NATIVE_EXTRACTION" and page.get("elements")]
+    if not native_pages:
+        return
+    import fitz
+
+    with fitz.open(source_path) as document:
+        if document.needs_pass and not document.authenticate(password or ""):
+            raise ValueError("PDF password is required")
+        for projected in native_pages:
+            if cancellation_check is not None:
+                cancellation_check()
+            page = document[int(projected["page_num"]) - 1]
+            spans = [(fitz.Rect(span["bbox"]), int(span["color"]))
+                     for block in page.get_text("dict", flags=fitz.TEXTFLAGS_DICT & ~fitz.TEXT_PRESERVE_IMAGES)["blocks"]
+                     for line in block.get("lines", []) for span in line.get("spans", [])
+                     if span.get("text", "").strip() and "color" in span]
+            for element in projected["elements"]:
+                rect = fitz.Rect(element["x"], element["y"], element["x"] + element["width"], element["y"] + element["height"])
+                if visible_geometry:
+                    rect = rect * page.derotation_matrix
+                colors: dict[int, float] = {}
+                for span_rect, color in spans:
+                    area = (rect & span_rect).get_area()
+                    if area > 0 and area >= span_rect.get_area() * 0.5:
+                        colors[color] = colors.get(color, 0) + area
+                if colors:
+                    element["text_color"] = f"#{max(colors, key=colors.get):06x}"
+
+
 def _value(value: object) -> object:
     return getattr(value, "value", value)
 

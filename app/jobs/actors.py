@@ -811,6 +811,13 @@ def editor_extract_job(
             extractor_kwargs["languages"] = languages or ["eng"]
         result = extractor(input_path, password, **extractor_kwargs)
         check_cancellation(job_id)
+        if ocr_v2:
+            from app.core.editor_ocr_projection import preserve_native_editor_colors
+            preserve_native_editor_colors(
+                result, input_path, password,
+                visible_geometry=consumer != EDITOR_OCR_CONSUMER_GENERAL_EDITOR,
+                cancellation_check=lambda: check_cancellation(job_id),
+            )
 
         # The extract layout is public editor data. Storage keys remain inside
         # the worker lifecycle and must not be returned as source trackers.
