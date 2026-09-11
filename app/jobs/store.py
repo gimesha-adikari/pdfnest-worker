@@ -99,41 +99,50 @@ def save_job(job: JobRecord) -> None:
                 continue
 
     prune_expired_job_index()
+    sync_task_mirror(job.id)
 
-    # Sync task status to Go backend Redis key format pdfnest:tasks:<job.id>
+
+def sync_task_mirror(job_id: str) -> None:
+    """Publish the latest canonical state without racing another job/task writer."""
     try:
-        task_key = f"pdfnest:tasks:{job.id}"
-        existing_task_raw = redis_client.get(task_key)
-        existing_task = json.loads(existing_task_raw) if existing_task_raw else {}
-
-        status_map = {
-            JobState.queued: "QUEUED",
-            JobState.running: "PROCESSING",
-            JobState.succeeded: "COMPLETED",
-            JobState.failed: "FAILED",
-            JobState.cancelled: "CANCELLED",
-            JobState.cancel_requested: "CANCELLED",
-        }
-
-        task_status = status_map.get(job.status, "PROCESSING")
-        result_key = (job.result or {}).get("artifact_key", "")
-
-        task_data = {
-            "id": job.id,
-            "status": task_status,
-            "progress": job.progress,
-            "resultKey": result_key,
-            "resultUrl": f"r2://{result_key}" if result_key else "",
-            "ownerIdentity": existing_task.get("ownerIdentity", job.owner_identity or ""),
-            "reservationId": existing_task.get("reservationId", ""),
-            "downloadToken": existing_task.get("downloadToken", ""),
-            "error": job.error or job.message or "",
-            "updatedAt": int(job.updated_at.timestamp()),
-        }
-
-        redis_client.set(task_key, json.dumps(task_data), ex=3600)
+        key, task_key = job_key(job_id), f"pdfnest:tasks:{job_id}"
+        with redis_client.pipeline() as pipe:
+            while True:
+                try:
+                    pipe.watch(key, task_key)
+                    raw = pipe.get(key)
+                    if not raw:
+                        pipe.unwatch()
+                        return
+                    job = JobRecord.model_validate_json(raw)
+                    existing_task_raw = pipe.get(task_key)
+                    existing_task = json.loads(existing_task_raw) if existing_task_raw else {}
+                    status_map = {
+                        JobState.queued: "QUEUED", JobState.running: "PROCESSING",
+                        JobState.succeeded: "COMPLETED", JobState.failed: "FAILED",
+                        JobState.cancelled: "CANCELLED", JobState.cancel_requested: "CANCELLED",
+                    }
+                    result_key = (job.result or {}).get("artifact_key", "")
+                    task_data = {
+                        "id": job.id,
+                        "status": status_map.get(job.status, "PROCESSING"),
+                        "progress": job.progress,
+                        "resultKey": result_key,
+                        "resultUrl": f"r2://{result_key}" if result_key else "",
+                        "ownerIdentity": existing_task.get("ownerIdentity", job.owner_identity or ""),
+                        "reservationId": existing_task.get("reservationId", ""),
+                        "downloadToken": existing_task.get("downloadToken", ""),
+                        "error": job.error or job.message or "",
+                        "updatedAt": int(job.updated_at.timestamp()),
+                    }
+                    pipe.multi()
+                    pipe.set(task_key, json.dumps(task_data), ex=3600)
+                    pipe.execute()
+                    return
+                except WatchError:
+                    continue
     except Exception as e:
-        logger.warning(f"[TASK SYNC FAIL] Failed to sync task {job.id}: {e}")
+        logger.warning("[TASK SYNC FAIL] Failed to sync task %s: %s", job_id, e)
 
 
 def get_job(job_id: str) -> JobRecord | None:
@@ -176,25 +185,7 @@ def get_job(job_id: str) -> JobRecord | None:
                             except Exception as lease_err:
                                 logger.warning("Failed to release lease for stuck job %s: %s", current_job.id, lease_err)
 
-                            try:
-                                task_key = f"pdfnest:tasks:{current_job.id}"
-                                existing_task_raw = redis_client.get(task_key)
-                                existing_task = json.loads(existing_task_raw) if existing_task_raw else {}
-                                task_data = {
-                                    "id": current_job.id,
-                                    "status": "FAILED",
-                                    "progress": current_job.progress,
-                                    "resultKey": "",
-                                    "resultUrl": "",
-                                    "ownerIdentity": existing_task.get("ownerIdentity", current_job.owner_identity or ""),
-                                    "reservationId": existing_task.get("reservationId", ""),
-                                    "downloadToken": existing_task.get("downloadToken", ""),
-                                    "error": current_job.error,
-                                    "updatedAt": int(current_job.updated_at.timestamp()),
-                                }
-                                redis_client.set(task_key, json.dumps(task_data), ex=3600)
-                            except Exception as sync_err:
-                                logger.warning("Failed to sync stuck task %s: %s", current_job.id, sync_err)
+                            sync_task_mirror(current_job.id)
 
                             return current_job
                         else:
