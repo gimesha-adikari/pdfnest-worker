@@ -13,6 +13,7 @@ from app.core.broker import broker  # noqa: F401
 from app.jobs.router import router as jobs_router
 
 from app.api.tools.pdf_to_office.router import router as office_router
+from app.api.tools.office_to_pdf.router import router as office_to_pdf_router
 from app.api.tools.render.router import router as render_router
 from app.api.tools.editor.router import router as editor_router
 from app.api.tools.markup.router import router as markup_router
@@ -179,6 +180,7 @@ async def ready() -> JSONResponse:
 
 app.include_router(jobs_router)
 app.include_router(office_router)
+app.include_router(office_to_pdf_router)
 app.include_router(render_router)
 app.include_router(editor_router)
 app.include_router(markup_router)
