@@ -1010,6 +1010,13 @@ def _layout_item_box(item: Any) -> dict[str, float] | None:
     return _element_layout_box(item)
 
 
+def _element_type_value(element: Any) -> str:
+    """Normalize worker and standalone-SDK enum representations alike."""
+
+    raw_type = getattr(element, "type", "")
+    return str(getattr(raw_type, "value", raw_type))
+
+
 def _cluster_layout_items(
     items: Sequence[Any],
     *,
@@ -1070,11 +1077,11 @@ def _page_layout_order(page: Any) -> list[StructuredElement]:
         page_width = 0.0
     if page_width <= 0.0:
         page_width = max((_element_layout_box(element) or {}).get("x", 0.0) + (_element_layout_box(element) or {}).get("width", 0.0) for element in ordered)
-    text_types = {StructuredElementType.PARAGRAPH, StructuredElementType.TEXT_BLOCK}
+    text_types = {StructuredElementType.PARAGRAPH.value, StructuredElementType.TEXT_BLOCK.value}
     candidates = [
         element
         for element in ordered
-        if element.type in text_types
+        if _element_type_value(element) in text_types
         and (box := _element_layout_box(element)) is not None
         and box["width"] <= page_width * 0.65
     ]
@@ -1096,7 +1103,7 @@ def _page_layout_order(page: Any) -> list[StructuredElement]:
     full_width: list[StructuredElement] = []
     for element in ordered:
         box = _element_layout_box(element)
-        if box is None or element.type not in text_types or box["width"] > page_width * 0.65:
+        if box is None or _element_type_value(element) not in text_types or box["width"] > page_width * 0.65:
             full_width.append(element)
             continue
         if box["y"] + box["height"] < column_start or box["y"] > column_end:
@@ -1197,23 +1204,24 @@ def render_structured_markdown(result: StructuredDocumentResult, *, emit_page_br
         except (AttributeError, TypeError, ValueError):
             page_width = 0.0
         for element in _page_layout_order(page):
-            if element.type is StructuredElementType.HEADING:
+            element_type = _element_type_value(element)
+            if element_type == StructuredElementType.HEADING.value:
                 chunks.append(f"{'#' * max(1, min(6, element.level or 1))} {element.text}".strip())
-            elif element.type in (StructuredElementType.PARAGRAPH, StructuredElementType.TEXT_BLOCK):
+            elif element_type in (StructuredElementType.PARAGRAPH.value, StructuredElementType.TEXT_BLOCK.value):
                 chunks.extend(_layout_text_blocks(element, page_width))
-            elif element.type is StructuredElementType.LIST:
+            elif element_type == StructuredElementType.LIST.value:
                 rendered = _markdown_list(element)
                 if rendered:
                     chunks.append(rendered)
-            elif element.type is StructuredElementType.TABLE:
+            elif element_type == StructuredElementType.TABLE.value:
                 rendered = _markdown_table(element)
                 if rendered:
                     chunks.append(rendered)
-            elif element.type is StructuredElementType.IMAGE:
+            elif element_type == StructuredElementType.IMAGE.value:
                 chunks.append(f"![{element.data.get('alt_text', 'Figure')}]({element.data.get('url', '')})")
-            elif element.type is StructuredElementType.CAPTION:
+            elif element_type == StructuredElementType.CAPTION.value:
                 chunks.append(f"*{element.text}*")
-            elif element.type is StructuredElementType.FORMULA:
+            elif element_type == StructuredElementType.FORMULA.value:
                 if element.text:
                     chunks.append(f"$${element.text}$$")
             elif element.text:

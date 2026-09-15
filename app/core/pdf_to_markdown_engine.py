@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -40,6 +40,79 @@ class PdfToMarkdownExecution:
 
     structured_result: Any
     markdown: str
+
+
+def _structured_content_length(result: Any) -> int:
+    """Return a semantic-content signal for a structured result.
+
+    The actor persists both the canonical structured result and its Markdown
+    projection. A short projection is suspicious only when that canonical
+    result contains materially more text. Keep this schema-light so worker
+    result classes and structurally compatible SDK objects are both handled.
+    """
+
+    pages = getattr(result, "pages", None)
+    elements: list[Any] = []
+    if pages is not None:
+        for page in pages or ():
+            elements.extend(getattr(page, "elements", ()) or ())
+    if not elements:
+        elements.extend(getattr(result, "elements", ()) or ())
+
+    text_parts: list[str] = []
+
+    def collect(value: Any) -> None:
+        if isinstance(value, Mapping):
+            direct = value.get("text")
+            if direct is not None:
+                text = str(direct).strip()
+                if text:
+                    text_parts.append(text)
+            for key in ("headers", "rows", "items", "cells"):
+                if key in value:
+                    collect(value[key])
+            return
+        if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+            for item in value:
+                collect(item)
+
+    for element in elements:
+        text = str(getattr(element, "text", "") or "").strip()
+        if text:
+            text_parts.append(text)
+        collect(getattr(element, "data", {}) or {})
+
+    return len(" ".join(text_parts).strip())
+
+
+def _repair_markdown_projection(execution: PdfToMarkdownExecution) -> PdfToMarkdownExecution:
+    """Repair a truncated projection without extracting the PDF twice.
+
+    A production run persisted a one-character Markdown sentinel even though
+    the same job's structured result contained OCR elements. Re-rendering that
+    canonical result at this boundary preserves the V2 contract and avoids a
+    silent fallback to the unrelated classic converter.
+    """
+
+    projected = str(execution.markdown or "")
+    projected_length = len(projected.strip())
+    structured_length = _structured_content_length(execution.structured_result)
+    if projected_length > 2 or structured_length <= 2:
+        return execution
+
+    repaired = _internal_markdown(execution.structured_result)
+    repaired_length = len(str(repaired or "").strip())
+    if repaired_length <= projected_length:
+        return execution
+
+    logger.warning(
+        "OCR_V2_PDF_TO_MARKDOWN_PROJECTION_REPAIRED projected_chars=%d "
+        "structured_chars=%d repaired_chars=%d",
+        projected_length,
+        structured_length,
+        repaired_length,
+    )
+    return replace(execution, markdown=repaired)
 
 
 def configured_pdf_to_markdown_engine(raw: str | None = None) -> str:
@@ -197,7 +270,7 @@ def execute_pdf_to_markdown(
     selected = configured_pdf_to_markdown_engine()
     logger.info("OCR_V2_PDF_TO_MARKDOWN_ENGINE consumer=pdf_to_markdown engine=%s", selected)
     executor = _execute_internal if selected == "internal" else _execute_sdk
-    return executor(
+    execution = executor(
         pdf_path,
         language=language,
         language_mode=language_mode,
@@ -207,6 +280,7 @@ def execute_pdf_to_markdown(
         cancellation_check=cancellation_check,
         page_progress_callback=page_progress_callback,
     )
+    return _repair_markdown_projection(execution)
 
 
 __all__ = [

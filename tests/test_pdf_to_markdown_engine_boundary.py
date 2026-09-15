@@ -240,6 +240,101 @@ def test_sdk_failure_is_not_silently_fallen_back(
         engine.execute_pdf_to_markdown(tmp_path / "source.pdf", language="eng")
 
 
+def test_short_markdown_projection_is_repaired_from_canonical_result(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A sentinel projection must not replace meaningful structured content."""
+
+    element = SimpleNamespace(
+        element_id="paragraph-1",
+        type=SimpleNamespace(value="PARAGRAPH"),
+        page_index=0,
+        text="The controlled fixture has meaningful text.",
+        level=None,
+        ordered=None,
+        data={},
+    )
+    page = SimpleNamespace(
+        page_index=0,
+        geometry={"width": 600.0, "height": 800.0},
+        elements=(element,),
+        reading_order=("paragraph-1",),
+    )
+    result = SimpleNamespace(pages=(page,), elements=(element,))
+    sentinel = engine.PdfToMarkdownExecution(result, "a")
+
+    monkeypatch.setenv(engine.PDF_TO_MARKDOWN_ENGINE_ENV, "internal")
+    monkeypatch.setattr(engine, "_execute_internal", lambda *_args, **_kwargs: sentinel)
+
+    execution = engine.execute_pdf_to_markdown(tmp_path / "source.pdf", language="eng")
+
+    assert execution.markdown != "a"
+    assert "controlled fixture" in execution.markdown
+    assert execution.markdown.endswith("\n")
+
+
+def test_projection_repair_preserves_unicode_and_newlines(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    element = SimpleNamespace(
+        element_id="paragraph-1",
+        type=SimpleNamespace(value="TEXT_BLOCK"),
+        page_index=0,
+        text="Résumé Δ\nLine two",
+        level=None,
+        ordered=None,
+        data={},
+    )
+    page = SimpleNamespace(
+        page_index=0,
+        geometry={"width": 600.0, "height": 800.0},
+        elements=(element,),
+        reading_order=("paragraph-1",),
+    )
+    result = SimpleNamespace(pages=(page,), elements=(element,))
+    sentinel = engine.PdfToMarkdownExecution(result, "a\n")
+
+    monkeypatch.setenv(engine.PDF_TO_MARKDOWN_ENGINE_ENV, "sdk")
+    monkeypatch.setattr(engine, "_execute_sdk", lambda *_args, **_kwargs: sentinel)
+
+    execution = engine.execute_pdf_to_markdown(tmp_path / "source.pdf", language="eng")
+
+    assert "Résumé Δ" in execution.markdown
+    assert "Line two" in execution.markdown
+
+
+def test_short_canonical_document_is_not_rewritten(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    element = SimpleNamespace(
+        element_id="paragraph-1",
+        type=SimpleNamespace(value="PARAGRAPH"),
+        page_index=0,
+        text="a",
+        level=None,
+        ordered=None,
+        data={},
+    )
+    page = SimpleNamespace(
+        page_index=0,
+        geometry={"width": 600.0, "height": 800.0},
+        elements=(element,),
+        reading_order=("paragraph-1",),
+    )
+    result = SimpleNamespace(pages=(page,), elements=(element,))
+    sentinel = engine.PdfToMarkdownExecution(result, "a")
+
+    monkeypatch.setenv(engine.PDF_TO_MARKDOWN_ENGINE_ENV, "internal")
+    monkeypatch.setattr(engine, "_execute_internal", lambda *_args, **_kwargs: sentinel)
+
+    execution = engine.execute_pdf_to_markdown(tmp_path / "source.pdf", language="eng")
+
+    assert execution.markdown == "a"
+
+
 def test_actor_uses_pdf_to_markdown_boundary_without_document_selector(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
