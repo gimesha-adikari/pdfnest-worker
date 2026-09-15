@@ -152,6 +152,36 @@ def test_ruling_line_preparation_is_bounded_and_noop_without_grid() -> None:
     assert no_grid is None
 
 
+def test_ruling_line_preparation_rejects_filled_dark_page_background(tmp_path: Path) -> None:
+    """A bordered dark scan must not be erased as a table grid before OCR."""
+
+    image = Image.new("RGB", (960, 640), (48, 96, 150))
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((48, 48, 912, 592), outline="white", width=10)
+    draw.text((102, 210), "IMAGE ALPHA", fill="white", font=_font(38))
+    draw.text((102, 305), "PLATEN-ACCEPTANCE-20260913", fill="white", font=_font(28))
+    draw.text((102, 365), "OCR TARGET 8724", fill="white", font=_font(28))
+
+    grid = detect_ruling_line_grid(image)
+    prepared, prepared_grid = prepare_table_ocr_image(image)
+
+    assert grid.horizontal and grid.vertical
+    assert grid.is_table_like is False
+    assert prepared is image
+    assert prepared_grid is None
+
+    pdf_path = tmp_path / "dark-bordered-scan.pdf"
+    _pdf_from_image(pdf_path, image)
+    result = StructuredDocumentProcessor(
+        raster_dpi=200,
+        enable_scanned_table_recognition=True,
+    ).process_document(pdf_path, routing_policy="FAST")
+    text = "\n".join(element.text for page in result.pages for element in page.elements)
+    assert "IMAGE ALPHA" in text
+    assert "PLATEN-ACCEPTANCE-20260913" in text
+    assert "OCR TARGET 8724" in text
+
+
 def test_pdf_to_word_scanned_table_recovers_six_columns_without_duplicate_paragraph(tmp_path: Path) -> None:
     pdf_path = tmp_path / "scanned-table.pdf"
     _scanned_table_pdf(pdf_path)

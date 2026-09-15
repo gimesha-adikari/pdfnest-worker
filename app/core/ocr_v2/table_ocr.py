@@ -19,6 +19,11 @@ _MIN_LINE_COVERAGE = 0.20
 _MIN_GRID_LINES = 3
 _MAX_DETECTION_DIMENSION = 1600
 _LINE_PADDING = 1
+# A ruling line should be thin relative to the run it spans. Without this
+# guard, an inverted/filled page background can be interpreted as several
+# contiguous "lines" and erased before OCR. Real table rules remain well below
+# this bound, including the deliberately thick rules used by our fixtures.
+_MAX_LINE_THICKNESS_RATIO = 0.10
 
 
 @dataclass(frozen=True)
@@ -32,6 +37,8 @@ class RulingLineGrid:
     def is_table_like(self) -> bool:
         if len(self.horizontal) < _MIN_GRID_LINES or len(self.vertical) < _MIN_GRID_LINES:
             return False
+        if not all(_line_is_reasonably_thin(line) for line in (*self.horizontal, *self.vertical)):
+            return False
         horizontal_left = min(line[2] for line in self.horizontal)
         horizontal_right = max(line[3] for line in self.horizontal)
         horizontal_top = min(line[0] for line in self.horizontal)
@@ -44,6 +51,14 @@ class RulingLineGrid:
             min(horizontal_right, vertical_right) > max(horizontal_left, vertical_left)
             and min(horizontal_bottom, vertical_bottom) > max(horizontal_top, vertical_top)
         )
+
+
+def _line_is_reasonably_thin(line: tuple[int, int, int, int]) -> bool:
+    """Reject filled-image bands that are not plausible ruling lines."""
+
+    thickness = max(1, line[1] - line[0] + 1)
+    span = max(1, line[3] - line[2] + 1)
+    return thickness <= span * _MAX_LINE_THICKNESS_RATIO
 
 
 def _sample_image(gray: Image.Image) -> tuple[Image.Image, float, float]:

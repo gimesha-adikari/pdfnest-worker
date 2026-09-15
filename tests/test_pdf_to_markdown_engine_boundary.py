@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import pymupdf as fitz
 import pytest
 
 import app.core.pdf_to_markdown_engine as engine
@@ -335,6 +337,27 @@ def test_short_canonical_document_is_not_rewritten(
     assert execution.markdown == "a"
 
 
+@pytest.mark.parametrize("selected", ["internal", "sdk"])
+def test_legitimate_one_character_native_document_remains_valid(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    selected: str,
+) -> None:
+    """The short-output guard must not rewrite a genuine one-character PDF."""
+
+    source = tmp_path / "one-character.pdf"
+    with fitz.open() as document:
+        page = document.new_page(width=300, height=200)
+        page.insert_text((80, 100), "a", fontsize=32, fontname="helv")
+        document.save(str(source))
+
+    monkeypatch.setenv(engine.PDF_TO_MARKDOWN_ENGINE_ENV, selected)
+    execution = engine.execute_pdf_to_markdown(source, language="eng", routing_policy="FAST")
+
+    assert execution.structured_result.validation["valid"] is True
+    assert execution.markdown.strip() == "a"
+
+
 def test_actor_uses_pdf_to_markdown_boundary_without_document_selector(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -391,3 +414,62 @@ def test_actor_uses_pdf_to_markdown_boundary_without_document_selector(
     assert calls["language_usage"] == {"sin": 0.5}
     assert calls["routing_policy"] == "AUTO"
     assert updates[-1]["status"] == JobState.succeeded
+
+
+def test_actor_serialization_round_trip_preserves_markdown_payload(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The persisted actor payload keeps meaningful UTF-8 Markdown intact."""
+
+    from app.jobs.actors import _run_structured_document_job
+
+    uploads: list[tuple[str, str, dict[str, object]]] = []
+    updates: list[dict[str, object]] = []
+    page = SimpleNamespace(page_index=0, status="SUCCESS", warnings=())
+    payload = {
+        "schema_version": "ocr_v2_structured_document.v1",
+        "pages": [{"page_index": 0, "elements": [{"text": "Résumé Δ\nLine two"}]}],
+    }
+    result = SimpleNamespace(
+        pages=(page,),
+        warnings=(),
+        validation={"valid": True},
+        to_dict=lambda: payload,
+    )
+
+    def execute(_path: str | Path, **_kwargs: object) -> engine.PdfToMarkdownExecution:
+        return engine.PdfToMarkdownExecution(result, "# Résumé Δ\n\nLine two\n")
+
+    monkeypatch.setattr("app.jobs.actors.get_job", lambda _job_id: SimpleNamespace(status=JobState.queued, owner_identity="guest:boundary", payload={}))
+    monkeypatch.setattr("app.jobs.actors.claim_job", lambda _job_id: object())
+    monkeypatch.setattr("app.jobs.actors.check_cancellation", lambda _job_id: None)
+    monkeypatch.setattr("app.jobs.actors.acquire_lease", lambda _job_id, _owner: (True, ""))
+    monkeypatch.setattr("app.jobs.actors.release_lease", lambda _job_id, _owner: None)
+    monkeypatch.setattr("app.jobs.actors._cleanup_input_objects", lambda _keys: None)
+    monkeypatch.setattr("app.jobs.actors.temp_file_path", lambda **_kwargs: str(tmp_path / "input.pdf"))
+    monkeypatch.setattr("app.jobs.actors.download_to_path", lambda _key, path: Path(path).write_bytes(b"pdf"))
+    monkeypatch.setattr("app.jobs.actors.cleanup_paths", lambda *_paths: None)
+    monkeypatch.setattr("app.jobs.actors.upload_text", lambda text, key, **kwargs: uploads.append((text, key, kwargs)))
+    monkeypatch.setattr("app.jobs.actors.update_job", lambda _job_id, **fields: updates.append(fields))
+    monkeypatch.setattr("app.jobs.actors.execute_pdf_to_markdown", execute)
+
+    _run_structured_document_job(
+        "123e4567-e89b-12d3-a456-426614174003",
+        "jobs/ocr_v2/structured/input/document.pdf",
+        "document.pdf",
+        "eng",
+        "AUTO",
+        "PDF_MARKDOWN_V2",
+        "AUTO",
+        ["eng"],
+        {},
+    )
+
+    assert updates[-1]["status"] == JobState.succeeded
+    assert len(uploads) == 1
+    serialized, _key, kwargs = uploads[0]
+    assert kwargs["content_type"] == "application/json"
+    round_trip = json.loads(serialized)
+    assert round_trip["markdown"] == "# Résumé Δ\n\nLine two\n"
+    assert "Résumé Δ" in json.dumps(round_trip, ensure_ascii=False)
