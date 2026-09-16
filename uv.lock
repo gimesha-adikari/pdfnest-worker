@@ -1073,15 +1073,15 @@ wheels = [
 [[package]]
 name = "platen-document"
 version = "0.1.8"
-source = { registry = "/home/gimesha/My_Projects/platen-audit-reports/tool-004-production-parity-20260916/evidence/sdk-wheel" }
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "pdfplumber" },
     { name = "pillow" },
     { name = "pymupdf" },
 ]
-sdist = { path = "/home/gimesha/My_Projects/platen-audit-reports/tool-004-production-parity-20260916/evidence/sdk-wheel/platen_document-0.1.8.tar.gz" }
+sdist = { url = "https://files.pythonhosted.org/packages/fd/1a/61f0595aa4643636bd48a78e90a6e693fdebcf80a27d5a11f14236fcb7bd/platen_document-0.1.8.tar.gz", hash = "sha256:c2058da2049c60791fbff6fdfb9ab7ec5fdc85aff737cfbdc26d8020690ff3d6", size = 89933, upload-time = "2026-09-16T06:51:43.109Z" }
 wheels = [
-    { path = "/home/gimesha/My_Projects/platen-audit-reports/tool-004-production-parity-20260916/evidence/sdk-wheel/platen_document-0.1.8-py3-none-any.whl" },
+    { url = "https://files.pythonhosted.org/packages/2e/ed/5ff54730ef8c38935cc9e6301e3c34bc98029c6bab07eff15e4b4bf9c45d/platen_document-0.1.8-py3-none-any.whl", hash = "sha256:86059bdd393ab81a4ec1e917366257b9cfcda1cd268bafd6970eb785b876573f", size = 86665, upload-time = "2026-09-16T06:51:41.697Z" },
 ]
 
 [[package]]
