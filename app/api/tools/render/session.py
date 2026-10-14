@@ -47,6 +47,7 @@ class RenderSession:
     page_count: int
     created_at: float
     last_accessed_at: float
+    dedup_scope: str = "global"
     document: PdfRenderDocument | None = None
     lock: threading.RLock = field(default_factory=threading.RLock)
     page_cache: dict[str, bytes] = field(default_factory=dict)
@@ -62,6 +63,7 @@ class RenderSessionManager:
             file_path: Path,
             file_size: int,
             sha256: str,
+            dedup_scope: str = "global",
     ) -> RenderSession:
         now = time.time()
 
@@ -76,9 +78,12 @@ class RenderSessionManager:
             session_dir.mkdir(parents=True, exist_ok=True)
 
             target_path = session_dir / "source.pdf"
-            shutil.copyfile(file_path, target_path)
-
-            doc = PdfRenderDocument.open(target_path)
+            try:
+                shutil.copyfile(file_path, target_path)
+                doc = PdfRenderDocument.open(target_path)
+            except Exception:
+                shutil.rmtree(session_dir, ignore_errors=True)
+                raise
 
             session = RenderSession(
                 session_id=session_id,
@@ -88,6 +93,7 @@ class RenderSessionManager:
                 page_count=doc.page_count,
                 created_at=now,
                 last_accessed_at=now,
+                dedup_scope=dedup_scope,
                 document=doc,
             )
 
@@ -133,16 +139,34 @@ class RenderSessionManager:
         except Exception:
             pass
 
-    def find_by_hash(self, sha256: str) -> RenderSession | None:
+    def find_by_hash(
+            self,
+            sha256: str,
+            dedup_scope: str = "global",
+    ) -> RenderSession | None:
         with self._lock:
             self._cleanup_expired_locked()
 
             for session in self._sessions.values():
-                if session.sha256 == sha256:
+                if session.sha256 == sha256 and session.dedup_scope == dedup_scope:
                     session.last_accessed_at = time.time()
                     return session
 
             return None
+
+    def get_or_create(
+            self,
+            file_path: Path,
+            file_size: int,
+            sha256: str,
+            dedup_scope: str = "global",
+    ) -> RenderSession:
+        """Reuse identical content only inside the caller's opaque scope."""
+        with self._lock:
+            existing = self.find_by_hash(sha256, dedup_scope)
+            if existing is not None:
+                return existing
+            return self.create(file_path, file_size, sha256, dedup_scope)
 
     def _evict_oldest_locked(self) -> None:
         if not self._sessions:

@@ -196,6 +196,7 @@ async def render_page_to_jpeg_bytes(
 
 async def create_render_session(
         file: UploadFile,
+        dedup_scope: str = "global",
 ) -> RenderSession:
     temp_file = tempfile.NamedTemporaryFile(
         prefix="pdfnest-session-upload-",
@@ -224,15 +225,11 @@ async def create_render_session(
 
         sha256 = sha256_file(temp_path)
 
-        existing = session_manager.find_by_hash(sha256)
-
-        if existing is not None:
-            return existing
-
-        return session_manager.create(
+        return session_manager.get_or_create(
             file_path=temp_path,
             file_size=file_size,
             sha256=sha256,
+            dedup_scope=dedup_scope,
         )
 
     finally:
