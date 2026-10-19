@@ -9,6 +9,8 @@ opt-in.
 
 from __future__ import annotations
 
+from app.core.sdk_raster import guard_sdk_processor
+
 import logging
 import os
 from dataclasses import dataclass, replace
@@ -177,7 +179,7 @@ def _sdk_processor(*, raster_dpis: Sequence[int] | None = None) -> Any:
                 "the standalone platen_document package is not installed"
             ) from exc
         raise
-    processor = DocumentProcessor(EngineConfiguration(enable_scanned_table_recognition=True))
+    processor = guard_sdk_processor(DocumentProcessor, EngineConfiguration(enable_scanned_table_recognition=True), unavailable_error=PdfToMarkdownEngineUnavailableError)
     if raster_dpis is None:
         return processor
     from app.core.pdf_to_word_ocr_engine import _PageScopedRasterPreparer

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from app.core.ocr_v2.geometry import render_page_pixmap, raster_policy
+
 import logging
 import mimetypes
 import os
@@ -154,8 +156,7 @@ def is_tesseract_available() -> bool:
 
 
 def _render_page_image(page: fitz.Page, dpi: int = 300) -> Image.Image:
-    matrix = fitz.Matrix(dpi / 72.0, dpi / 72.0)
-    pix = page.get_pixmap(matrix=matrix, alpha=False)
+    pix = render_page_pixmap(page, dpi=dpi)
     return Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
 
 
@@ -463,7 +464,8 @@ def page_to_ocr_text(
     if cancellation_check:
         cancellation_check()
 
-    image = _render_page_image(page, dpi=dpi)
+    with raster_policy(None, cancellation_check):
+        image = _render_page_image(page, dpi=dpi)
 
     if cancellation_check:
         cancellation_check()
@@ -474,7 +476,8 @@ def page_to_ocr_text(
         cancellation_check()
 
     if _is_auto_lang_spec(lang):
-        preview = _render_page_preview(page)
+        with raster_policy(None, cancellation_check):
+            preview = _render_page_preview(page)
         if cancellation_check:
             cancellation_check()
         resolved_lang = _resolve_auto_lang_spec_from_text_and_image(

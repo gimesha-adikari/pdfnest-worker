@@ -7,6 +7,8 @@ standalone package's public ``DocumentProcessor`` API.
 
 from __future__ import annotations
 
+from app.core.sdk_raster import guard_sdk_processor
+
 import os
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -113,7 +115,7 @@ def _sdk_processor() -> Any:
                 "the standalone platen_document package is not installed"
             ) from exc
         raise
-    return DocumentProcessor()
+    return guard_sdk_processor(DocumentProcessor, unavailable_error=OCRTextEngineUnavailableError)
 
 
 def _execute_sdk(

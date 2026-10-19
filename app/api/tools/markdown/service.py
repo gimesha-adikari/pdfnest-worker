@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from app.core.ocr_v2.geometry import render_page_pixmap
+from app.core.ocr_v2.errors import RasterAdmissionError, ConfigurationError, OCRCancellationError
+
+
 import base64
 import logging
 from typing import Callable, Optional
@@ -272,7 +276,10 @@ def convert_pdf_to_markdown(
 
                 # OCR pass for SCANNED or MIXED pages
                 if classification in ("SCANNED", "MIXED"):
-                    pix = fitz_page.get_pixmap(dpi=150)
+                    pix = render_page_pixmap(fitz_page, dpi=150, cancellation_check=cancellation_check)
+                    # The historical dpi=150 call also set PNG resolution for
+                    # Tesseract. Matrix-based admission must retain that input.
+                    pix.set_dpi(150, 150)
                     # Accurate scaling factor from Pixmap pixel dimensions to PDF page points
                     scale_x = p_width / float(pix.width) if pix.width > 0 else 1.0
                     scale_y = p_height / float(pix.height) if pix.height > 0 else 1.0
@@ -348,7 +355,11 @@ def convert_pdf_to_markdown(
                 grouped_nodes = SemanticGrouper.process_page_nodes(all_page_nodes, p_width, p_height)
                 page_node.nodes = grouped_nodes
 
+            except (RasterAdmissionError, ConfigurationError, OCRCancellationError):
+                raise
             except Exception as page_exc:
+                if type(page_exc).__name__ == "JobCancelledException":
+                    raise
                 logger.error(f"Error processing page {page_idx + 1} of document '{input_path}': {page_exc}", exc_info=True)
                 raise RuntimeError(f"Conversion failed on page {page_idx + 1}: {page_exc}") from page_exc
 

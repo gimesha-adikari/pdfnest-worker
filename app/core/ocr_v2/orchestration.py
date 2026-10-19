@@ -23,8 +23,8 @@ from .contracts import (
     SourceMetadata,
     UnnormalizedPageOutput,
 )
-from .errors import LanguageDetectionUncertainError, OCRCancellationError, OCRTimeoutError
-from .geometry import RasterPreparer, page_geometry_from_pdf
+from .errors import ConfigurationError, RasterAdmissionError, LanguageDetectionUncertainError, OCRCancellationError, OCRTimeoutError
+from .geometry import RasterPreparer, page_geometry_from_pdf, effective_raster_limit, raster_policy
 from .language_policy import FusedLanguageDetector, LanguageDecisionStatus, OCRLanguageMode, OCRLanguagePolicy
 from .native import NativeDecision, NativeExtractor, NativeGeometryMode, NativeValidator
 from .normalization import normalize_page_output
@@ -65,7 +65,7 @@ class OCRV2Worker:
         self.native_extractor = native_extractor or NativeExtractor(geometry_mode=native_geometry_mode)
         self.native_validator = native_validator or NativeValidator()
         self.router = OCRRouter(self.adapters, route_policy)
-        self.max_raster_pixels = max_raster_pixels
+        self.max_raster_pixels = effective_raster_limit(max_raster_pixels)
         self.table_aware_ocr = table_aware_ocr
 
     def _native_output(self, candidate: object) -> UnnormalizedPageOutput:
@@ -142,9 +142,11 @@ class OCRV2Worker:
                         normalized = normalize_page_output(output, page_index=page_index, geometry=geometry, classification=decision.classification, processing_source=PageProcessingSource.NATIVE_EXTRACTION, language=LanguageMetadata(policy.languages, (), "REQUESTED", (), "NOT_DETECTED", policy.mode.value))
                     else:
                         route = self.router.plan(decision, profile)
-                        raster = self.raster_preparer.prepare(page)
+                        with raster_policy(self.max_raster_pixels, cancellation_check):
+                            raster = self.raster_preparer.prepare(page)
+                        _check(cancellation_check)
                         if self.max_raster_pixels is not None and raster.image.width * raster.image.height > self.max_raster_pixels:
-                            raise ValueError(
+                            raise RasterAdmissionError(
                                 f"page raster pixel count {raster.image.width * raster.image.height} "
                                 f"exceeds configured structured OCR limit {self.max_raster_pixels}"
                             )
@@ -219,7 +221,7 @@ class OCRV2Worker:
                     pages.append(checked)
                     page_result = checked
                     emit("PAGE_COMMIT_DONE", page_index=page_index, elapsed_seconds=time.monotonic() - started)
-                except OCRCancellationError:
+                except (RasterAdmissionError, ConfigurationError, OCRCancellationError):
                     raise
                 except Exception as exc:
                     # Preserve the worker's existing cooperative cancellation

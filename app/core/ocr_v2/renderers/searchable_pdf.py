@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -9,7 +11,8 @@ import pymupdf as fitz
 
 from ..contracts import DocumentResult
 from ..diagnostics import emit_searchable_diagnostic, safe_exception_message
-from ..errors import RenderingNotEligibleError
+from ..errors import ConfigurationError, RasterAdmissionError, OCRCancellationError, RenderingNotEligibleError
+from ..geometry import effective_raster_limit, estimate_raster
 from ..validation import OCRProfile, require_profile
 from .validation import validate_searchable_pdf_artifact
 
@@ -40,7 +43,26 @@ def _font_file_for_text(text: str) -> str | None:
 class SearchablePdfRenderer:
     """Add an invisible text layer; this class never performs OCR."""
 
+    def __init__(self, *, max_raster_pixels: int | None = None) -> None:
+        self.max_raster_pixels = effective_raster_limit(max_raster_pixels)
+
     def render(
+        self, source_pdf: str | Path, result: DocumentResult, output_pdf: str | Path,
+        *, job_id: str | None = None,
+    ) -> None:
+        # Only this owned sibling file is removed on failure. The destination
+        # (including a pre-existing file) is replaced only after all checks.
+        target = Path(output_pdf)
+        fd, name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".pdf", dir=target.parent)
+        os.close(fd)
+        staged = Path(name)
+        try:
+            self._render_staged(source_pdf, result, staged, job_id=job_id)
+            os.replace(staged, target)
+        finally:
+            staged.unlink(missing_ok=True)
+
+    def _render_staged(
         self,
         source_pdf: str | Path,
         result: DocumentResult,
@@ -125,11 +147,11 @@ class SearchablePdfRenderer:
         finally:
             document.close()
 
-        _log_output_metadata(target, job_id=job_id)
-        validate_searchable_pdf_artifact(source, target, checked, job_id=job_id)
+        _log_output_metadata(target, job_id=job_id, max_raster_pixels=self.max_raster_pixels)
+        validate_searchable_pdf_artifact(source, target, checked, job_id=job_id, max_raster_pixels=self.max_raster_pixels)
 
 
-def _log_output_metadata(output_pdf: Path, *, job_id: str | None) -> dict[str, Any] | None:
+def _log_output_metadata(output_pdf: Path, *, job_id: str | None, max_raster_pixels: int | None = None) -> dict[str, Any] | None:
     """Record safe output facts before the independent validator runs."""
     try:
         data = output_pdf.read_bytes()
@@ -141,6 +163,7 @@ def _log_output_metadata(output_pdf: Path, *, job_id: str | None) -> dict[str, A
         with fitz.open(str(output_pdf)) as document:
             metadata["page_count"] = len(document)
             for index, page in enumerate(document):
+                admission = estimate_raster(page, dpi=72, max_raster_pixels=max_raster_pixels)
                 image_info = page.get_image_info()
                 metadata["pages"].append(
                     {
@@ -151,12 +174,15 @@ def _log_output_metadata(output_pdf: Path, *, job_id: str | None) -> dict[str, A
                         "image_dimensions": [{"width": info.get("width"), "height": info.get("height")} for info in image_info],
                         "image_colorspaces": [info.get("cs-name") for info in image_info],
                         "extracted_word_count": len(page.get_text("words")),
-                        "raster_width": page.get_pixmap(alpha=False).width,
-                        "raster_height": page.get_pixmap(alpha=False).height,
+                        "raster_width": admission.width,
+                        "raster_height": admission.height,
+                        "raster_dimensions_estimated": True,
                     }
                 )
         emit_searchable_diagnostic(event="RENDER_OUTPUT_READY", job_id=job_id, substage="PDF_RENDER_SAVE", fields=metadata)
         return metadata
+    except (RasterAdmissionError, ConfigurationError, OCRCancellationError):
+        raise
     except Exception as exc:
         emit_searchable_diagnostic(
             event="RENDER_OUTPUT_METADATA_FAILED",
