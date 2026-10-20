@@ -15,8 +15,6 @@ jobs:
     name: Quality Gates & External Container Build
     runs-on: ubuntu-latest
     env:
-      UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/f11-sdk019-venv
-      F11_INSTALLED_ENV_ROOT: ${{ runner.temp }}/f11-sdk019-venv
       UV_CONCURRENT_DOWNLOADS: '1'
       UV_CONCURRENT_BUILDS: '1'
       UV_CONCURRENT_INSTALLS: '1'
@@ -41,6 +39,8 @@ jobs:
         run: python3 -m py_compile app/main.py
 
       - name: Install locked security-qualification dependencies
+        env:
+          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/f11-sdk019-venv
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-eng tesseract-ocr-sin tesseract-ocr-tam qpdf fonts-dejavu-core
@@ -52,6 +52,8 @@ jobs:
       - name: Qualify installed SDK and F-11 security boundaries
         env:
           APP_ENV: test
+          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/f11-sdk019-venv
+          F11_INSTALLED_ENV_ROOT: ${{ runner.temp }}/f11-sdk019-venv
         run: |
           unset PYTHONPATH F11_SDK_CANDIDATE_ROOT
           timeout 120s prlimit --as=1073741824 --cpu=90 -- "$UV_PROJECT_ENVIRONMENT/bin/python" - <<'PY'
