@@ -1,4 +1,4 @@
-"""Fail-closed SDK release boundary while the production pin remains 0.1.8."""
+"""Fail-closed SDK raster capability boundary for worker consumers."""
 from __future__ import annotations
 
 from functools import wraps
@@ -59,9 +59,9 @@ def guard_sdk_processor(
 ) -> Any:
     """Require the reviewed raster contract before constructing any SDK engine.
 
-    The unchanged 0.1.8 pin cannot satisfy this capability gate. Qualification
-    uses the accepted source candidate explicitly; no version/policy fallback
-    or automatic installation is performed here.
+    The installed SDK must supply the complete reviewed security contract.
+    Incapable packages (including 0.1.8) remain unavailable; no version/policy
+    fallback or automatic installation is performed here.
     """
     try:
         import platen_document as sdk

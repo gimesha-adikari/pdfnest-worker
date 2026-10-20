@@ -11,6 +11,7 @@ from __future__ import annotations
 from app.core.sdk_raster import guard_sdk_processor
 from app.core.ocr_v2.errors import RasterAdmissionError, ConfigurationError
 from app.core.ocr_v2.geometry import validate_raster_dpi
+from app.jobs.cancellation import JobCancelledException
 
 import logging
 import os
@@ -191,7 +192,7 @@ def _execute_sdk(
         else:
             processor = _sdk_processor(raster_dpi=raster_dpi)
         return processor.extract_document(pdf_path, language=language)
-    except (RasterAdmissionError, ConfigurationError, PdfToWordOcrEngineUnavailableError):
+    except (JobCancelledException, RasterAdmissionError, ConfigurationError, PdfToWordOcrEngineUnavailableError):
         raise
     except Exception as exc:
         # The worker service currently projects converter exceptions into the
