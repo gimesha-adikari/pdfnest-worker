@@ -1,12 +1,31 @@
 from __future__ import annotations
 
 import io
+from pathlib import Path
 
 import pymupdf as fitz
 from PIL import Image, ImageDraw, ImageFont
 
 from app.core.ocr_v2.contracts import OCRLine, OCRToken, PageContentClassification, PageGeometry, PageProcessingSource, PageResult, PageStatus, Rect
 from app.core.ocr_v2.structured import StructuredDocumentProcessor, StructuredElementType, _ocr_structured_elements, render_structured_markdown
+
+
+def _pdf_with_native_text(path: Path) -> None:
+    """Separate heading/body blocks with real native word geometry."""
+    with fitz.open() as document:
+        page = document.new_page(width=420, height=360)
+        page.insert_text((36, 48), "Document processing overview", fontsize=20, fontname="hebo")
+        remaining = page.insert_textbox(
+            fitz.Rect(36, 85, 384, 300),
+            "This native document describes a small document processing service. "
+            "The service preserves readable text and its word positions.\n\n"
+            "A second paragraph explains how reports keep their original content. "
+            "These sentences are ordinary prose without formulas or tabular data.",
+            fontsize=11,
+            fontname="helv",
+        )
+        assert remaining >= 0, "Native fixture body must fit on the page"
+        document.save(path)
 
 
 def _pdf_with_scanned_text(path) -> None:
@@ -23,13 +42,17 @@ def _pdf_with_scanned_text(path) -> None:
     document.close()
 
 
-def test_native_document_uses_native_structured_elements():
-    result = StructuredDocumentProcessor().process_document("/home/gimesha/My_Projects/platen/pdfnest/tests/fixtures/normal_text.pdf")
+def test_native_document_uses_native_structured_elements(tmp_path):
+    source = tmp_path / "native.pdf"
+    _pdf_with_native_text(source)
+    result = StructuredDocumentProcessor().process_document(str(source))
 
     assert result.schema_version == "ocr_v2_structured_document.v1"
     assert result.validation["valid"] is True
     assert all(page.processing_source == "NATIVE_EXTRACTION" for page in result.pages)
     assert any(element.type is StructuredElementType.HEADING for page in result.pages for element in page.elements)
+    assert any(element.type is StructuredElementType.PARAGRAPH for page in result.pages for element in page.elements)
+    assert "Document processing overview" in render_structured_markdown(result)
     assert "WORD_GEOMETRY" in result.capabilities
     assert "FORMULA_STRUCTURE_UNAVAILABLE_WITH_CURRENT_LOCAL_ENGINES" not in result.warnings
 
@@ -49,10 +72,14 @@ def test_scanned_document_uses_real_tesseract_structured_blocks(tmp_path):
     assert "Scanned" in render_structured_markdown(result)
 
 
-def test_structured_markdown_does_not_invent_unsupported_formula_or_table():
-    result = StructuredDocumentProcessor().process_document("/home/gimesha/My_Projects/platen/pdfnest/tests/fixtures/normal_text.pdf")
+def test_structured_markdown_does_not_invent_unsupported_formula_or_table(tmp_path):
+    source = tmp_path / "native.pdf"
+    _pdf_with_native_text(source)
+    result = StructuredDocumentProcessor().process_document(str(source))
     markdown = render_structured_markdown(result)
 
+    assert "Document processing overview" in markdown
+    assert "ordinary prose" in markdown
     assert "$$" not in markdown
     assert "| :---" not in markdown
 
@@ -128,10 +155,12 @@ def test_scanned_geometry_recovers_obvious_lists_but_not_numbered_prose():
 
 
 def test_mixed_document_keeps_native_and_scanned_page_paths(tmp_path):
+    native_pdf = tmp_path / "native.pdf"
+    _pdf_with_native_text(native_pdf)
     scanned_pdf = tmp_path / "scanned.pdf"
     _pdf_with_scanned_text(str(scanned_pdf))
     mixed_pdf = tmp_path / "mixed.pdf"
-    with fitz.open("/home/gimesha/My_Projects/platen/pdfnest/tests/fixtures/normal_text.pdf") as native_document, fitz.open(str(scanned_pdf)) as scanned_document, fitz.open() as mixed_document:
+    with fitz.open(native_pdf) as native_document, fitz.open(str(scanned_pdf)) as scanned_document, fitz.open() as mixed_document:
         mixed_document.insert_pdf(native_document, from_page=0, to_page=0)
         mixed_document.insert_pdf(scanned_document, from_page=0, to_page=0)
         mixed_document.save(str(mixed_pdf))

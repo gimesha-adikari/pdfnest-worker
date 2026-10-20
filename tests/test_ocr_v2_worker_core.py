@@ -19,6 +19,12 @@ from app.core.ocr_v2.routing import OCRRouter, RoutePolicy
 from app.core.ocr_v2.validation import validate_document
 
 
+def _ocr_font(size: int) -> ImageFont.FreeTypeFont:
+    path = Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
+    assert path.is_file(), "OCR fixtures require fonts-dejavu-core"
+    return ImageFont.truetype(str(path), size)
+
+
 def _scanned_pdf(path: Path) -> None:
     image = Image.new("RGB", (600, 400), "white")
     ImageDraw.Draw(image).text((40, 80), "Scanned Hello 123", fill="black")
@@ -240,7 +246,7 @@ def test_searchable_renderer_preserves_variable_page_geometry_and_reading_order(
         draw = ImageDraw.Draw(image)
         y = 40
         for text, font_size in lines:
-            font = ImageFont.truetype("/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf", font_size)
+            font = _ocr_font(font_size)
             draw.text((40, y), text, fill="black", font=font)
             y += font_size + 30
         path = tmp_path / f"variable-page-{index}.png"
@@ -283,7 +289,7 @@ def test_image_input_runs_tesseract_word_geometry_to_searchable_artifact(tmp_pat
     image_path = tmp_path / "input.png"
     image = Image.new("RGB", (1200, 800), "white")
     draw = ImageDraw.Draw(image)
-    font = ImageFont.truetype("/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf", 96)
+    font = _ocr_font(96)
     draw.text((120, 180), "Searchable Image 123", fill="black", stroke_width=1, font=font)
     image.save(image_path)
     source = tmp_path / "source.pdf"

@@ -11,6 +11,79 @@ import app.core.pdf_to_markdown_engine as engine
 from app.jobs.models import JobState
 
 
+def _scanned_table_pdf(path: Path) -> None:
+    """A ruled six-column table, embedded as pixels without a native text layer."""
+    rows = [
+        ["ID", "Name", "Q1", "Q2", "Q3", "Total"],
+        ["001", "Alice", "10", "15", "12", "37"],
+        ["002", "Bob", "8", "9", "11", "28"],
+        ["003", "Charlie", "20", "18", "22", "60"],
+        ["004", "Dave", "5", "5", "5", "15"],
+    ]
+    with fitz.open() as native:
+        # Retain the original table's cell/glyph spacing; crop only blank
+        # space below it so OCR still exercises the same exact cell values.
+        page = native.new_page(width=595, height=300)
+        for row_index in range(5):
+            for column in range(6):
+                x, y = 50 + column * 80, 70 + row_index * 40
+                page.draw_rect(fitz.Rect(x, y, x + 80, y + 40), color=(0, 0, 0), width=2)
+        for row_index, row in enumerate(rows):
+            for column, text in enumerate(row):
+                x, y = 50 + column * 80, 70 + row_index * 40
+                page.insert_text((x + 5, y + 25), text, fontsize=12, fontname="helv")
+        raster = page.get_pixmap(dpi=300, alpha=False)
+        width, height = raster.width, raster.height
+        assert width * height == 3_100_000
+        encoded = raster.tobytes("png")
+        del raster
+    with fitz.open() as document:
+        # The original scan uses one PDF point per source pixel. Preserve
+        # that adaptive-DPI path without its 8.7-million-pixel full-page image.
+        page = document.new_page(width=width, height=height)
+        page.insert_image(page.rect, stream=encoded)
+        assert not page.get_text().strip()
+        document.save(path)
+
+
+def _non_tabular_cv_pdf(path: Path) -> None:
+    """CV-style aligned dates, varied prose blocks and headings, without a grid."""
+    with fitz.open() as document:
+        page = document.new_page(width=600, height=450)
+        page.insert_text((40, 40), "Alex Example", fontsize=20, fontname="hebo")
+        page.insert_text((40, 68), "Software engineer and document processing specialist", fontsize=11)
+        page.insert_text((40, 105), "PROJECT EXPERIENCE", fontsize=14, fontname="hebo")
+        page.insert_text((40, 139), "2022 - 2024", fontsize=10)
+        page.insert_text((155, 139), "BankingSystem", fontsize=13, fontname="hebo")
+        remaining = page.insert_textbox(
+            fitz.Rect(155, 153, 555, 210),
+            "Built account services and reviewed transaction workflows. "
+            "Coordinated three services with authentication and clear error handling. "
+            "Documented recovery procedures for the engineering team.",
+            fontsize=11,
+        )
+        assert remaining >= 0
+        page.insert_text((40, 230), "2020 - 2022", fontsize=10)
+        page.insert_text((155, 230), "Document workflow platform", fontsize=13, fontname="hebo")
+        remaining = page.insert_textbox(
+            fitz.Rect(155, 245, 555, 310),
+            "Implemented searchable reports and accessible editing tools. "
+            "Worked with support teams to resolve document conversion problems "
+            "and improve the reliability of background processing.",
+            fontsize=11,
+        )
+        assert remaining >= 0
+        page.insert_text((40, 340), "SKILLS", fontsize=14, fontname="hebo")
+        remaining = page.insert_textbox(
+            fitz.Rect(40, 360, 555, 420),
+            "Python and SQL for service development. Practical experience with "
+            "document geometry, regression testing and operational documentation.",
+            fontsize=11,
+        )
+        assert remaining >= 0
+        document.save(path)
+
+
 def test_pdf_to_markdown_engine_defaults_to_internal(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv(engine.PDF_TO_MARKDOWN_ENGINE_ENV, raising=False)
 
@@ -80,12 +153,15 @@ def test_pdf_to_markdown_reuses_page_scoped_raster_preflight(
 def test_pdf_to_markdown_projects_original_scanned_table(
     monkeypatch: pytest.MonkeyPatch,
     selected: str,
+    tmp_path: Path,
 ) -> None:
-    source = Path("/home/gimesha/My_Projects/platen/benchmarks/ocr_eval/fixtures_generated/synth_table_scan.pdf")
+    source = tmp_path / "scanned-table.pdf"
+    _scanned_table_pdf(source)
     monkeypatch.setenv(engine.PDF_TO_MARKDOWN_ENGINE_ENV, selected)
 
     execution = engine.execute_pdf_to_markdown(source, language="eng", routing_policy="FAST")
 
+    assert execution.structured_result.pages[0].processing_source == "OCR_RECOGNITION"
     tables = [
         element
         for page in execution.structured_result.pages
@@ -111,12 +187,17 @@ def test_pdf_to_markdown_projects_original_scanned_table(
 def test_pdf_to_markdown_does_not_turn_mixed_cv_content_into_a_table(
     monkeypatch: pytest.MonkeyPatch,
     selected: str,
+    tmp_path: Path,
 ) -> None:
-    source = Path("/home/gimesha/My_Projects/platen/pdfnest/tests/fixtures/gimesha_cv.pdf")
+    source = tmp_path / "project-summary.pdf"
+    _non_tabular_cv_pdf(source)
     monkeypatch.setenv(engine.PDF_TO_MARKDOWN_ENGINE_ENV, selected)
 
     execution = engine.execute_pdf_to_markdown(source, language="eng", routing_policy="FAST")
 
+    assert execution.structured_result.pages[0].processing_source == "NATIVE_EXTRACTION"
+    assert "Document workflow platform" in execution.markdown
+    assert "regression testing" in execution.markdown
     assert all(
         getattr(element.type, "value", element.type) != "TABLE"
         for page in execution.structured_result.pages
