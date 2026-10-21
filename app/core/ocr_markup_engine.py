@@ -13,6 +13,8 @@ frozen internal implementation.
 
 from __future__ import annotations
 
+from app.core.sdk_raster import guard_sdk_processor
+
 import logging
 import math
 import os
@@ -148,7 +150,7 @@ def _sdk_processor() -> Any:
                 "the standalone platen_document package is not installed"
             ) from exc
         raise
-    return DocumentProcessor()
+    return guard_sdk_processor(DocumentProcessor, unavailable_error=OcrMarkupEngineUnavailableError)
 
 
 def _translate_sdk_error(exc: Exception) -> None:
@@ -420,7 +422,7 @@ def _preview_sdk(
 
     from platen_document import DocumentProcessor, OCRProfile
 
-    processor = DocumentProcessor()
+    processor = guard_sdk_processor(DocumentProcessor, unavailable_error=OcrMarkupEngineUnavailableError)
     try:
         result = processor.extract_text(
             input_path,

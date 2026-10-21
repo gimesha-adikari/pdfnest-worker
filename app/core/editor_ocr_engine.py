@@ -8,6 +8,8 @@ standalone SDK.
 
 from __future__ import annotations
 
+from app.core.sdk_raster import guard_sdk_processor
+
 import logging
 import os
 from pathlib import Path
@@ -96,7 +98,7 @@ def _sdk_processor() -> Any:
 
     # Match the current internal Editor V2 raster guard and keep the SDK route
     # Tesseract-only below, as the current editor contract requires.
-    return DocumentProcessor(EngineConfiguration(max_raster_pixels=25_000_000))
+    return guard_sdk_processor(DocumentProcessor, EngineConfiguration(max_raster_pixels=25_000_000), unavailable_error=EditorOcrEngineUnavailableError)
 
 
 def _sdk_profile() -> Any:

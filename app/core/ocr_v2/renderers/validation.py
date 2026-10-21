@@ -6,9 +6,11 @@ from pathlib import Path
 from typing import Any
 
 import pymupdf as fitz
+from app.jobs.cancellation import JobCancelledException
 
 from ..contracts import DocumentResult
-from ..errors import RenderingNotEligibleError
+from ..errors import ConfigurationError, RasterAdmissionError, OCRCancellationError, RenderingNotEligibleError
+from ..geometry import effective_raster_limit, estimate_raster, render_page_pixmap
 from ..diagnostics import emit_searchable_diagnostic
 
 
@@ -33,6 +35,7 @@ def validate_searchable_pdf_artifact(
     result: DocumentResult,
     *,
     job_id: str | None = None,
+    max_raster_pixels: int | None = None,
 ) -> dict[str, Any]:
     """Validate the durable PDF with a reader independent of the renderer.
 
@@ -41,6 +44,7 @@ def validate_searchable_pdf_artifact(
     searchable text layer.
     """
 
+    limit = effective_raster_limit(max_raster_pixels)
     source_path = Path(source_pdf)
     output_path = Path(output_pdf)
     source = None
@@ -120,27 +124,36 @@ def validate_searchable_pdf_artifact(
             if expected and " ".join(expected) not in " ".join(actual):
                 raise _validation_error("PDF_VALIDATE_READING_ORDER", "READING_ORDER_MISMATCH", f"artifact page {index} text layer is not extractable in reading order", job_id=job_id, page_index=index)
 
+            # Admit BOTH independently before either allocation. In particular,
+            # an unsafe output cannot trigger a source allocation first.
+            estimate_raster(source_page, dpi=72, max_raster_pixels=limit)
+            estimate_raster(output_page, dpi=72, max_raster_pixels=limit)
+            source_pixmap = output_pixmap = None
             try:
-                source_pixmap = source_page.get_pixmap(alpha=False)
-                output_pixmap = output_page.get_pixmap(alpha=False)
+                source_pixmap = render_page_pixmap(source_page, dpi=72, max_raster_pixels=limit)
+                output_pixmap = render_page_pixmap(output_page, dpi=72, max_raster_pixels=limit)
+                emit_searchable_diagnostic(
+                    event="VALIDATION_CHECK", job_id=job_id, substage="PDF_VALIDATE_VISUAL_RASTER",
+                    fields={
+                        "page_index": index,
+                        "source_raster_width": source_pixmap.width,
+                        "source_raster_height": source_pixmap.height,
+                        "output_raster_width": output_pixmap.width,
+                        "output_raster_height": output_pixmap.height,
+                    },
+                )
+                # samples_mv avoids two additional full native-buffer copies.
+                if ((source_pixmap.width, source_pixmap.height) != (output_pixmap.width, output_pixmap.height)
+                        or source_pixmap.samples_mv != output_pixmap.samples_mv):
+                    raise _validation_error("PDF_VALIDATE_VISUAL_RASTER", "VISIBLE_RASTER_MISMATCH", f"artifact page {index} visible appearance changed", job_id=job_id, page_index=index)
+            except (RasterAdmissionError, ConfigurationError, OCRCancellationError, JobCancelledException, RenderingNotEligibleError):
+                raise
             except Exception as exc:
                 raise _validation_error("PDF_VALIDATE_VISUAL_RASTER", "VISIBLE_RASTER_MISMATCH", f"artifact page {index} raster comparison failed", job_id=job_id, page_index=index) from exc
-            emit_searchable_diagnostic(
-                event="VALIDATION_CHECK",
-                job_id=job_id,
-                substage="PDF_VALIDATE_VISUAL_RASTER",
-                fields={
-                    "page_index": index,
-                    "source_raster_width": source_pixmap.width,
-                    "source_raster_height": source_pixmap.height,
-                    "output_raster_width": output_pixmap.width,
-                    "output_raster_height": output_pixmap.height,
-                },
-            )
-            if (source_pixmap.width, source_pixmap.height) != (output_pixmap.width, output_pixmap.height) or source_pixmap.samples != output_pixmap.samples:
-                raise _validation_error("PDF_VALIDATE_VISUAL_RASTER", "VISIBLE_RASTER_MISMATCH", f"artifact page {index} visible appearance changed", job_id=job_id, page_index=index)
+            finally:
+                source_pixmap = output_pixmap = None
         return {"page_count": len(output), "extracted_word_count": extracted_words, "visual_match": True}
-    except RenderingNotEligibleError:
+    except (RasterAdmissionError, ConfigurationError, OCRCancellationError, JobCancelledException, RenderingNotEligibleError):
         raise
     except Exception as exc:
         raise _validation_error("PDF_VALIDATE_OPEN", "OUTPUT_PDF_INVALID", "searchable PDF artifact could not be independently read", job_id=job_id) from exc

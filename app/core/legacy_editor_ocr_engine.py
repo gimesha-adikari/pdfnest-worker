@@ -7,6 +7,8 @@ EDITOR_OCR_ENGINE and from the Studio internal path.
 
 from __future__ import annotations
 
+from app.core.sdk_raster import guard_sdk_processor
+
 import logging
 import os
 import re
@@ -92,12 +94,14 @@ def _sdk_processor() -> Any:
 
     # The historical legacy Editor OCR rasterizes at 2x (144 DPI). Keep that
     # input raster contract while the SDK supplies canonical recognition.
-    return DocumentProcessor(
+    return guard_sdk_processor(
+        DocumentProcessor,
         EngineConfiguration(
             max_raster_pixels=25_000_000,
             raster_dpi=int(LEGACY_OCR_ZOOM * 72),
             raster_dpi_metadata_policy=RasterDpiMetadataPolicy.OMIT_DPI,
-        )
+        ),
+        unavailable_error=LegacyEditorOcrEngineUnavailableError,
     )
 
 

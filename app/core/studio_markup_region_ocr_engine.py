@@ -7,6 +7,8 @@ SDK only through its public region-markup API when explicitly selected.
 
 from __future__ import annotations
 
+from app.core.sdk_raster import guard_sdk_processor
+
 import logging
 import os
 from pathlib import Path
@@ -107,7 +109,7 @@ def _sdk_processor() -> Any:
                 "the standalone platen_document package is not installed"
             ) from exc
         raise
-    return DocumentProcessor(EngineConfiguration(max_raster_pixels=25_000_000))
+    return guard_sdk_processor(DocumentProcessor, EngineConfiguration(max_raster_pixels=25_000_000), unavailable_error=StudioMarkupRegionOcrEngineUnavailableError)
 
 
 def _sdk_public_types() -> tuple[Any, Any, Any, Any]:

@@ -21,6 +21,8 @@ from app.api.tools.ocr.router import create_route_cancellation_checker
 from app.core.ocr_v2.adapters import PPOCRv6MediumAdapter, TesseractAdapter
 from app.core.ocr_v2.errors import (
     EngineUnavailableError,
+    RasterAdmissionError,
+    ConfigurationError,
     LanguageDetectionUncertainError,
     OCRTimeoutError,
     WordGeometryUnavailableError,
@@ -306,6 +308,10 @@ async def ocr_text_v2(
             warnings.append("ENGINE_FALLBACK:PP_OCR_UNAVAILABLE_TO_TESSERACT")
         try:
             result = await _run_worker(path, contract, check_cancel)
+        except RasterAdmissionError as exc:
+            raise HTTPException(status_code=422, detail={"code": "INVALID_INPUT", "message": "Document raster exceeds safety limits"}) from exc
+        except ConfigurationError as exc:
+            raise HTTPException(status_code=500, detail={"code": "INVALID_CONFIGURATION", "message": "OCR raster configuration is invalid"}) from exc
         except JobCancelledException as exc:
             raise HTTPException(status_code=499, detail={"code": "CANCELLED", "message": "OCR V2 request was cancelled"}) from exc
         except OCRTextEngineConfigurationError as exc:
@@ -356,6 +362,10 @@ async def markup_preview(
         return OCRV2MarkupPreviewResponse(**result)
     except HTTPException:
         raise
+    except RasterAdmissionError as exc:
+        raise HTTPException(status_code=422, detail={"code": "INVALID_INPUT", "message": "Document raster exceeds safety limits"}) from exc
+    except ConfigurationError as exc:
+        raise HTTPException(status_code=500, detail={"code": "INVALID_CONFIGURATION", "message": "OCR raster configuration is invalid"}) from exc
     except JobCancelledException as exc:
         raise HTTPException(status_code=499, detail={"code": "CANCELLED", "message": "Selectable text preparation was cancelled"}) from exc
     except OcrMarkupEngineConfigurationError as exc:

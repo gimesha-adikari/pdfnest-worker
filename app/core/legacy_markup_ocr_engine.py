@@ -9,6 +9,9 @@ projection; PDFNest continues to own storage, rectangles, and PDF mutation.
 
 from __future__ import annotations
 
+from app.core.sdk_raster import guard_sdk_processor
+from app.core.ocr_v2.geometry import raster_policy
+
 import logging
 import os
 from pathlib import Path
@@ -17,7 +20,7 @@ from typing import Any, Callable, Mapping
 import pymupdf as fitz
 
 from app.api.tools.editor.document import is_valid_ocr_word
-from app.core.ocr_v2.errors import EngineUnavailableError, OCRTimeoutError
+from app.core.ocr_v2.errors import ConfigurationError, EngineUnavailableError, OCRTimeoutError, RasterAdmissionError
 from app.jobs.cancellation import JobCancelledException
 
 
@@ -111,12 +114,14 @@ def _sdk_processor() -> Any:
     # The historical legacy markup OCR helper renders at 2x (144 DPI) and
     # passes a PIL image without a resolution tag to Tesseract.  This is a
     # consumer-local compatibility choice; the SDK default remains unchanged.
-    return DocumentProcessor(
+    return guard_sdk_processor(
+        DocumentProcessor,
         EngineConfiguration(
             max_raster_pixels=25_000_000,
             raster_dpi=int(LEGACY_MARKUP_OCR_ZOOM * 72),
             raster_dpi_metadata_policy=RasterDpiMetadataPolicy.OMIT_DPI,
-        )
+        ),
+        unavailable_error=LegacyMarkupOcrEngineUnavailableError,
     )
 
 
@@ -242,7 +247,7 @@ def _sdk_execute(
             cancellation_check=cancellation_check,
             page_indices=affected_page_indices,
         )
-    except JobCancelledException:
+    except (JobCancelledException, RasterAdmissionError, ConfigurationError, LegacyMarkupOcrEngineUnavailableError):
         raise
     except Exception as exc:
         _translate_sdk_exception(exc)
@@ -287,15 +292,16 @@ def execute_legacy_markup(
     selected = configured_legacy_markup_ocr_engine()
     logger.info("LEGACY_MARKUP_ENGINE consumer=legacy_markup engine=%s", selected)
     if selected == "internal":
-        _historical_markup(
-            input_path=input_path,
-            output_path=output_path,
-            boxes=boxes,
-            action=action,
-            mode=mode,
-            password=password,
-            progress_callback=progress_callback,
-        )
+        with raster_policy(None, cancellation_check):
+            _historical_markup(
+                input_path=input_path,
+                output_path=output_path,
+                boxes=boxes,
+                action=action,
+                mode=mode,
+                password=password,
+                progress_callback=progress_callback,
+            )
         return {"engine": "internal", "ocr_passes": 1 if str(mode).lower() in {"smart", "ocr"} else 0}
     return _sdk_execute(
         input_path,

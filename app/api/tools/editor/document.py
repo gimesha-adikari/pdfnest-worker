@@ -1,3 +1,5 @@
+from app.core.ocr_v2.geometry import render_page_pixmap, validate_raster_dpi, raster_policy
+from app.core.ocr_v2.errors import ConfigurationError
 import difflib
 import io
 import json
@@ -116,12 +118,12 @@ def sample_background_hex(page: fitz.Page, rect: fitz.Rect) -> str:
             continue
 
         try:
-            pix = page.get_pixmap(clip=clip, matrix=fitz.Matrix(1, 1), alpha=False)
+            pix = render_page_pixmap(page, clip=clip, dpi=72)
             if pix.samples and len(pix.samples) >= 3:
                 r, g, b = pix.samples[0], pix.samples[1], pix.samples[2]
                 if r > 220 and g > 220 and b > 220:
                     samples.append((r, g, b))
-        except fitz.FitzError:
+        except (RuntimeError, fitz.FileDataError):
             continue
 
     if not samples:
@@ -194,7 +196,12 @@ def is_valid_ocr_word(text: str, conf: float) -> bool:
 
 
 def ocr_words_for_page(page: fitz.Page, zoom: float = 2.0, lang: str = "eng") -> Tuple[list[dict[str, Any]], Image.Image]:
-    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+    if isinstance(zoom, bool) or not isinstance(zoom, (int, float)):
+        raise ConfigurationError("editor raster scale must correspond to an integer DPI")
+    dpi = zoom * 72
+    if not isinstance(dpi, (int, float)) or not (1 <= dpi <= 600) or int(dpi) != dpi:
+        raise ConfigurationError("editor raster scale must correspond to an integer DPI from 1 to 600")
+    pix = render_page_pixmap(page, dpi=validate_raster_dpi(int(dpi)))
     image = pixmap_to_image(pix)
     del pix
 
@@ -409,7 +416,8 @@ def extract_document(
             if len(page.get_text("words") or []) > 0:
                 pages.append(extract_native_page(page, i + 1))
             else:
-                pages.append(extract_ocr_page(page, i + 1))
+                with raster_policy(None, cancellation_check):
+                    pages.append(extract_ocr_page(page, i + 1))
         return {"success": True, "pages": pages}
 
 
@@ -976,7 +984,7 @@ def compile_document(
                     page.apply_redactions()
 
                 zoom = 2.0
-                pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+                pix = render_page_pixmap(page, dpi=144, cancellation_check=cancellation_check)
                 img = pixmap_to_image(pix)
                 draw = ImageDraw.Draw(img)
 

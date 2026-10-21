@@ -8,6 +8,11 @@ processor remains the default; the standalone SDK is an explicit opt-in.
 
 from __future__ import annotations
 
+from app.core.sdk_raster import guard_sdk_processor
+from app.core.ocr_v2.errors import RasterAdmissionError, ConfigurationError
+from app.core.ocr_v2.geometry import validate_raster_dpi
+from app.jobs.cancellation import JobCancelledException
+
 import logging
 import os
 from pathlib import Path
@@ -37,7 +42,8 @@ class _PageScopedRasterPreparer:
     """Select one cached raster preparer for each PDF page's target DPI."""
 
     def __init__(self, raster_dpis: Sequence[int], factory: Callable[[int], Any]) -> None:
-        normalized = tuple(int(dpi) for dpi in raster_dpis)
+        from app.core.ocr_v2.geometry import validate_raster_dpi
+        normalized = tuple(validate_raster_dpi(dpi) for dpi in raster_dpis)
         if not normalized or any(dpi <= 0 for dpi in normalized):
             raise ValueError("raster_dpis must contain only positive DPI values")
         self.raster_dpis = normalized
@@ -119,11 +125,12 @@ def _sdk_processor(
             ) from exc
         raise
     if raster_dpi is not None:
-        return DocumentProcessor(EngineConfiguration(
+        validate_raster_dpi(raster_dpi)
+        return guard_sdk_processor(DocumentProcessor, EngineConfiguration(
             raster_dpi=raster_dpi,
             enable_scanned_table_recognition=True,
-        ))
-    processor = DocumentProcessor(EngineConfiguration(enable_scanned_table_recognition=True))
+        ), unavailable_error=PdfToWordOcrEngineUnavailableError)
+    processor = guard_sdk_processor(DocumentProcessor, EngineConfiguration(enable_scanned_table_recognition=True), unavailable_error=PdfToWordOcrEngineUnavailableError)
     if raster_dpis is None:
         return processor
 
@@ -185,7 +192,7 @@ def _execute_sdk(
         else:
             processor = _sdk_processor(raster_dpi=raster_dpi)
         return processor.extract_document(pdf_path, language=language)
-    except PdfToWordOcrEngineUnavailableError:
+    except (JobCancelledException, RasterAdmissionError, ConfigurationError, PdfToWordOcrEngineUnavailableError):
         raise
     except Exception as exc:
         # The worker service currently projects converter exceptions into the

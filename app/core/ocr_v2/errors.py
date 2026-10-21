@@ -11,6 +11,10 @@ class ConfigurationError(OCRV2Error, ValueError):
     pass
 
 
+class RasterAdmissionError(OCRV2Error, ValueError):
+    """Document-fatal rejection of unsafe raster geometry or allocation size."""
+
+
 class EngineUnavailableError(OCRV2Error):
     pass
 

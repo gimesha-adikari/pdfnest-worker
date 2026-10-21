@@ -7,6 +7,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from app.core.ocr_v2.errors import RasterAdmissionError, ConfigurationError
+from app.core.ocr_v2.geometry import raster_policy
+
 import dramatiq
 from dramatiq.errors import Retry
 import pymupdf as fitz
@@ -117,6 +120,17 @@ def _cleanup_input_objects(keys: list[str]) -> None:
             delete_object(key)
         except Exception:
             logger.warning("OCR V2 input cleanup failed for key %s", key, exc_info=True)
+
+
+def _record_raster_failure(job_id: str, exc: Exception) -> None:
+    """Use existing public classifications; never publish input/exception details."""
+    invalid_config = isinstance(exc, ConfigurationError)
+    message = "OCR raster configuration is invalid" if invalid_config else "Document raster exceeds safety limits"
+    update_job(
+        job_id, status=JobState.failed, finished_at=datetime.now(timezone.utc),
+        current_page=None, error_code="INVALID_CONFIGURATION" if invalid_config else "INVALID_INPUT",
+        error=message, message=message,
+    )
 
 
 def _searchable_failure_code(exc: Exception, stage: str) -> str:
@@ -359,6 +373,9 @@ def ocr_v2_job(
                 result={"artifact_key": result_key, "artifact_name": f"{Path(source_name or 'document').stem}.json"},
                 message="OCR V2 job completed with page failures",
             )
+    except (RasterAdmissionError, ConfigurationError) as exc:
+        _record_raster_failure(job_id, exc)
+        return
     except JobCancelledException:
         update_job(
             job_id,
@@ -541,6 +558,9 @@ def _run_searchable_pdf_job(
         upload_path(output_pdf, result_key, content_type="application/pdf")
         size = Path(output_pdf).stat().st_size
         update_job(job_id, status=JobState.succeeded, finished_at=datetime.now(timezone.utc), progress=100, total_pages=len(result.pages), completed_pages=len(result.pages), failed_pages=[], current_page=None, page_statuses={str(page.page_index): page.status.value for page in result.pages}, result={"artifact_key": result_key, "artifact_name": f"{Path(source_name or 'document').stem}-searchable.pdf", "artifact_content_type": "application/pdf", "artifact_size": size}, message="Searchable PDF V2 job completed")
+    except (RasterAdmissionError, ConfigurationError) as exc:
+        _record_raster_failure(job_id, exc)
+        return
     except JobCancelledException:
         update_job(job_id, status=JobState.cancelled, finished_at=datetime.now(timezone.utc), current_page=None, error_code="CANCELLED", message="Searchable PDF V2 job cancelled")
     except SearchablePdfEngineConfigurationError:
@@ -717,6 +737,9 @@ def _run_structured_document_job(
             )
         else:
             update_job(job_id, status=JobState.failed, finished_at=datetime.now(timezone.utc), progress=100, total_pages=len(result.pages), completed_pages=sum(page.status in {"SUCCESS", "BLANK"} for page in result.pages), failed_pages=[page.page_index for page in result.pages if page.status not in {"SUCCESS", "BLANK"}], current_page=None, page_statuses=page_statuses, warnings=list(result.warnings), error="Structured document result did not pass validation.", error_code="STRUCTURED_OUTPUT_INVALID", result={"artifact_key": result_key, "artifact_name": f"{Path(source_name or 'document').stem}.json", "artifact_content_type": "application/json"}, message=f"{profile} validation failed")
+    except (RasterAdmissionError, ConfigurationError) as exc:
+        _record_raster_failure(job_id, exc)
+        return
     except JobCancelledException:
         update_job(job_id, status=JobState.cancelled, finished_at=datetime.now(timezone.utc), current_page=None, error_code="CANCELLED", message=f"{profile} job cancelled")
     except DocumentExtractionEngineConfigurationError:
@@ -753,6 +776,9 @@ def editor_extract_job(
 
     try:
         check_cancellation(job_id)
+    except (RasterAdmissionError, ConfigurationError) as exc:
+        _record_raster_failure(job_id, exc)
+        return
     except JobCancelledException as exc:
         logger.info("Editor extract job %s cancelled before start: %s", job_id, exc)
         update_job(job_id, status=JobState.cancelled, finished_at=datetime.now(timezone.utc), message="Job cancelled")
@@ -830,6 +856,9 @@ def editor_extract_job(
             result=result,
             message="OCR V2 editor extraction completed" if ocr_v2 else "Editor extraction completed",
         )
+    except (RasterAdmissionError, ConfigurationError) as exc:
+        _record_raster_failure(job_id, exc)
+        return
     except JobCancelledException as exc:
         logger.info("Editor extract job %s cancelled: %s", job_id, exc)
         update_job(
@@ -896,6 +925,9 @@ def editor_compile_job(
 
     try:
         check_cancellation(job_id)
+    except (RasterAdmissionError, ConfigurationError) as exc:
+        _record_raster_failure(job_id, exc)
+        return
     except JobCancelledException as exc:
         logger.info("Editor compile job %s cancelled before start: %s", job_id, exc)
         update_job(job_id, status=JobState.cancelled, finished_at=datetime.now(timezone.utc), message="Job cancelled")
@@ -945,6 +977,9 @@ def editor_compile_job(
             },
             message="Editor compile completed",
         )
+    except (RasterAdmissionError, ConfigurationError) as exc:
+        _record_raster_failure(job_id, exc)
+        return
     except JobCancelledException as exc:
         logger.info("Editor compile job %s cancelled: %s", job_id, exc)
         update_job(
@@ -1041,6 +1076,9 @@ def _run_markup_v2_job(
         result_key = f"jobs/ocr_v2/markup/{action}/{job_id}.json"
         upload_text(json.dumps(metadata, ensure_ascii=False), result_key)
         update_job(job_id, status=JobState.succeeded, finished_at=datetime.now(timezone.utc), progress=100, total_pages=execution.page_count, completed_pages=execution.page_count, current_page=None, page_statuses={str(index): "SUCCESS" for index in range(execution.page_count)}, result={"artifact_key": output_key, "artifact_name": artifact_name, "artifact_content_type": "application/pdf", "metadata_key": result_key, "action": action}, message="OCR-aware markup completed")
+    except (RasterAdmissionError, ConfigurationError) as exc:
+        _record_raster_failure(job_id, exc)
+        return
     except JobCancelledException:
         update_job(job_id, status=JobState.cancelled, finished_at=datetime.now(timezone.utc), error_code="CANCELLED", message="OCR-aware markup cancelled")
     except Exception as exc:
@@ -1083,6 +1121,9 @@ def _run_markup_job(
 
     try:
         check_cancellation(job_id)
+    except (RasterAdmissionError, ConfigurationError) as exc:
+        _record_raster_failure(job_id, exc)
+        return
     except JobCancelledException as exc:
         logger.info("Markup job %s cancelled before start: %s", job_id, exc)
         update_job(job_id, status=JobState.cancelled, finished_at=datetime.now(timezone.utc), message="Job cancelled")
@@ -1159,15 +1200,16 @@ def _run_markup_job(
                 studio_processing_summary = dict(processing_summary)
                 studio_processing_engine = str(studio_processing_summary.pop("engine", "unknown"))
         else:
-            process_markup_pdf(
-                input_path=input_path,
-                output_path=output_pdf_path,
-                boxes=boxes,
-                action=action,  # type: ignore[arg-type]
-                mode=mode,      # type: ignore[arg-type]
-                password=file_password,
-                progress_callback=on_progress,
-            )
+            with raster_policy(None, lambda: check_cancellation(job_id)):
+                process_markup_pdf(
+                    input_path=input_path,
+                    output_path=output_pdf_path,
+                    boxes=boxes,
+                    action=action,  # type: ignore[arg-type]
+                    mode=mode,      # type: ignore[arg-type]
+                    password=file_password,
+                    progress_callback=on_progress,
+                )
         check_cancellation(job_id)
 
         output_key = build_key(f"jobs/markup/{action}/output", suffix=".pdf")
@@ -1196,6 +1238,9 @@ def _run_markup_job(
             },
             message=f"{action.title()} job completed",
         )
+    except (RasterAdmissionError, ConfigurationError) as exc:
+        _record_raster_failure(job_id, exc)
+        return
     except JobCancelledException as exc:
         logger.info("Markup job %s cancelled: %s", job_id, exc)
         update_job(
@@ -1310,6 +1355,9 @@ def pdf_to_markdown_job(
             },
             message="PDF to Markdown conversion completed",
         )
+    except (RasterAdmissionError, ConfigurationError) as exc:
+        _record_raster_failure(job_id, exc)
+        return
     except JobCancelledException as exc:
         logger.info("PDF to Markdown job %s cancelled: %s", job_id, exc)
         update_job(

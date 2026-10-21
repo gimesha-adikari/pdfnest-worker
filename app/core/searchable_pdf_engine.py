@@ -9,6 +9,9 @@ produce the same canonical result before the application marks the job done.
 
 from __future__ import annotations
 
+from app.core.sdk_raster import guard_sdk_processor
+from app.core.ocr_v2.geometry import raster_policy
+
 import logging
 import os
 from pathlib import Path
@@ -91,7 +94,7 @@ def _sdk_processor() -> Any:
                 "the standalone platen_document package is not installed"
             ) from exc
         raise
-    return DocumentProcessor()
+    return guard_sdk_processor(DocumentProcessor, unavailable_error=SearchablePdfEngineUnavailableError)
 
 
 def _sdk_profile() -> Any:
@@ -148,7 +151,8 @@ def _execute_internal(
     )
     if after_ocr is not None:
         after_ocr(result)
-    _internal_renderer().render(source_pdf, result, output_pdf, job_id=diagnostic_job_id)
+    with raster_policy(None, cancellation_check):
+        _internal_renderer().render(source_pdf, result, output_pdf, job_id=diagnostic_job_id)
     return result
 
 
@@ -192,12 +196,13 @@ def _execute_sdk(
     try:
         # Supplying the already extracted result is essential: this is a
         # render-only second call, not a second OCR pass.
-        processor.make_searchable_pdf(
-            source_pdf,
-            output_pdf,
-            result=result,
-            job_id=diagnostic_job_id,
-        )
+        with raster_policy(None, cancellation_check):
+            processor.make_searchable_pdf(
+                source_pdf,
+                output_pdf,
+                result=result,
+                job_id=diagnostic_job_id,
+            )
     except Exception as exc:
         _raise_sdk_exception(exc)
     return result

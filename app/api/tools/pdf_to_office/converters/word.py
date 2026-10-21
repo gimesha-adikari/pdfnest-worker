@@ -8,6 +8,9 @@ from typing import Any
 import fitz
 from docx import Document
 
+from app.core.ocr_v2.geometry import estimate_raster
+from app.core.ocr_v2.errors import RasterAdmissionError
+from app.core.ocr_v2.structured import structured_max_raster_pixels
 from app.core.ocr_v2.native import NativeDecision, NativeExtractor, NativeValidator
 from app.core.subprocess_runner import run_hardened_subprocess
 from app.core.pdf_to_word_ocr_engine import (
@@ -18,10 +21,7 @@ from app.core.pdf_to_word_ocr_engine import (
 
 PDF_TO_WORD_DEFAULT_RASTER_DPI = 200
 PDF_TO_WORD_TIMEOUT_SECONDS = 300
-# The SDK's structured pixel guard runs after PyMuPDF and Pillow have already
-# materialized the raster.  Keep this PDF-to-Word-only preflight below the
-# worker's 1 GiB production ceiling, leaving room for the service and OCR
-# runtime around the raster itself.
+# Adaptive OCR DPI uses the same conservative admission as final rendering.
 PDF_TO_WORD_MAX_RASTER_PIXELS = 10_000_000
 _FULL_PAGE_IMAGE_AREA_RATIO = 0.95
 
@@ -85,27 +85,35 @@ def _requires_structured_ocr(pdf_path: str) -> bool:
 
 
 def _raster_pixel_count(page: Any, dpi: int) -> int:
-    scale = dpi / 72.0
-    width = max(1, math.ceil(float(page.rect.width) * scale))
-    height = max(1, math.ceil(float(page.rect.height) * scale))
-    return width * height
+    admission = estimate_raster(
+        page, dpi=dpi,
+        max_raster_pixels=min(PDF_TO_WORD_MAX_RASTER_PIXELS, structured_max_raster_pixels()),
+    )
+    return admission.width * admission.height
 
 
 def _max_safe_page_raster_dpi(page: Any) -> int:
-    """Find the highest pre-render DPI within the PDF-to-Word pixel budget."""
+    """Find the highest safe DPI using the final native admission contract."""
+    # Invalid geometry or no safe minimum is a fatal typed rejection.
+    _raster_pixel_count(page, 1)
 
-    if _raster_pixel_count(page, 1) > PDF_TO_WORD_MAX_RASTER_PIXELS:
-        raise ValueError("PDF-to-Word page is too large for safe rasterization")
-    if _raster_pixel_count(page, PDF_TO_WORD_DEFAULT_RASTER_DPI) <= PDF_TO_WORD_MAX_RASTER_PIXELS:
+    def admitted(dpi: int) -> bool:
+        try:
+            _raster_pixel_count(page, dpi)
+        except RasterAdmissionError:
+            return False
+        return True
+
+    if admitted(PDF_TO_WORD_DEFAULT_RASTER_DPI):
         return PDF_TO_WORD_DEFAULT_RASTER_DPI
-
     lower, upper = 1, PDF_TO_WORD_DEFAULT_RASTER_DPI
     while lower < upper:
         candidate = (lower + upper + 1) // 2
-        if _raster_pixel_count(page, candidate) <= PDF_TO_WORD_MAX_RASTER_PIXELS:
+        if admitted(candidate):
             lower = candidate
         else:
             upper = candidate - 1
+    _raster_pixel_count(page, lower)
     return lower
 
 
@@ -140,6 +148,7 @@ def _page_pdf_to_word_raster_dpi(page: Any) -> int:
         source_dpi = _full_page_image_source_dpi(page)
         if source_dpi is not None:
             page_dpi = min(page_dpi, max(1, math.floor(source_dpi)))
+    _raster_pixel_count(page, page_dpi)
     return page_dpi
 
 

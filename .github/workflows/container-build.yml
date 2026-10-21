@@ -8,12 +8,22 @@ on:
 
 permissions:
   contents: read
-  packages: write
 
 jobs:
   test-and-build:
     name: Quality Gates & External Container Build
     runs-on: ubuntu-latest
+    env:
+      UV_CONCURRENT_DOWNLOADS: '1'
+      UV_CONCURRENT_BUILDS: '1'
+      UV_CONCURRENT_INSTALLS: '1'
+      RAYON_NUM_THREADS: '1'
+      TOKIO_WORKER_THREADS: '1'
+      MALLOC_ARENA_MAX: '2'
+      PYTHONDONTWRITEBYTECODE: '1'
+      PYTEST_DISABLE_PLUGIN_AUTOLOAD: '1'
+      OPENBLAS_NUM_THREADS: '1'
+      OMP_NUM_THREADS: '1'
 
     steps:
       - name: Checkout Source Code
@@ -27,16 +37,96 @@ jobs:
       - name: Run Python Syntax Check
         run: python3 -m py_compile app/main.py
 
+      - name: Install locked security-qualification dependencies
+        env:
+          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/f11-sdk019-venv
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-eng tesseract-ocr-sin tesseract-ocr-tam qpdf fonts-dejavu-core
+          python -m pip install --no-cache-dir uv==0.11.28
+          uv lock --check --offline
+          uv sync --frozen --no-install-project
+          uv pip check --python "$UV_PROJECT_ENVIRONMENT/bin/python"
+
+      - name: Qualify installed SDK and F-11 security boundaries
+        env:
+          APP_ENV: test
+          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/f11-sdk019-venv
+          F11_INSTALLED_ENV_ROOT: ${{ runner.temp }}/f11-sdk019-venv
+        run: |
+          unset PYTHONPATH F11_SDK_CANDIDATE_ROOT
+          timeout 120s prlimit --as=1073741824 --cpu=90 -- "$UV_PROJECT_ENVIRONMENT/bin/python" - <<'PY'
+          import importlib.metadata
+          import os
+          from pathlib import Path
+          import sys
+          import sysconfig
+          import tomllib
+
+          import platen_document
+          import pytest
+
+          assert sys.version_info[:2] == (3, 12)
+          assert Path(sys.prefix).resolve() == Path(os.environ["F11_INSTALLED_ENV_ROOT"]).resolve()
+          assert importlib.metadata.version("platen-document") == "0.1.9"
+          expected = Path(sysconfig.get_path("purelib")) / "platen_document/__init__.py"
+          assert Path(platen_document.__file__).resolve() == expected.resolve()
+          assert expected.resolve().is_relative_to(Path(sys.prefix).resolve())
+          lock = tomllib.loads(Path("uv.lock").read_text())
+          sdk = next(package for package in lock["package"] if package["name"] == "platen-document")
+          assert sdk["version"] == "0.1.9"
+          assert sdk["sdist"]["hash"] == "sha256:74634f3e23dda9ed1740e1a840e263db47ab255a6a431ade8fe7bdff5d2f90f1"
+          assert [wheel["hash"] for wheel in sdk["wheels"]] == ["sha256:70919a01664643b7b5e95d38d893b61b326b9e57bb0a0ddadf79d135c214e21b"]
+          print("Installed SDK:", importlib.metadata.version("platen-document"), platen_document.__file__)
+
+          class NoMandatorySkips:
+              def __init__(self):
+                  self.skipped = []
+
+              def pytest_collectreport(self, report):
+                  if report.skipped:
+                      self.skipped.append(report.nodeid)
+
+              def pytest_runtest_logreport(self, report):
+                  if report.skipped:
+                      self.skipped.append(report.nodeid)
+
+          # Fake hostile pages and selector failures run first. Only the
+          # designated small native fixtures follow; no load/stress suites.
+          files = [
+              "tests/test_raster_sdk_boundary.py",
+              "tests/test_raster_admission.py",
+              "tests/test_raster_geometry_contract.py",
+              "tests/test_raster_public_contract.py",
+              "tests/test_ocr_v2_worker_core.py",
+              "tests/test_structured_ocr.py",
+              "tests/test_ocr_v2_markup.py",
+              "tests/test_ocr_text_engine_boundary.py",
+              "tests/test_document_extraction_engine_boundary.py",
+              "tests/test_searchable_pdf_engine_boundary.py",
+              "tests/test_ocr_markup_engine_boundary.py",
+              "tests/test_editor_ocr_engine_boundary.py",
+              "tests/test_legacy_editor_ocr_engine.py",
+              "tests/test_legacy_markup_ocr_engine.py",
+              "tests/test_studio_editor_extraction_engine.py",
+              "tests/test_studio_markup_region_ocr_engine.py",
+              "tests/test_pdf_to_markdown_engine_boundary.py",
+              "tests/test_pdf_to_word_ocr_engine.py",
+              "tests/test_studio_editor_compile_geometry.py",
+              "tests/test_ocr_cancellation.py::test_extract_text_cancellation_before_start",
+              "tests/test_ocr_cancellation.py::test_extract_text_cancellation_during_ocr",
+              "tests/test_pdf_to_word_parallelism.py::test_ordinary_page_keeps_existing_raster_default",
+              "tests/test_pdf_to_word_parallelism.py::test_scanned_pdf_to_word_uses_structured_ocr_v2",
+          ]
+          gate = NoMandatorySkips()
+          result = pytest.main(["-q", "--tb=short", "-p", "no:cacheprovider", *files], plugins=[gate])
+          if gate.skipped:
+              raise SystemExit("Mandatory security tests skipped: " + ", ".join(gate.skipped))
+          raise SystemExit(result)
+          PY
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GitHub Container Registry (GHCR)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
 
       # Image 1: Worker Web API (Dockerfile)
       - name: Extract Metadata for Worker Web API
@@ -48,12 +138,12 @@ jobs:
             type=raw,value=${{ github.sha }}
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
 
-      - name: Build & Push Worker Web API Container Image
+      - name: Build Worker Web API Container Image
         uses: docker/build-push-action@v5
         with:
           context: .
           file: ./Dockerfile
-          push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          push: false
           tags: ${{ steps.meta-api.outputs.tags }}
           labels: ${{ steps.meta-api.outputs.labels }}
           cache-from: type=gha
@@ -69,12 +159,12 @@ jobs:
             type=raw,value=${{ github.sha }}
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
 
-      - name: Build & Push Dramatiq Task Actor Container Image
+      - name: Build Dramatiq Task Actor Container Image
         uses: docker/build-push-action@v5
         with:
           context: .
           file: ./Dockerfile.worker
-          push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          push: false
           tags: ${{ steps.meta-actor.outputs.tags }}
           labels: ${{ steps.meta-actor.outputs.labels }}
           cache-from: type=gha
