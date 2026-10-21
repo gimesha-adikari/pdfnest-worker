@@ -96,6 +96,8 @@ jobs:
           files = [
               "tests/test_raster_sdk_boundary.py",
               "tests/test_raster_admission.py",
+              "tests/test_gateway_protocol.py",
+              "tests/test_gateway_forwarding.py",
               "tests/test_raster_geometry_contract.py",
               "tests/test_raster_public_contract.py",
               "tests/test_ocr_v2_worker_core.py",
