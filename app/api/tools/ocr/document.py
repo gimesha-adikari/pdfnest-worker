@@ -851,7 +851,8 @@ def build_searchable_pdf_from_r2_images(
             download_to_path(key, str(local_path))
             temp_paths.append(str(local_path))
 
-        build_searchable_pdf_from_images(temp_paths, output_path, lang=lang, cancellation_check=cancellation_check)
+        from app.core.native_operations import build_searchable_pdf_from_images as isolated_build
+        isolated_build(temp_paths, output_path, lang=lang, cancellation_check=cancellation_check)
 
 
 def safe_suffix(filename: str | None, fallback: str = ".bin") -> str:

@@ -14,10 +14,10 @@ import dramatiq
 from dramatiq.errors import Retry
 import pymupdf as fitz
 
-from app.api.tools.editor.document import compile_document, extract_document, extract_document_v2
+from app.core.native_operations import compile_document, extract_document, extract_document_v2
 from app.api.tools.editor.utils import cleanup_paths, temp_file_path
-from app.api.tools.markup.document import process_markup_pdf
-from app.api.tools.markdown.service import convert_pdf_to_markdown
+from app.core.native_operations import process_markup_pdf
+from app.core.native_operations import convert_pdf_to_markdown
 from app.core.broker import broker  # noqa: F401
 from app.core.config import validate_runtime_config
 from app.core.ocr_v2.diagnostics import emit_searchable_diagnostic, retain_failed_render_artifacts, safe_exception_message
@@ -26,53 +26,43 @@ from app.core.ocr_v2.errors import MarkupError, TextNotFoundError, WordGeometryU
 from app.core.ocr_text_engine import (
     OCRTextEngineConfigurationError,
     OCRTextEngineUnavailableError,
-    execute_ocr_text,
 )
 from app.core.searchable_pdf_engine import (
     SearchablePdfEngineConfigurationError,
     SearchablePdfEngineUnavailableError,
-    execute_searchable_pdf,
 )
 from app.core.document_extraction_engine import (
     DocumentExtractionEngineConfigurationError,
     DocumentExtractionEngineUnavailableError,
-    execute_document_extraction,
 )
 from app.core.pdf_to_markdown_engine import (
     PdfToMarkdownEngineConfigurationError,
     PdfToMarkdownEngineUnavailableError,
-    execute_pdf_to_markdown,
 )
 from app.core.ocr_markup_engine import (
     OcrMarkupEngineConfigurationError,
     OcrMarkupEngineUnavailableError,
-    execute_ocr_markup,
 )
 from app.core.editor_ocr_engine import (
     EDITOR_OCR_CONSUMER_GENERAL_EDITOR,
     EditorOcrEngineConfigurationError,
-    execute_editor_ocr,
 )
 from app.core.studio_editor_extraction_engine import (
     STUDIO_EDITOR_EXTRACTION_CONSUMER,
     StudioEditorExtractionEngineConfigurationError,
-    execute_studio_editor_extraction,
 )
 from app.core.editor_language import EditorLanguageConfigurationError, EditorLanguageRequiredError
 from app.core.studio_markup_region_ocr_engine import (
     StudioMarkupRegionOcrEngineConfigurationError,
-    execute_studio_markup_region_ocr,
 )
 from app.core.studio_markup_telemetry import emit_studio_markup_processing_summary
 from app.core.legacy_editor_ocr_engine import (
     LEGACY_EDITOR_CONSUMER,
     LegacyEditorOcrEngineConfigurationError,
-    execute_legacy_editor_ocr,
 )
 from app.core.legacy_markup_ocr_engine import (
     LEGACY_MARKUP_CONSUMER,
     LegacyMarkupOcrEngineConfigurationError,
-    execute_legacy_markup,
 )
 from app.core.storage import build_key, delete_object, download_to_path, upload_path, upload_text
 from app.core.actor_heartbeat import start_actor_heartbeat
@@ -80,6 +70,19 @@ from app.jobs.cancellation import JobCancelledException, check_cancellation
 from app.jobs.limiter import acquire_lease, release_lease
 from app.jobs.models import JobState
 from app.jobs.store import claim_job, get_job, update_job
+
+from app.core.native_operations import (
+    execute_ocr_text,
+    execute_searchable_pdf,
+    execute_document_extraction,
+    execute_pdf_to_markdown,
+    execute_ocr_markup,
+    execute_editor_ocr,
+    execute_studio_editor_extraction,
+    execute_studio_markup_region_ocr,
+    execute_legacy_editor_ocr,
+    execute_legacy_markup,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -478,11 +481,13 @@ def _run_searchable_pdf_job(
             download_to_path(str(item["source_key"]), local_path)
             local_inputs.append(local_path)
 
-        from app.core.ocr_v2.image_pages import build_image_source_pdf
+        from app.core.native_operations import image_source_metadata as build_image_source_pdf
+        from types import SimpleNamespace
 
         stage = "IMAGE_NORMALIZATION"
         normalized_images = build_image_source_pdf(local_inputs, source_pdf)
         for index, normalized in enumerate(normalized_images):
+            normalized = SimpleNamespace(**normalized)
             metadata = {
                 "page_index": index,
                 "input_format": getattr(normalized, "format", ""),
@@ -698,9 +703,9 @@ def _run_structured_document_job(
         else:
             # This branch is retained for any future structured profile, and
             # deliberately stays on the frozen internal processor.
-            from app.core.ocr_v2.structured import StructuredDocumentProcessor
+            from app.core.native_operations import structured_document
 
-            result = StructuredDocumentProcessor().process_document(
+            result = structured_document(
                 input_path,
                 language=language,
                 language_mode=language_mode,
@@ -838,8 +843,8 @@ def editor_extract_job(
         result = extractor(input_path, password, **extractor_kwargs)
         check_cancellation(job_id)
         if ocr_v2:
-            from app.core.editor_ocr_projection import preserve_native_editor_colors
-            preserve_native_editor_colors(
+            from app.core.native_operations import editor_colors
+            result = editor_colors(
                 result, input_path, password,
                 visible_geometry=consumer != EDITOR_OCR_CONSUMER_GENERAL_EDITOR,
                 cancellation_check=lambda: check_cancellation(job_id),

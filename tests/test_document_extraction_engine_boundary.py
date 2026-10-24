@@ -189,6 +189,10 @@ def test_pdf_markdown_profile_keeps_internal_structured_processor(
 ) -> None:
     from app.jobs.actors import _run_structured_document_job
     from app.core.ocr_v2 import structured as structured_module
+    from app.core.pdf_to_markdown_engine import execute_pdf_to_markdown
+    # This is a selector/routing unit test. The real process bridge and its
+    # internal/SDK behavior are exercised in test_native_isolation.py.
+    monkeypatch.setattr("app.jobs.actors.execute_pdf_to_markdown", execute_pdf_to_markdown)
 
     calls: list[str] = []
     updates: list[dict[str, object]] = []

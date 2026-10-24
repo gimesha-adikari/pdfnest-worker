@@ -127,6 +127,15 @@ jobs:
           raise SystemExit(result)
           PY
 
+      - name: Qualify native OCR process isolation
+        env:
+          APP_ENV: test
+          STORAGE_MODE: local
+          WORKER_SHARED_SECRET: synthetic-f11-ci-secret
+          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/f11-sdk019-venv
+        run: |
+          timeout 240s "$UV_PROJECT_ENVIRONMENT/bin/python" -m pytest -q -p anyio.pytest_plugin tests/test_native_isolation.py tests/test_subprocess_runner.py tests/test_ocr_v2_api.py tests/test_ocr_markup_preview.py
+
       - name: Qualify preview raster and session resource safety
         env:
           APP_ENV: test

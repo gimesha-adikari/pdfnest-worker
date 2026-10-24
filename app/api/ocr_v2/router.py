@@ -12,7 +12,6 @@ import re
 import tempfile
 from pathlib import Path
 
-import pymupdf as fitz
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse
 
@@ -31,14 +30,15 @@ from app.core.ocr_v2.language_policy import OCRLanguageMode, OCRLanguagePolicy
 from app.core.ocr_markup_engine import (
     OcrMarkupEngineConfigurationError,
     OcrMarkupEngineUnavailableError,
-    execute_ocr_markup_preview,
 )
 from app.core.ocr_text_engine import (
     OCRTextEngineConfigurationError,
     OCRTextEngineUnavailableError,
-    execute_ocr_text,
 )
 from app.jobs.cancellation import JobCancelledException
+from app.core.native_operations import execute_ocr_text, execute_ocr_markup_preview, inspect_pdf, preview_source
+from starlette.concurrency import run_in_threadpool
+from app.core.native_isolation import execute_async
 
 from .schemas import (
     OCRV2ErrorResponse,
@@ -96,7 +96,7 @@ def _max_pages() -> int:
     return max(1, value)
 
 
-def _prepare_page_scoped_preview_source(input_path: str, page_index: int | None) -> tuple[str, int | None]:
+def _prepare_page_scoped_preview_source(input_path: str, page_index: int | None, cancellation_check=None) -> tuple[str, int | None]:
     """Create a temporary one-page derivative for visible-page OCR preview.
 
     The source remains application-owned and is never exposed. A page-scoped
@@ -107,28 +107,14 @@ def _prepare_page_scoped_preview_source(input_path: str, page_index: int | None)
     if page_index is None:
         return input_path, None
 
+    fd, selected_path = tempfile.mkstemp(prefix="pdfnest-ocr-v2-page-", suffix=".pdf")
+    os.close(fd)
     try:
-        with fitz.open(input_path) as source:
-            page_count = len(source)
-            if page_index >= page_count:
-                raise HTTPException(status_code=422, detail={"code": "INVALID_INPUT", "message": "The requested preview page is unavailable"})
-            fd, selected_path = tempfile.mkstemp(prefix="pdfnest-ocr-v2-page-", suffix=".pdf")
-            os.close(fd)
-            try:
-                with fitz.open() as selected:
-                    selected.insert_pdf(source, from_page=page_index, to_page=page_index)
-                    selected.save(selected_path, garbage=3, deflate=True)
-            except Exception:
-                try:
-                    os.remove(selected_path)
-                except OSError:
-                    pass
-                raise
-            return selected_path, page_count
-    except HTTPException:
+        page_count = preview_source(input_path, selected_path, page_index, cancellation_check=cancellation_check)
+        return selected_path, page_count
+    except BaseException:
+        Path(selected_path).unlink(missing_ok=True)
         raise
-    except Exception as exc:
-        raise HTTPException(status_code=415, detail={"code": "INVALID_INPUT", "message": "This PDF page could not be prepared for preview"}) from exc
 
 
 def _restore_page_scoped_preview(result: object, page_count: int, page_index: int) -> object:
@@ -154,12 +140,13 @@ def _restore_page_scoped_preview(result: object, page_count: int, page_index: in
     return restored_result
 
 
-async def _stage_pdf(upload: UploadFile) -> str:
+async def _stage_pdf(upload: UploadFile, request: Request | None = None) -> str:
     if upload.content_type not in (None, "", "application/pdf", "application/octet-stream"):
         raise HTTPException(status_code=415, detail={"code": "INVALID_INPUT", "message": "OCR V2 requires a PDF upload"})
     fd, path = tempfile.mkstemp(prefix="pdfnest-ocr-v2-", suffix=".pdf")
     os.close(fd)
     total = 0
+    check, cleanup = create_route_cancellation_checker(request) if request is not None else (None, lambda: None)
     try:
         with open(path, "wb") as output:
             while True:
@@ -173,21 +160,20 @@ async def _stage_pdf(upload: UploadFile) -> str:
         with open(path, "rb") as source:
             if source.read(5) != b"%PDF-":
                 raise HTTPException(status_code=415, detail={"code": "INVALID_INPUT", "message": "Uploaded content is not a PDF"})
-        try:
-            with fitz.open(path) as document:
-                if len(document) == 0 or len(document) > _max_pages():
-                    raise HTTPException(status_code=413, detail={"code": "INVALID_INPUT", "message": "OCR V2 document exceeds the configured page limit"})
-        except HTTPException:
-            raise
-        except Exception as exc:
-            raise HTTPException(status_code=415, detail={"code": "INVALID_INPUT", "message": "Uploaded PDF could not be read"}) from exc
+        await execute_async("inspect_pdf", path, _max_pages(), cancellation_check=check)
         return path
-    except Exception:
-        try:
-            os.remove(path)
-        except OSError:
-            pass
+    except BaseException as exc:
+        Path(path).unlink(missing_ok=True)
+        if isinstance(exc, JobCancelledException):
+            raise HTTPException(499, detail={"code": "CANCELLED", "message": "OCR V2 request was cancelled"}) from exc
+        if isinstance(exc, OCRTimeoutError):
+            raise HTTPException(504, detail={"code": "TIMEOUT", "message": "PDF inspection timed out"}) from exc
+        if isinstance(exc, EngineUnavailableError):
+            raise HTTPException(503, detail={"code": "ENGINE_UNAVAILABLE", "message": "PDF inspection failed safely"}) from exc
         raise
+
+    finally:
+        cleanup()
 
 
 def _availability(language: str) -> list[dict[str, object]]:
@@ -292,7 +278,7 @@ async def ocr_text_v2(
         if isinstance(exc.detail, dict) and exc.detail.get("code") == "UNSUPPORTED_LANGUAGE":
             return JSONResponse(status_code=exc.status_code, content=exc.detail)
         raise
-    path = await _stage_pdf(file)
+    path = await _stage_pdf(file, request)
     check_cancel, cleanup_cancel = create_route_cancellation_checker(request)
     warnings: list[str] = []
     try:
@@ -316,7 +302,9 @@ async def ocr_text_v2(
             raise HTTPException(status_code=499, detail={"code": "CANCELLED", "message": "OCR V2 request was cancelled"}) from exc
         except OCRTextEngineConfigurationError as exc:
             raise HTTPException(status_code=500, detail={"code": "INVALID_CONFIGURATION", "message": "OCR Text V2 engine configuration is invalid"}) from exc
-        except OCRTextEngineUnavailableError:
+        except OCRTimeoutError:
+            return JSONResponse(status_code=504, content={"code": "TIMEOUT", "message": "OCR Text V2 timed out"})
+        except (OCRTextEngineUnavailableError, EngineUnavailableError):
             return JSONResponse(status_code=503, content={"code": "ENGINE_UNAVAILABLE", "message": "OCR Text V2 engine is unavailable"})
         response = _response(result, contract, warnings)
         if response.status == "FAILED":
@@ -350,12 +338,12 @@ async def markup_preview(
         if isinstance(exc.detail, dict) and exc.detail.get("code") == "UNSUPPORTED_LANGUAGE":
             return JSONResponse(status_code=exc.status_code, content=exc.detail)
         raise
-    path = await _stage_pdf(file)
+    path = await _stage_pdf(file, request)
     check_cancel, cleanup_cancel = create_route_cancellation_checker(request)
     preview_path = path
     derivative_page_count: int | None = None
     try:
-        preview_path, derivative_page_count = _prepare_page_scoped_preview_source(path, contract.page_index)
+        preview_path, derivative_page_count = await run_in_threadpool(_prepare_page_scoped_preview_source, path, contract.page_index, check_cancel)
         result = await _run_markup_preview(preview_path, contract, check_cancel)
         if contract.page_index is not None and derivative_page_count is not None:
             result = _restore_page_scoped_preview(result, derivative_page_count, contract.page_index)

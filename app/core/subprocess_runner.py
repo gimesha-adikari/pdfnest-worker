@@ -53,17 +53,21 @@ def run_hardened_subprocess(
     cwd: str | None = None,
     env: dict[str, str] | None = None,
     max_output_bytes: int = 16 * 1024 * 1024,
+    cleanup_group_on_exit: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     """Run with bounded output capture, cancellation and process-tree cleanup."""
     if max_output_bytes <= 0:
         raise ValueError("max_output_bytes must be positive")
+    # Nested OCR helpers stay in the supervised document group. A local
+    # helper timeout kills only that helper; the outer supervisor owns the tree.
+    from app.core.native_isolation import IN_CHILD
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         cwd=cwd,
         env=env,
-        start_new_session=True,
+        start_new_session=not IN_CHILD,
     )
 
     pgid = proc.pid  # start_new_session makes the child's PID its process group.
@@ -79,6 +83,13 @@ def run_hardened_subprocess(
         # Drain while the child runs: waiting for exit first deadlocks once
         # either pipe fills. Reads and retained output are bounded separately.
         while selector.get_map() or proc.poll() is None:
+            if cleanup_group_on_exit and proc.poll() is not None:
+                # A descendant may hold an inherited pipe open after the
+                # supervisor crashes. Stop it now rather than waiting for EOF.
+                try:
+                    os.killpg(pgid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
             if cancellation_check is not None:
                 cancellation_check()
             if time.monotonic() >= deadline:
@@ -102,10 +113,19 @@ def run_hardened_subprocess(
             stderr=output["stderr"].decode(encoding, errors="replace"),
         )
     except BaseException:
-        kill_process_group(pgid, term_grace_seconds=term_grace_seconds)
+        if IN_CHILD:
+            proc.kill()
+        else:
+            kill_process_group(pgid, term_grace_seconds=term_grace_seconds)
         proc.wait()
         raise
     finally:
+        if cleanup_group_on_exit and not IN_CHILD:
+            # Clean up descendants even if the document child exited first.
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
         selector.close()
         proc.stdout.close()
         proc.stderr.close()

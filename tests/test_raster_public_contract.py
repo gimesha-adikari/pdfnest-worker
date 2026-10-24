@@ -41,7 +41,6 @@ def test_public_errors_are_safe_existing_envelopes(endpoint, error, code, status
 def test_job_rejection_cannot_publish_artifact_or_success(profile, tmp_path, monkeypatch):
     from app.jobs import actors
     from app.jobs.models import JobState
-    from app.core.ocr_v2 import image_pages
     updates, uploads = [], []
     monkeypatch.setattr(actors, "get_job", lambda *args: SimpleNamespace(status=JobState.queued, owner_identity="guest:test", payload={}, total_pages=1))
     monkeypatch.setattr(actors, "claim_job", lambda *args: object())
@@ -60,7 +59,8 @@ def test_job_rejection_cannot_publish_artifact_or_success(profile, tmp_path, mon
     monkeypatch.setattr(actors, "upload_text", lambda *args, **kw: uploads.append("json"))
     monkeypatch.setattr(actors, "upload_path", lambda *args, **kw: uploads.append("pdf"))
     monkeypatch.setattr(actors, "update_job", lambda job, **kw: updates.append(kw))
-    monkeypatch.setattr(image_pages, "build_image_source_pdf", lambda *args: ())
+    from app.core import native_operations
+    monkeypatch.setattr(native_operations, "image_source_metadata", lambda *args: ())
     reached = []
     def reject(*args, **kwargs):
         reached.append(True)

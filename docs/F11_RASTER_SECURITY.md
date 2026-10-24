@@ -293,3 +293,64 @@ native processing. Existing Tesseract subprocess control and pdf2docx conversion
 isolation do not isolate these PyMuPDF calls. Source-image decode budgets and
 external package allocations remain separate boundaries. F-12 session lifecycle
 and renderer isolation remain distinct work.
+
+## Native OCR operation isolation follow-up
+
+The earlier remaining-gates paragraphs describe the raster-only baseline.
+The operation boundary is now `native_operations` → `native_isolation` →
+`native_supervisor` → `native_child`, with an explicit allowlist and fresh exec (no forked Python
+runtime, pickle, arbitrary module/function from requests, or runtime opt-out).
+
+Production OCR call sites use this boundary for internal and SDK selectors:
+V2 text, searchable PDF, document extraction, structured Markdown, markup and
+preview, general/legacy/Studio editor extraction and legacy/Studio markup.
+Legacy OCR/image-searchable, legacy Markdown and complete PDF-to-Word conversion
+also cross it. V2 input inspection, selected-page derivative creation, searchable
+image normalization, native editor color recovery, editor compilation and the
+actor's retained structured fallback are included, so these native operations do
+not precede or follow the child boundary in the long-running API/actor.
+Low-level engine classes remain ordinary library APIs for composition **inside**
+the child; future application call sites must use `native_operations`.
+
+A child tightens inherited hard limits before importing PDF/OCR implementations:
+1 GiB address space, 180 CPU seconds, 64 MiB per output file, 128 descriptors,
+no core dumps. The parent enforces a 300-second wall deadline and a 30-second
+capacity wait. A private uid-owned flock slot admits one document child across
+cooperating API/actor processes sharing that filesystem and temporary root.
+Child numeric/OCR page parallelism and Tesseract capacity are set to one.
+Limits are mandatory, not permissive environment settings. Inherited stricter
+limits remain stricter. Previously allowed longer jobs or larger outputs may
+now fail safely instead of occupying an unbounded native operation.
+
+IPC uses bounded JSON with allowlisted dataclass/enum reconstruction: 16 MiB
+per frame, 1,000 callbacks / 64 MiB cumulative callback data, 64 KiB each stdout
+and stderr. Callbacks execute in the parent; acknowledgement is required before
+the child continues, especially `after_ocr` validation before PDF rendering.
+The active smaller raster budget crosses exec explicitly. SDK capability checks,
+raster ceilings, engine selection and existing output validation remain intact.
+
+Nested Worker Tesseract/pdf2docx helpers inherit the document process group.
+Inside the child only, SDK 0.1.9's copied Tesseract runner is bound to the existing
+bounded Worker runner, preventing detached/unbounded SDK helper processes.
+Timeout/cancellation kills the group and waits for the direct supervisor;
+the supervisor normally waits/reaps the native child. Its non-native loop also
+kills the group on owner death or its independent wall deadline. Descendant
+exit/reaping by the OS is distinct from direct-child wait; no live helper may
+continue processing. Child temporaries use a parent-owned private directory;
+file outputs and renderer sibling staging stay there. The parent publishes a
+successful decoded result's output atomically, preserving an existing destination
+on failure and removing partial work with the directory.
+
+Scope limitations remain explicit: RLIMIT_AS/CPU are per process, not aggregate
+process-tree or host cgroup budgets. The flock is not cross-node/container
+admission. This is resource containment, not a separate uid/seccomp/network/file
+access sandbox. GPU/provider allocations and all non-OCR native PDF operations
+are not certified by this change. F-12 raster/session safeguards are retained;
+preview-session creation metadata parsing remains outside this OCR boundary.
+No production runtime, deployment, failover or aggregate-memory qualification is
+claimed, and F-11 must not be described as an unconditional whole-Worker sandbox.
+
+An ungraceful owner death can leave bounded private staging files for operational
+cleanup; it must not leave live native processing. No cgroup or service-manager
+configuration is changed by this patch. Whole-Worker F-11 closure remains partial
+until aggregate resource/runtime qualification and non-OCR native paths are covered.
