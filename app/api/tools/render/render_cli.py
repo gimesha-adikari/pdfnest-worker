@@ -68,6 +68,9 @@ def main() -> None:
             "runqueue_wait_ms": runqueue_wait_ms,
         }) + "\n")
         sys.stdout.flush()
+    except ValueError as exc:
+        sys.stderr.write(f"Render error: {exc}\n")
+        sys.exit(3)
     except Exception as exc:
         sys.stderr.write(f"Render error: {exc}\n")
         sys.exit(2)
