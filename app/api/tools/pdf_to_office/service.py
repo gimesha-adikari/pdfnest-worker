@@ -10,7 +10,9 @@ from fastapi.responses import FileResponse
 from starlette.background import BackgroundTask
 
 from app.core.disk import check_disk_space
-from .converters import convert_to_excel, convert_to_powerpoint, convert_to_word
+from .converters import convert_to_excel, convert_to_powerpoint
+from app.core.native_operations import convert_to_word
+from app.jobs.cancellation import JobCancelledException
 from .models import OfficeOutputFormat
 from .utils import cleanup_paths, create_temp_paths
 
@@ -18,16 +20,16 @@ _office_capacity = anyio.CapacityLimiter(1)
 
 class OfficeConversionService:
     @staticmethod
-    async def convert(format: OfficeOutputFormat, file: UploadFile, language: str = "eng") -> FileResponse:
+    async def convert(format: OfficeOutputFormat, file: UploadFile, language: str = "eng", cancellation_check=None) -> FileResponse:
         # Preserve one conversion at a time while keeping the HTTP event loop
         # available for readiness, cancellation and other lightweight requests.
         return await anyio.to_thread.run_sync(
-            partial(OfficeConversionService._convert_sync, format, file, language),
+            partial(OfficeConversionService._convert_sync, format, file, language, cancellation_check),
             limiter=_office_capacity,
         )
 
     @staticmethod
-    def _convert_sync(format: OfficeOutputFormat, file: UploadFile, language: str) -> FileResponse:
+    def _convert_sync(format: OfficeOutputFormat, file: UploadFile, language: str, cancellation_check=None) -> FileResponse:
         file_size = getattr(file, "size", 0) or 10 * 1024 * 1024
         required_bytes = (file_size * 5) + (50 * 1024 * 1024)
         check_disk_space(required_bytes)
@@ -41,7 +43,7 @@ class OfficeConversionService:
                 shutil.copyfileobj(file.file, buffer)
 
             if format == "docx":
-                convert_to_word(input_path, output_path, language=language)
+                convert_to_word(input_path, output_path, language=language, cancellation_check=cancellation_check)
                 media_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
             elif format == "xlsx":
                 convert_to_excel(input_path, output_path)
@@ -59,6 +61,9 @@ class OfficeConversionService:
                 filename=download_name,
                 background=BackgroundTask(cleanup_paths, input_path, output_path),
             )
+        except JobCancelledException as exc:
+            cleanup_paths(input_path, output_path)
+            raise HTTPException(status_code=499, detail="Word conversion cancelled") from exc
         except HTTPException:
             cleanup_paths(input_path, output_path)
             raise

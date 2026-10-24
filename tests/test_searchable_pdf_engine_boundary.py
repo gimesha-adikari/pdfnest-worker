@@ -226,8 +226,8 @@ def test_searchable_actor_delegates_ocr_and_render_to_consumer_boundary(
     monkeypatch.setattr("app.jobs.actors.update_job", lambda _job_id, **fields: updates.append(fields))
     monkeypatch.setattr("app.jobs.actors.execute_searchable_pdf", execute)
     monkeypatch.setattr(
-        "app.core.ocr_v2.image_pages.build_image_source_pdf",
-        lambda _inputs, _output: (SimpleNamespace(format="PNG", width=10, height=10, page_width=4.8, page_height=4.8),),
+        "app.core.native_operations.image_source_metadata",
+        lambda _inputs, _output: ({"format": "PNG", "width": 10, "height": 10, "page_width": 4.8, "page_height": 4.8},),
     )
 
     _run_searchable_pdf_job(

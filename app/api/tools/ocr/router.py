@@ -17,14 +17,14 @@ from starlette.concurrency import run_in_threadpool
 from app.jobs.cancellation import JobCancelledException
 from .document import (
     R2ImageRef,
-    build_searchable_pdf_from_images,
     build_searchable_pdf_from_r2_images,
-    extract_text_from_pdf,
     get_installed_tesseract_languages,
     normalize_lang_spec,
     safe_suffix,
 )
 from .languages import language_name
+
+from app.core.native_operations import extract_text_from_pdf, build_searchable_pdf_from_images
 
 router = APIRouter(prefix="/api/v1/ocr", tags=["ocr"])
 logger = logging.getLogger(__name__)

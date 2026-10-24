@@ -76,6 +76,15 @@ def guard_sdk_processor(
             raise ImportError("SDK raster admission contract unavailable")
     except (ImportError, AttributeError) as exc:
         raise unavailable_error("Selected OCR engine is unavailable") from exc
+    from app.core.native_isolation import IN_CHILD
+    if IN_CHILD:
+        # Bind only after this consumer selected a capable SDK. Keep its
+        # Tesseract inside the supervised group with bounded pipe capture.
+        from app.core.subprocess_runner import run_hardened_subprocess
+        from platen_document.engine import _compat
+        from platen_document.engine.adapters import tesseract
+        _compat.run_hardened_subprocess = run_hardened_subprocess
+        tesseract.run_hardened_subprocess = run_hardened_subprocess
     try:
         processor = processor_type() if config is None else processor_type(config)
     except sdk.ConfigurationError as exc:
