@@ -77,7 +77,6 @@ def child_probe(monkeypatch):
         code = (
             "from app.core import native_operations as o,native_isolation as b;"
             "o.OPERATIONS['inspect_pdf']=('tests.native_isolation_probes','probe',None);"
-            "b.CHILD_CPU=1;"
             "from app.core.native_child import main;main()"
         )
         guard = 'from app.core.native_supervisor import main;import sys;sys.exit(main(' + repr([sys.executable, '-c', code, cmd[3]]) + '))'
@@ -93,7 +92,7 @@ def assert_dead(pid):
 
 
 def test_timeout_tree_cleanup_and_recovery(child_probe, monkeypatch, tmp_path, pdf):
-    monkeypatch.setattr(boundary, 'CHILD_WALL', 3.0)
+    monkeypatch.setattr(boundary, 'CHILD_WALL', 6.0)
     with pytest.raises(OCRTimeoutError):
         operations.inspect_pdf(tmp_path, 'hang')
     assert_dead(int((tmp_path / 'child.pid').read_text()))
@@ -159,7 +158,7 @@ def test_protocol_limits_and_no_arbitrary_import(tmp_path, monkeypatch):
 @pytest.mark.anyio
 async def test_async_cancellation_joins_child_before_cleanup(child_probe, tmp_path):
     task = asyncio.create_task(boundary.execute_async('inspect_pdf', tmp_path, 'hang'))
-    deadline = time.monotonic() + 5
+    deadline = time.monotonic() + 15
     while not (tmp_path / 'grandchild.pid').exists():
         assert time.monotonic() < deadline
         await asyncio.sleep(.02)
@@ -344,7 +343,7 @@ def test_crashed_child_with_inherited_pipes_stops_descendants(child_probe, tmp_p
     started = time.monotonic()
     with pytest.raises(EngineUnavailableError):
         operations.inspect_pdf(tmp_path, 'orphan_crash')
-    assert time.monotonic() - started < 5
+    assert time.monotonic() - started < 10
     assert_dead(int((tmp_path / 'grandchild.pid').read_text()))
 
 

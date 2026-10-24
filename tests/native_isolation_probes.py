@@ -25,6 +25,12 @@ def probe(directory, mode, **kwargs):
         mmap.mmap(-1, 2 * 1024 * 1024)
         raise AssertionError('Address-space limit did not reject mapping')
     if mode == 'cpu':
+        # CPU limits are cumulative from process start. Tighten after imports
+        # so this tests the native-operation boundary, not cold .py compilation.
+        import math
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+        cpu_limit = min(CHILD_CPU, math.ceil(usage.ru_utime + usage.ru_stime) + 1)
+        resource.setrlimit(resource.RLIMIT_CPU, (cpu_limit, cpu_limit))
         while True:
             pass
     if mode == 'orphan_crash':
