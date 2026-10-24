@@ -35,5 +35,55 @@ OPERATIONS.update({
     'structured_document': ('app.core.native_document_helpers', 'structured_document', None),
 })
 
-for _operation in OPERATIONS:
-    globals()[_operation] = partial(execute, _operation)
+# Explicit exports keep the process boundary visible to type/static tools.
+execute_ocr_text = partial(execute, 'execute_ocr_text')
+execute_searchable_pdf = partial(execute, 'execute_searchable_pdf')
+execute_document_extraction = partial(execute, 'execute_document_extraction')
+execute_pdf_to_markdown = partial(execute, 'execute_pdf_to_markdown')
+execute_ocr_markup = partial(execute, 'execute_ocr_markup')
+execute_ocr_markup_preview = partial(execute, 'execute_ocr_markup_preview')
+execute_editor_ocr = partial(execute, 'execute_editor_ocr')
+execute_legacy_editor_ocr = partial(execute, 'execute_legacy_editor_ocr')
+execute_studio_editor_extraction = partial(execute, 'execute_studio_editor_extraction')
+execute_studio_markup_region_ocr = partial(execute, 'execute_studio_markup_region_ocr')
+execute_legacy_markup = partial(execute, 'execute_legacy_markup')
+extract_text_from_pdf = partial(execute, 'extract_text_from_pdf')
+build_searchable_pdf_from_images = partial(execute, 'build_searchable_pdf_from_images')
+extract_document = partial(execute, 'extract_document')
+extract_document_v2 = partial(execute, 'extract_document_v2')
+compile_document = partial(execute, 'compile_document')
+process_markup_pdf = partial(execute, 'process_markup_pdf')
+convert_pdf_to_markdown = partial(execute, 'convert_pdf_to_markdown')
+convert_to_word = partial(execute, 'convert_to_word')
+image_source_metadata = partial(execute, 'image_source_metadata')
+editor_colors = partial(execute, 'editor_colors')
+inspect_pdf = partial(execute, 'inspect_pdf')
+preview_source = partial(execute, 'preview_source')
+structured_document = partial(execute, 'structured_document')
+
+__all__ = [
+    'execute_ocr_text',
+    'execute_searchable_pdf',
+    'execute_document_extraction',
+    'execute_pdf_to_markdown',
+    'execute_ocr_markup',
+    'execute_ocr_markup_preview',
+    'execute_editor_ocr',
+    'execute_legacy_editor_ocr',
+    'execute_studio_editor_extraction',
+    'execute_studio_markup_region_ocr',
+    'execute_legacy_markup',
+    'extract_text_from_pdf',
+    'build_searchable_pdf_from_images',
+    'extract_document',
+    'extract_document_v2',
+    'compile_document',
+    'process_markup_pdf',
+    'convert_pdf_to_markdown',
+    'convert_to_word',
+    'image_source_metadata',
+    'editor_colors',
+    'inspect_pdf',
+    'preview_source',
+    'structured_document',
+]

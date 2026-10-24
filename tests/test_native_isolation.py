@@ -418,3 +418,11 @@ async def test_markdown_cancel_preserves_cleanup(monkeypatch, tmp_path):
     assert response.status_code == 499
     assert cleanups == [True]
     assert not source.exists()
+
+
+def test_explicit_exports_match_the_operation_allowlist():
+    assert set(operations.__all__) == set(operations.OPERATIONS)
+    for name in operations.__all__:
+        wrapper = getattr(operations, name)
+        assert wrapper.func is boundary.execute
+        assert wrapper.args == (name,)
