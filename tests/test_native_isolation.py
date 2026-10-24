@@ -257,8 +257,8 @@ def test_legacy_and_studio_markup_outputs(engine, monkeypatch, pdf, tmp_path):
     monkeypatch.setenv('LEGACY_MARKUP_OCR_ENGINE', engine)
     monkeypatch.setenv('STUDIO_MARKUP_REGION_OCR_ENGINE', engine)
     boxes = [{'page': 1, 'x': 15, 'y': 20, 'width': 250, 'height': 30}]
-    for operation in (operations.execute_legacy_markup, operations.execute_studio_markup_region_ocr):
-        output = tmp_path / (operation.args[0] + '.pdf')
+    for index, operation in enumerate((operations.execute_legacy_markup, operations.execute_studio_markup_region_ocr)):
+        output = tmp_path / f'markup-{index}.pdf'
         operation(pdf, output, boxes=boxes, action='highlight', mode='smart')
         with fitz.open(output) as document:
             assert len(document) == 2
@@ -424,5 +424,8 @@ def test_explicit_exports_match_the_operation_allowlist():
     assert set(operations.__all__) == set(operations.OPERATIONS)
     for name in operations.__all__:
         wrapper = getattr(operations, name)
-        assert wrapper.func is boundary.execute
-        assert wrapper.args == (name,)
+        from functools import partial
+        assert isinstance(wrapper, partial)
+        metadata = {attribute: getattr(wrapper, attribute) for attribute in ('func', 'args')}
+        assert metadata['func'] is boundary.execute
+        assert metadata['args'] == (name,)
