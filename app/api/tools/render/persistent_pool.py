@@ -100,6 +100,9 @@ class PersistentRenderWorker:
             self.init_cpu_ms = handshake.get("init_cpu_ms", 0.0)
             self.is_alive = True
             self.needs_recycling = False
+        except asyncio.CancelledError:
+            await self.kill()
+            raise
         except Exception as exc:
             await self.kill()
             raise PersistentWorkerInfrastructureError(f"Worker {self.worker_id} failed to initialize: {exc}") from exc
@@ -178,6 +181,9 @@ class PersistentRenderWorker:
 
                 return jpeg_bytes, meta
 
+            except asyncio.CancelledError:
+                await self.kill()
+                raise
             except asyncio.TimeoutError:
                 self.is_alive = False
                 await self.kill()
@@ -333,6 +339,16 @@ class PersistentRenderWorkerPool:
 
             should_return_to_queue = True
             return jpeg_bytes, meta
+
+        except asyncio.CancelledError:
+            self.total_failed += 1
+            await worker.kill()
+            try:
+                worker = await self._replace_worker(worker, is_recycling=False)
+                should_return_to_queue = True
+            except Exception:
+                should_return_to_queue = False
+            raise
 
         except ValueError:
             # User/input error: worker remains healthy and should return to queue

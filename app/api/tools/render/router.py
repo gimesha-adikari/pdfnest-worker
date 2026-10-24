@@ -1,3 +1,5 @@
+import asyncio
+
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import Response
 
@@ -14,6 +16,21 @@ router = APIRouter(
     prefix="/api/v1/render",
     tags=["render"],
 )
+
+
+async def render_until_disconnect(request: Request, operation):
+    task = asyncio.create_task(operation)
+    try:
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=0.1)
+            if done:
+                return await task
+            if await request.is_disconnected():
+                raise HTTPException(status_code=499, detail="Render request disconnected")
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 @router.get("/metrics")
@@ -67,7 +84,7 @@ async def render_page(
         simulate_hang = request.headers.get("x-test-simulate-hang", "").lower() in ("true", "1")
 
     try:
-        (image_bytes, child_metrics), timings = await render_limiter.run_with_timings(
+        (image_bytes, child_metrics), timings = await render_until_disconnect(request, render_limiter.run_with_timings(
             render_page_to_jpeg_bytes(
                 file=file,
                 page=page,
@@ -79,7 +96,7 @@ async def render_page(
                 simulate_crash=simulate_crash,
                 simulate_hang=simulate_hang,
             )
-        )
+        ))
 
         headers = {
             "Cache-Control": "private, max-age=60",
@@ -159,18 +176,19 @@ async def create_session(
 
 @router.get("/sessions/{session_id}/page/{page}")
 async def render_session_page(
+        request: Request,
         session_id: str,
         page: int,
         dpi: float = 144,
 ):
     try:
-        image_bytes = await render_limiter.run(
+        image_bytes = await render_until_disconnect(request, render_limiter.run(
             get_render_session_page(
                 session_id=session_id,
                 page=page,
                 dpi=dpi,
             )
-        )
+        ))
 
         return Response(
             content=image_bytes,

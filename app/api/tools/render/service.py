@@ -14,7 +14,7 @@ from .persistent_pool import (
     PersistentWorkerTimeoutError,
     get_persistent_render_pool,
 )
-from .renderer import PdfRenderDocument, render_pdf_page_to_jpeg
+from .renderer import validate_preview_dpi
 from .session import RenderSession, session_manager, sha256_file
 
 
@@ -26,6 +26,7 @@ async def render_page_to_jpeg_bytes_subprocess(
         clip_y0: float | None = None,
         clip_x1: float | None = None,
         clip_y1: float | None = None,
+        pdf_path: Path | None = None,
 ) -> Tuple[bytes, Dict[str, Any]]:
     """
     Certified Phase 3F/3G isolated subprocess renderer.
@@ -38,7 +39,9 @@ async def render_page_to_jpeg_bytes_subprocess(
     out_path = Path(temp_out.name)
 
     try:
-        temp_in.write(pdf_bytes)
+        validate_preview_dpi(dpi)
+        if pdf_path is None:
+            temp_in.write(pdf_bytes)
         temp_in.flush()
         temp_in.close()
         temp_out.close()
@@ -48,7 +51,7 @@ async def render_page_to_jpeg_bytes_subprocess(
             "-m",
             "app.api.tools.render.render_cli",
             "--input",
-            str(in_path),
+            str(pdf_path if pdf_path is not None else in_path),
             "--output",
             str(out_path),
             "--page",
@@ -73,7 +76,8 @@ async def render_page_to_jpeg_bytes_subprocess(
         )
 
         try:
-            stdout, stderr = await proc.communicate()
+            from .limiter import render_limiter
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), render_limiter.render_timeout)
         except BaseException:
             if proc.returncode is None:
                 try:
@@ -88,7 +92,7 @@ async def render_page_to_jpeg_bytes_subprocess(
 
         if proc.returncode != 0:
             err_msg = stderr.decode(errors="replace").strip()
-            if "Invalid page" in err_msg or "Page number must be" in err_msg or "DPI must be" in err_msg or "Empty file" in err_msg or "PDF contains no pages" in err_msg:
+            if proc.returncode == 3 or "Invalid page" in err_msg or "Page number must be" in err_msg or "DPI must be" in err_msg or "Empty file" in err_msg or "PDF contains no pages" in err_msg:
                 raise ValueError(err_msg)
             raise RuntimeError(f"Render process failed with code {proc.returncode}: {err_msg}")
 
@@ -124,8 +128,7 @@ async def render_page_to_jpeg_bytes(
     if page < 1:
         raise ValueError("Page number must be 1 or greater")
 
-    if dpi <= 0:
-        raise ValueError("DPI must be greater than 0")
+    validate_preview_dpi(dpi)
 
     pdf_bytes = await file.read()
 
@@ -250,32 +253,16 @@ async def get_render_session_page(
     if page < 1:
         raise ValueError("Page number must be 1 or greater")
 
-    if dpi <= 0:
-        raise ValueError("DPI must be greater than 0")
+    validate_preview_dpi(dpi)
 
     session = session_manager.get(session_id)
 
-    cache_key = f"{page}:{dpi:g}"
-
-    with session.lock:
-        cached = session.page_cache.get(cache_key)
-
-        if cached is not None:
-            return cached
-
-        if session.document is None:
-            session.document = PdfRenderDocument.open(
-                session.file_path,
-            )
-
-        image_bytes = session.document.render_page(
-            page_number=page,
-            dpi=dpi,
-        )
-
-        session.page_cache[cache_key] = image_bytes
-
-        return image_bytes
+    # No retained image cache or native document use in the API process.
+    # Deletion/expiry may remove the path before the child opens it: fail safely.
+    image_bytes, _ = await render_page_to_jpeg_bytes_subprocess(
+        pdf_bytes=b"", pdf_path=session.file_path, page=page, dpi=dpi,
+    )
+    return image_bytes
 
 
 def delete_render_session(

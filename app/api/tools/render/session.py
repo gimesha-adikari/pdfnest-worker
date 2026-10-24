@@ -49,7 +49,6 @@ class RenderSession:
     last_accessed_at: float
     document: PdfRenderDocument | None = None
     lock: threading.RLock = field(default_factory=threading.RLock)
-    page_cache: dict[str, bytes] = field(default_factory=dict)
 
 
 class RenderSessionManager:
@@ -78,17 +77,25 @@ class RenderSessionManager:
             target_path = session_dir / "source.pdf"
             shutil.copyfile(file_path, target_path)
 
-            doc = PdfRenderDocument.open(target_path)
+            try:
+                doc = PdfRenderDocument.open(target_path)
+                try:
+                    page_count = doc.page_count
+                finally:
+                    doc.close()
+            except BaseException:
+                shutil.rmtree(session_dir, ignore_errors=True)
+                raise
 
             session = RenderSession(
                 session_id=session_id,
                 file_path=target_path,
                 file_size=file_size,
                 sha256=sha256,
-                page_count=doc.page_count,
+                page_count=page_count,
                 created_at=now,
                 last_accessed_at=now,
-                document=doc,
+                document=None,
             )
 
             self._sessions[session_id] = session
