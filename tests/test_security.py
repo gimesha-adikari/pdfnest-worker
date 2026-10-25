@@ -19,7 +19,7 @@ def generate_headers(
     secret: str = SECRET,
     timestamp: float | None = None,
     nonce: str | None = None,
-    body_hash: str | None = None,
+    body_hash: str | None = hashlib.sha256(b"").hexdigest(),
 ) -> dict[str, str]:
     if timestamp is None:
         timestamp = time.time()

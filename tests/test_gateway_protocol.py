@@ -212,23 +212,45 @@ def test_query_cannot_bypass_closed_gate_and_trailing_slash_still_processing():
             require_admission(target, admission_open=False)
 
 
-def test_worker_verifier_accepts_origin_signature_without_body_integrity_claim(monkeypatch):
-    from starlette.requests import Request
+def _real_worker_status(target, headers, body, observed):
     from starlette.responses import Response
     from app.core.security import WorkerAuthMiddleware
+    async def scenario():
+        async def accepted(scope, receive, send):
+            chunks = []
+            while True:
+                message = await receive()
+                chunks.append(message.get('body', b''))
+                if not message.get('more_body', False): break
+            observed.append(b''.join(chunks))
+            await Response(status_code=204)(scope, receive, send)
+        async def receive(): return {'type':'http.request', 'body':body, 'more_body':False}
+        statuses = []
+        async def send(message):
+            if message['type'] == 'http.response.start': statuses.append(message['status'])
+        scope = {'type':'http', 'method':target.method, 'path':target.path,
+                 'raw_path':target.raw_path.encode(), 'query_string':target.raw_query.encode(),
+                 'headers':[(k.encode(),v.encode()) for k,v in headers],
+                 'scheme':'http', 'server':('test.invalid',80)}
+        await WorkerAuthMiddleware(accepted)(scope, receive, send)
+        return statuses[0]
+    return run(scenario())
+
+
+def test_strict_worker_requires_actual_body_digest_from_inert_gateway(monkeypatch):
+    import hashlib
     monkeypatch.setenv('WORKER_SHARED_SECRET', ORIGIN)
     monkeypatch.delenv('REDIS_URL', raising=False)
     monkeypatch.setattr('app.core.security.time.time', lambda: NOW)
     target = RequestTarget('POST', '/internal/ocr/v2/jobs', 'b=2&a=%2F&a=one+two')
-    signed = sign_headers(target, ORIGIN, timestamp='1800000000', nonce='compat-real-worker', body_hash='not-an-actual-body-hash')
-    request = Request({'type':'http', 'method':'POST', 'path':target.path,
-                       'query_string':target.raw_query.encode(), 'headers':[(k.encode(),v.encode()) for k,v in signed],
-                       'scheme':'http', 'server':('test.invalid',80)})
-    async def accepted(request):
-        return Response(status_code=204)
-    response = run(WorkerAuthMiddleware(accepted).dispatch(request, accepted))
-    assert response.status_code == 204
-    assert run(WorkerAuthMiddleware(accepted).dispatch(request, accepted)).status_code == 401
+    observed = []
+    for digest in ['', 'not-an-actual-body-hash', '0'*64]:
+        signed = sign_headers(target, ORIGIN, timestamp='1800000000', nonce='compat-real-worker', body_hash=digest)
+        assert _real_worker_status(target, signed, b'body', observed) == 401
+    signed = sign_headers(target, ORIGIN, timestamp='1800000000', nonce='compat-real-worker', body_hash=hashlib.sha256(b'body').hexdigest())
+    assert _real_worker_status(target, signed, b'body', observed) == 204
+    assert _real_worker_status(target, signed, b'body', observed) == 401
+    assert observed == [b'body']
 
 
 def test_policy_covers_every_current_mounted_route_without_importing_worker_app():
@@ -298,26 +320,15 @@ def test_invalid_replay_window_rejected(skew):
         ClientAuthenticator(Credentials(CLIENT, ORIGIN), MemoryReplay(), skew_seconds=skew)
 
 
-def test_real_worker_authenticates_encoded_path_and_still_does_not_hash_body(monkeypatch):
-    from starlette.requests import Request
-    from starlette.responses import Response
-    from app.core.security import WorkerAuthMiddleware
+def test_real_worker_preserves_encoded_target_and_rejects_changed_body(monkeypatch):
+    import hashlib
     monkeypatch.setenv('WORKER_SHARED_SECRET', ORIGIN)
     monkeypatch.delenv('REDIS_URL', raising=False)
     monkeypatch.setattr('app.core.security.time.time', lambda: NOW)
     target = RequestTarget('POST', '/internal/ocr/v2/%74ext', 'a=%2F&b=one+two')
     observed = []
-    async def accepted(request):
-        observed.append(await request.body())
-        return Response(status_code=204)
-    async def scenario():
-        for index, body in enumerate([b'original-body', b'different-body']):
-            signed = sign_headers(target, ORIGIN, timestamp='1800000000', nonce=f'body-limit-{index}', body_hash='same-claimed-hash')
-            async def receive(): return {'type':'http.request', 'body':body, 'more_body':False}
-            request = Request({'type':'http', 'method':'POST', 'path':target.path,
-                               'raw_path':target.raw_path.encode(), 'query_string':target.raw_query.encode(),
-                               'headers':[(k.encode(),v.encode()) for k,v in signed],
-                               'scheme':'http', 'server':('test.invalid',80)}, receive)
-            assert (await WorkerAuthMiddleware(accepted).dispatch(request, accepted)).status_code == 204
-    run(scenario())
-    assert observed == [b'original-body', b'different-body']
+    signed = sign_headers(target, ORIGIN, timestamp='1800000000', nonce='body-binding-final',
+                          body_hash=hashlib.sha256(b'original-body').hexdigest())
+    assert _real_worker_status(target, signed, b'different-body', observed) == 401
+    assert _real_worker_status(target, signed, b'original-body', observed) == 204
+    assert observed == [b'original-body']

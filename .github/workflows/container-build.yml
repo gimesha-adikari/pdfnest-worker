@@ -48,6 +48,13 @@ jobs:
           uv sync --frozen --no-install-project
           uv pip check --python "$UV_PROJECT_ENVIRONMENT/bin/python"
 
+      - name: Verify strict Worker body integrity and multipart replay
+        env:
+          APP_ENV: test
+          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/f11-sdk019-venv
+        run: |
+          timeout 120s "$UV_PROJECT_ENVIRONMENT/bin/python" -m pytest -q --tb=short -p no:cacheprovider tests/test_security.py tests/test_security_body.py tests/test_ocr_v2_api.py tests/test_gateway_protocol.py tests/test_gateway_forwarding.py
+
       - name: Qualify installed SDK and F-11 security boundaries
         env:
           APP_ENV: test
