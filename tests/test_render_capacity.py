@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 from app.main import app
 from app.api.tools.render.limiter import RenderConcurrencyLimiter, render_limiter
 import app.api.tools.render.router as render_router
-from tests.test_security import generate_headers
+from tests.test_security import generate_headers, signed_post_async
 from tests.test_render_sessions import _create_sample_pdf_bytes
 
 client = TestClient(app)
@@ -186,11 +186,15 @@ async def test_http_endpoint_concurrency_enforcement(monkeypatch):
     pdf_bytes = _create_sample_pdf_bytes(num_pages=1)
 
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as ac:
+        # Exercise the render queue within the independently tested four-spool
+        # authentication admission bound, without weakening render assertions.
+        upload_admission = asyncio.Semaphore(4)
         async def send_render_request():
             headers = generate_headers("POST", "/api/v1/render/page")
             files = {"file": ("test.pdf", io.BytesIO(pdf_bytes), "application/pdf")}
             data = {"page": "1", "dpi": "72.0"}
-            resp = await ac.post("/api/v1/render/page", headers=headers, files=files, data=data)
+            async with upload_admission:
+                resp = await signed_post_async(ac, "/api/v1/render/page", headers=headers, files=files, data=data)
             return resp
 
         tasks = [send_render_request() for _ in range(6)]
@@ -249,7 +253,7 @@ async def test_http_endpoint_underlying_subprocess_termination_on_timeout(monkey
             data = {"page": "1", "dpi": "72.0"}
 
             # 1. Send request that will time out
-            resp = await ac.post("/api/v1/render/page", headers=headers, files=files, data=data)
+            resp = await signed_post_async(ac, "/api/v1/render/page", headers=headers, files=files, data=data)
 
             # 2. Verify HTTP 504
             assert resp.status_code == 504, f"Got {resp.status_code}: {resp.text}"
@@ -270,7 +274,7 @@ async def test_http_endpoint_underlying_subprocess_termination_on_timeout(monkey
 
             headers2 = generate_headers("POST", "/api/v1/render/page")
             files2 = {"file": ("test.pdf", io.BytesIO(pdf_bytes), "application/pdf")}
-            resp2 = await ac.post("/api/v1/render/page", headers=headers2, files=files2, data=data)
+            resp2 = await signed_post_async(ac, "/api/v1/render/page", headers=headers2, files=files2, data=data)
             assert resp2.status_code == 200
             assert resp2.headers["content-type"] == "image/jpeg"
             assert len(resp2.content) > 0

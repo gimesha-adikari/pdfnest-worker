@@ -53,7 +53,7 @@ jobs:
           APP_ENV: test
           UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/f11-sdk019-venv
         run: |
-          timeout 120s "$UV_PROJECT_ENVIRONMENT/bin/python" -m pytest -q --tb=short -p no:cacheprovider tests/test_security.py tests/test_security_body.py tests/test_ocr_v2_api.py tests/test_gateway_protocol.py tests/test_gateway_forwarding.py
+          timeout 120s "$UV_PROJECT_ENVIRONMENT/bin/python" -m pytest -q --tb=short -p no:cacheprovider tests/test_security.py tests/test_security_body.py tests/test_ocr_v2_api.py tests/test_gateway_protocol.py tests/test_gateway_forwarding.py tests/test_sign.py tests/test_redact.py
 
       - name: Qualify installed SDK and F-11 security boundaries
         env:

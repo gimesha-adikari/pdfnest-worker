@@ -51,6 +51,21 @@ def generate_headers(
     return headers
 
 
+def signed_post(client, path, **kwargs):
+    # Small synthetic fixtures only: serialize once, sign, and send those bytes.
+    outgoing = client.build_request("POST", path, **kwargs)
+    body = outgoing.read()
+    outgoing.headers.update(generate_headers("POST", path, body_hash=hashlib.sha256(body).hexdigest()))
+    return client.send(outgoing)
+
+
+async def signed_post_async(client, path, **kwargs):
+    outgoing = client.build_request("POST", path, **kwargs)
+    body = await outgoing.aread()
+    outgoing.headers.update(generate_headers("POST", path, body_hash=hashlib.sha256(body).hexdigest()))
+    return await client.send(outgoing)
+
+
 def test_public_routes_bypass_auth():
     assert client.get("/").status_code == 200
     assert client.get("/health").status_code == 200
