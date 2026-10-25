@@ -154,6 +154,22 @@ jobs:
         run: |
           timeout 90s "$UV_PROJECT_ENVIRONMENT/bin/python" -m pytest -q tests/test_markdown_admission.py tests/test_limiter.py tests/test_pdf_to_markdown.py
 
+      - name: Qualify Editor export text fidelity
+        env:
+          APP_ENV: test
+          STORAGE_MODE: local
+          WORKER_SHARED_SECRET: synthetic-f16-ci-secret
+          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/f11-sdk019-venv
+        run: |
+          timeout 90s "$UV_PROJECT_ENVIRONMENT/bin/python" -m pytest -q \
+            tests/test_editor_text_fidelity.py tests/test_editor.py \
+            tests/test_phase3a_surgical_rendering.py tests/test_phase3b_text_formatting_engine.py \
+            tests/test_phase3c_fidelity_audit.py tests/test_phase3d_word_level_style_editing.py \
+            tests/test_phase4_safety_rules.py tests/test_editor_rotation_rollback.py \
+            tests/test_studio_editor_compile_geometry.py tests/test_editor_native_colors.py \
+            tests/test_editor_ocr_engine_boundary.py tests/test_studio_editor_sdk_projection.py \
+            tests/test_legacy_editor_ocr_engine.py tests/test_phase8_editor_ocr_v2.py
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
