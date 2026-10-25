@@ -1292,6 +1292,12 @@ def _run_markup_job(
         cleanup_paths(input_path, payload_path, output_pdf_path)
 
 
+# Match the other actors' five-second capacity backoff, but keep a bounded
+# budget inside the claimed invocation so broker exhaustion cannot strand it.
+_MARKDOWN_LEASE_ATTEMPTS = 4
+_MARKDOWN_LEASE_RETRY_SECONDS = 5
+
+
 @dramatiq.actor(queue_name="conversion", max_retries=3)
 def pdf_to_markdown_job(
     job_id: str,
@@ -1306,24 +1312,55 @@ def pdf_to_markdown_job(
     if job is None:
         return
 
-    check_cancellation(job_id)
     owner_identity = getattr(job, "owner_identity", None) or "anonymous"
-    acquire_lease(job_id, owner_identity)
-
-    update_job(
-        job_id,
-        status=JobState.running,
-        started_at=datetime.now(timezone.utc),
-        progress=5,
-        message="Starting PDF to Markdown job",
-    )
-
-    input_path = temp_file_path("md-job-input-", ".pdf")
-    output_md_path = temp_file_path("md-job-output-", ".md")
+    claimed = False
+    acquired = False
+    input_path = output_md_path = None
 
     try:
         check_cancellation(job_id)
+        # The lease is task-scoped and accepts ALREADY_ACQUIRED. It cannot
+        # arbitrate duplicate deliveries; win the existing atomic claim first.
+        if claim_job(job_id) is None:
+            check_cancellation(job_id)
+            return
+        claimed = True
+
+        for attempt in range(_MARKDOWN_LEASE_ATTEMPTS):
+            check_cancellation(job_id)
+            acquired, reason = acquire_lease(job_id, owner_identity)
+            if acquired:
+                break
+            if attempt + 1 < _MARKDOWN_LEASE_ATTEMPTS:
+                time.sleep(_MARKDOWN_LEASE_RETRY_SECONDS)
+
+        if not acquired:
+            check_cancellation(job_id)
+            update_job(
+                job_id,
+                status=JobState.failed,
+                finished_at=datetime.now(timezone.utc),
+                error="PDF to Markdown execution capacity is unavailable. Try again later.",
+                error_code="TASK_STORAGE_UNAVAILABLE" if reason == "REDIS_ERROR" else "ENGINE_UNAVAILABLE",
+                message="PDF to Markdown admission failed",
+            )
+            # Cancellation remains sticky in the store, including a request
+            # racing the failed-state write above. Finish that transition too.
+            check_cancellation(job_id)
+            return
+
+        check_cancellation(job_id)
+        update_job(
+            job_id,
+            status=JobState.running,
+            progress=5,
+            message="Starting PDF to Markdown job",
+        )
+        input_path = temp_file_path("md-job-input-", ".pdf")
+        output_md_path = temp_file_path("md-job-output-", ".md")
+        check_cancellation(job_id)
         download_to_path(source_key, input_path)
+        check_cancellation(job_id)
 
         def on_progress(pct: int, msg: str) -> None:
             check_cancellation(job_id)
@@ -1373,11 +1410,17 @@ def pdf_to_markdown_job(
         )
         return
     except Exception as exc:
+        if not claimed:
+            # A failed/ambiguous store claim is not authority to finalize a
+            # job that another delivery may own. Let bounded broker retries
+            # handle storage recovery without starting document processing.
+            raise
         update_job(
             job_id,
             status=JobState.failed,
             finished_at=datetime.now(timezone.utc),
-            error=str(exc),
+            error="PDF to Markdown conversion failed. Try again later.",
+            error_code="CONVERSION_FAILED",
             message="PDF to Markdown job failed",
         )
         if is_non_retryable_error(exc):
@@ -1385,5 +1428,6 @@ def pdf_to_markdown_job(
             return
         raise
     finally:
-        release_lease(job_id, owner_identity)
+        if acquired:
+            release_lease(job_id, owner_identity)
         cleanup_paths(input_path, output_md_path)
