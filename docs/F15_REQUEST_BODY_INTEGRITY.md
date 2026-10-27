@@ -195,3 +195,118 @@ harness; no timing-dependent cancellation guarantee is claimed. Abrupt actor-hos
 failure, multi-replica duplicate races, production senders/storage, size-policy
 reconciliation and the authorized actor/Web API rollout/rollback decision remain
 outside this qualification.
+
+
+## F-11 metadata integration qualification — 2026-10-27
+
+**Draft source qualification only. F-11 and F-15 remain PARTIALLY RESOLVED /
+OPEN; production activation remains NO-GO. PR #6 stays OPEN / DRAFT / UNMERGED.**
+
+### Exact sources and preservation
+
+- Previous draft: `aa820c3c2fe8aa166df7a9a74af6199aaef75299`.
+- New main: `f074373fec05db5779281e1e0d45a58d67c6d0ce`, containing F-11
+  render-session metadata isolation [#9](https://github.com/gimesha-adikari/pdfnest-worker/pull/9),
+  fix `7d117b33ddb5fe703cc54a13b7afd0a440994367`.
+- Normal non-force merge: `2bee15bd7de1bf16b1912b8b9d7e30afc7ab8da3`;
+  first parent is the prior draft, second parent is new main. No textual conflicts.
+- Backend sender: `53f42a3c7116063786c45a8dcdc39676abc31090`.
+- Canonical docs reference: `c5ba5138b991888fd68c7e0fc7530b9c2a7ce0dc`.
+- Main's exact post-merge [CI run 40542485083](https://github.com/gimesha-adikari/pdfnest-worker/actions/runs/40542485083)
+  completed successfully before this refresh. This is source/build evidence only.
+
+All render application files and `app/core/native_child.py` match new main.
+F-14 actors/admission and F-16 Editor application files also match new main.
+`app/core/security.py` and `app/main.py` match the previous strict draft: mandatory
+five-field HMAC/raw-body binding, verification before dispatch, nonce protection,
+128 MiB ceiling, 64 KiB chunks and four spool slots/process are unchanged.
+The only additional changes beyond the merge are this append-only evidence,
+a focused interaction test, and its inclusion in the existing strict-auth CI
+step (with the already installed AnyIO plugin explicitly enabled). No new
+application logic, dependency, protocol, limit or deployment switch was added.
+The F-11/F-12, F-14, F-16 and non-publishing API/actor CI steps are retained.
+
+### New interaction evidence
+
+`tests/test_f15_render_session_integration.py` exercises the actual `app.main`
+middleware stack and real render routes using loopback-addressed ASGI requests.
+It does not start a listener or application lifespan/background services. Thirteen
+cases serialize each small synthetic multipart once, hash those exact bytes,
+and verify:
+
+- Signed creation/deduplication, empty-body signed GET/page-query and DELETE,
+  stored source equality, two-page metadata, and decoded JPEG dimensions.
+- Missing/malformed hash, changed PDF bytes and invalid HMAC reject before
+  metadata inspection/session creation and do not poison a valid nonce.
+- Replay cannot recreate a deleted session; valid invalid/corrupt PDFs return
+  safe `INVALID_DOCUMENT` errors without publishing a session.
+- Real supervised probe children time out/crash, terminate descendants and are
+  reaped. Authentication spools, private candidates and upload stages clean up;
+  the next valid request succeeds.
+- A real authenticated ASGI disconnect and direct request-task cancellation
+  during active child processing stop/reap the child before removing the input.
+  Auth spools are already closed after FastAPI consumes the verified multipart,
+  while metadata work is still active; neither staging lifecycle owns the other.
+- Native-capacity rejection remains safe HTTP 429 / `SESSION_METADATA_BUSY`,
+  with recovery. Existing metadata/resource suites cover manager-lock availability,
+  API responsiveness, atomic duplicate publication, deletion/eviction races,
+  bounded render admission and repeated cancellation.
+
+The child launch is redirected only in deterministic timeout/crash/cancellation
+probes; normal cases execute the real isolated PDF metadata and page-render code.
+No mocked authentication, HTTP parser, session manager or native-capacity policy
+is used. The ASGI checks are not a claim of socket/proxy disconnect qualification.
+
+### Focused local results
+
+Python 3.12.13, installed published SDK 0.1.9; isolated temporary roots and
+sequential native suites:
+
+- Strict auth/body/API/gateway/sign/redact plus the 13 interactions: **207 passed**.
+- Render/session/metadata/F-12 capacity/resource regressions: **59 passed**.
+- Native isolation/subprocess/OCR API/markup preview: **55 passed**.
+- F-14 Markdown claim/lease/limiter/conversion: **42 passed**, including a fresh
+  disposable 32 MiB loopback Redis fixture; it was stopped by its fixture.
+- F-16 Editor fidelity/geometry/OCR adapter regressions: **110 passed**.
+- Current backend shared sender and independent AST package tests under
+  `go test -race -count=1`: **28 passed, zero skipped/failed**, including real
+  loopback Go HTTP to old and strict Python receivers for empty, JSON and
+  streamed multipart bodies, plus tampered-body rejection.
+- Changed Python syntax, frozen lock consistency, all 81 installed package
+  compatibility, ancestry/source comparisons and diff integrity passed.
+
+These suite counts overlap. Existing Starlette/httpx deprecation remains.
+Initial new raw-ASGI probes used mixed-case header keys and were correctly
+rejected; the test was corrected to the ASGI lowercase-header contract. An
+initial Markdown run lacked the existing local Redis executable on PATH; the
+properly provisioned disposable-fixture rerun passed. No application behavior
+or security control was changed for either fixture correction.
+
+### Queued-lifecycle reuse and remaining boundaries
+
+The earlier actual Go HTTP -> strict receiver -> Redis/Dramatiq -> separate
+actor -> native Markdown -> local artifact -> signed retrieval result above is
+**reused, not rerun**. Exact Git blobs remain unchanged for actor/job models,
+store/lease/broker/storage, submission routes, native operation registry,
+isolation/supervisor/runner and all three queued-harness files. The new main
+extracts `native_child.apply_resource_limits()` for metadata reuse; its mandatory
+limits are preserved and the OCR protocol below `IN_CHILD` is structurally
+identical. The 55 current native regressions and 42 admission regressions cover
+that shared-helper integration. Backend worker/ocrv2/AST sender files also match
+the previously qualified sender merge. Public Go API/PostgreSQL/billing/customer
+retrieval and new full-queue execution are not claimed.
+
+Current merged backend Studio PDF source admission is 50 MiB, and preview keeps
+its distinct size-limit errors; historical 200 MiB notes above describe the prior
+source only. Other workflows/object-reference transfers retain separate limits.
+The authentication ceiling is unchanged. No deployed sender identity, shared
+secret, replay-store availability, aggregate spool capacity, actor/Web API
+transition or rollback readiness is established here. Reverting to the old
+receiver would reopen F-15; stale hashless senders remain incompatible.
+
+F-11 still does not establish aggregate host/process-tree or cross-node quotas,
+a complete OS sandbox, or interruptibility of stalled filesystem I/O. GitHub
+Codeac success is not a clean static-analysis verdict; introduced diagnostics
+must be inspected separately. Exact refreshed-head CI/Codeac outcomes are recorded
+on PR #6 after publication. No hosting access, manual deployment, production test,
+PR merge, ready transition or auto-merge is authorized or performed.
