@@ -150,7 +150,7 @@ jobs:
           WORKER_SHARED_SECRET: synthetic-f12-ci-secret
           UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/f11-sdk019-venv
         run: |
-          timeout 90s "$UV_PROJECT_ENVIRONMENT/bin/python" -m pytest -q -p anyio.pytest_plugin tests/test_render_resource_safety.py tests/test_render_sessions.py tests/test_render_capacity.py
+          timeout 90s "$UV_PROJECT_ENVIRONMENT/bin/python" -m pytest -q -p anyio.pytest_plugin tests/test_render_resource_safety.py tests/test_render_sessions.py tests/test_render_capacity.py tests/test_render_session_metadata.py
 
       - name: Qualify Markdown execution admission
         env:

@@ -9,9 +9,8 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import pymupdf as fitz
-
 from .renderer import PdfRenderDocument
+from .session_metadata import inspect_page_count, session_file_io
 
 
 SESSION_ROOT = Path(
@@ -56,50 +55,52 @@ class RenderSessionManager:
         self._sessions: dict[str, RenderSession] = {}
         self._lock = threading.RLock()
 
-    def create(
+    async def create(
             self,
             file_path: Path,
             file_size: int,
             sha256: str,
     ) -> RenderSession:
-        now = time.time()
-
-        with self._lock:
-            self._cleanup_expired_locked()
-
-            if len(self._sessions) >= MAX_SESSIONS:
-                self._evict_oldest_locked()
-
-            session_id = uuid.uuid4().hex
-            session_dir = SESSION_ROOT / session_id
-            session_dir.mkdir(parents=True, exist_ok=True)
-
-            target_path = session_dir / "source.pdf"
-            shutil.copyfile(file_path, target_path)
-
-            try:
-                doc = PdfRenderDocument.open(target_path)
-                try:
-                    page_count = doc.page_count
-                finally:
-                    doc.close()
-            except BaseException:
+        session_id = uuid.uuid4().hex
+        session_dir = SESSION_ROOT / session_id
+        session_dir.mkdir(mode=0o700, parents=True)
+        target_path = session_dir / "source.pdf"
+        published = False
+        try:
+            # Unpublished candidates are owned by this invocation. Expiry,
+            # deletion and eviction cannot remove them during verification.
+            await session_file_io(shutil.copyfile, file_path, target_path)
+            target_path.chmod(0o600)
+            page_count = await inspect_page_count(target_path)
+            with self._lock:
+                self._cleanup_expired_locked()
+                # Recheck after native work: simultaneous submissions may
+                # have published or deleted a matching session in the meantime.
+                for existing in self._sessions.values():
+                    if existing.sha256 == sha256:
+                        existing.last_accessed_at = time.time()
+                        return existing
+                if len(self._sessions) >= MAX_SESSIONS:
+                    self._evict_oldest_locked()
+                now = time.time()
+                session = RenderSession(
+                    session_id=session_id,
+                    file_path=target_path,
+                    file_size=file_size,
+                    sha256=sha256,
+                    page_count=page_count,
+                    created_at=now,
+                    last_accessed_at=now,
+                    document=None,
+                )
+                # No await between publication and return. A cancelled create
+                # cannot publish later from an abandoned background thread.
+                self._sessions[session_id] = session
+                published = True
+                return session
+        finally:
+            if not published:
                 shutil.rmtree(session_dir, ignore_errors=True)
-                raise
-
-            session = RenderSession(
-                session_id=session_id,
-                file_path=target_path,
-                file_size=file_size,
-                sha256=sha256,
-                page_count=page_count,
-                created_at=now,
-                last_accessed_at=now,
-                document=None,
-            )
-
-            self._sessions[session_id] = session
-            return session
 
     def get(self, session_id: str) -> RenderSession:
         with self._lock:

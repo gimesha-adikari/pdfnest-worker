@@ -354,3 +354,41 @@ An ungraceful owner death can leave bounded private staging files for operationa
 cleanup; it must not leave live native processing. No cgroup or service-manager
 configuration is changed by this patch. Whole-Worker F-11 closure remains partial
 until aggregate resource/runtime qualification and non-OCR native paths are covered.
+
+## Render-session metadata follow-up
+
+Render-session creation now stages a private candidate and inspects its page
+count in a fresh supervised child, outside both the API event loop and the
+session-manager lock. It reuses the existing process-group runner, owner-death
+guardian, local native capacity slot and child resource ceilings. The metadata
+command is deliberately separate from OCR's operation registry/page-limit and
+error contract. The common child-limit function is reused without changing OCR
+limits: 1 GiB address space, 180 CPU seconds, 64 MiB per file, 128 descriptors and
+no core dumps. Metadata has a 30-second wall deadline and 1 KiB capture per
+stdout/stderr stream; malformed child output cannot become a session.
+
+Session creation uses the existing bounded render admission/queue. Native
+capacity contention fails with 429 rather than accumulating blocked metadata
+threads. Cancellation/disconnect requests terminate the supervised process group
+and wait/reap the direct supervisor before deleting input/candidate files;
+repeated cancellation cannot detach file I/O or native supervision. Regular
+filesystem I/O is joined before cleanup, not claimed to be forcibly killable
+under an OS-level disk stall. Host/process-tree aggregate limits and cross-node
+admission remain unqualified.
+
+Only verified candidates can enter the session map. Publication rechecks hash
+deduplication and enforces eviction under the manager lock; unpublished paths are
+not candidates for session deletion/expiry/eviction. Failed creation does not
+evict valid sessions. Concurrent requests may receive normal capacity rejection;
+existing cached-session reuse and atomic duplicate publication remain supported.
+Creation success keeps `session_id`, `page_count`, `file_size`. Invalid/empty PDFs
+remain 400; metadata capacity is 429, timeout 504, child failure/unavailability
+503 and unexpected creation failure 500, with fixed safe public messages. Page
+retrieval/raster error contracts are unchanged.
+
+Focused tests use small PDFs and synchronized child probes for timeouts, crashes,
+output flooding, repeated cancellation, cleanup, event-loop responsiveness,
+deduplication, deletion/eviction and page rendering. This closes the specific
+in-process render-session metadata boundary, **not all F-11 residual scope**.
+F-11 remains PARTIALLY RESOLVED / OPEN. F-15 remains PARTIALLY RESOLVED / OPEN;
+its separate strict-authentication PR is not modified or activated by this work.
