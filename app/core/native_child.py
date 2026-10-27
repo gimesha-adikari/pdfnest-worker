@@ -8,7 +8,8 @@ import sys
 import time
 
 
-def main():
+def apply_resource_limits():
+    """Apply the shared native-child ceilings before importing PDF libraries."""
     from app.core import native_isolation as boundary
     def tighten(kind, ceiling):
         _, inherited = resource.getrlimit(kind)
@@ -19,6 +20,11 @@ def main():
     tighten(resource.RLIMIT_FSIZE, boundary.CHILD_FILES)
     tighten(resource.RLIMIT_CORE, 0)
     tighten(resource.RLIMIT_NOFILE, 128)
+
+
+def main():
+    from app.core import native_isolation as boundary
+    apply_resource_limits()
     boundary.IN_CHILD = True
     root = Path(sys.argv[1])
     try:

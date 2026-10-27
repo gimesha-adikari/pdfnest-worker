@@ -5,6 +5,7 @@ from fastapi.responses import Response
 
 from app.core.config import settings
 from .limiter import render_limiter
+from .session_metadata import MetadataBusy, MetadataFailed, MetadataTimeout, MetadataUnavailable
 from .service import (
     create_render_session,
     delete_render_session,
@@ -144,10 +145,11 @@ async def render_page(
 
 @router.post("/sessions")
 async def create_session(
+        request: Request,
         file: UploadFile = File(...),
 ):
     try:
-        session = await create_render_session(file)
+        session = await render_until_disconnect(request, create_render_session(file))
 
         return {
             "session_id": session.session_id,
@@ -155,12 +157,42 @@ async def create_session(
             "file_size": session.file_size,
         }
 
+    except HTTPException as exc:
+        if exc.status_code == 504:
+            raise HTTPException(504, detail={
+                "code": "SESSION_METADATA_TIMEOUT",
+                "message": "PDF metadata inspection timed out. Try a simpler PDF.",
+            }) from exc
+        raise
+
+    except MetadataBusy as exc:
+        raise HTTPException(429, detail={
+            "code": "SESSION_METADATA_BUSY", "message": "Native processing capacity is busy. Retry shortly.",
+        }, headers={"Retry-After": "2"}) from exc
+
+    except MetadataTimeout as exc:
+        raise HTTPException(504, detail={
+            "code": "SESSION_METADATA_TIMEOUT", "message": "PDF metadata inspection timed out. Try a simpler PDF.",
+        }) from exc
+
+    except MetadataFailed as exc:
+        raise HTTPException(503, detail={
+            "code": "SESSION_METADATA_FAILED", "message": "PDF metadata processing failed. Retry later.",
+        }) from exc
+
+    except MetadataUnavailable as exc:
+        raise HTTPException(503, detail={
+            "code": "SESSION_METADATA_UNAVAILABLE", "message": "PDF metadata processing is temporarily unavailable.",
+        }) from exc
+
     except ValueError as exc:
         raise HTTPException(
             status_code=400,
             detail={
                 "code": "INVALID_DOCUMENT",
-                "message": str(exc),
+                "message": "Empty PDF uploaded." if str(exc) == "Empty file uploaded" else (
+                    "PDF contains no pages." if str(exc) == "PDF contains no pages" else "File is not a valid PDF."
+                ),
             },
         ) from exc
 
@@ -169,7 +201,7 @@ async def create_session(
             status_code=500,
             detail={
                 "code": "SESSION_CREATE_FAILED",
-                "message": str(exc),
+                "message": "Render session could not be created. Retry later.",
             },
         ) from exc
 
