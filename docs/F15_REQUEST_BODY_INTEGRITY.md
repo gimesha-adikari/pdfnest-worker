@@ -131,3 +131,67 @@ Rollback Web API to the recorded compatible receiver if authorized; this reopens
 the original integrity weakness. Never restore a hashless sender while a strict
 receiver remains active. No hosting access, deployment or rollout is authorized by
 this draft refresh.
+
+## Opt-in local queued lifecycle qualification — 2026-10-27
+
+`tests/f15_queued_e2e.py` now qualifies the previously untested **private Go
+client -> real Worker HTTP -> strict middleware -> real RedisBroker -> separate
+Dramatiq actor -> native transformation -> local object -> signed retrieval**
+chain. It does not qualify the public Go API/PostgreSQL/billing/customer-download
+chain or establish production readiness. F-15 remains **PARTIALLY RESOLVED / OPEN**;
+PR #6 must remain **OPEN / DRAFT / UNMERGED**.
+
+Run from the candidate Worker root using its installed Python environment:
+
+```sh
+python tests/f15_queued_e2e.py \
+  --backend-root /path/to/verified/backend-checkout \
+  --redis-server /path/to/redis-server \
+  --report /tmp/f15-queued-evidence.json
+```
+
+The backend must be at sender merge
+`6713d7c26d95cdaadbebe6629aab0c43c35671c7`, with unchanged application files.
+The test verifies that source identity, disables dotenv, passes only synthetic
+configuration to child services and uses random loopback ports, a fresh 32 MiB
+Redis instance/database, one actor process/thread and a private local storage
+root. The Go fixture imports the actual backend `internal/ocrv2` and shared
+`internal/worker` clients. Its temporary source directory inside the backend
+module is removed after compilation. Existing development services are not used.
+Dependencies must already be installed/cached; Go module network fetching is off.
+An explicit `F15_GO_CACHE` development cache is optional; otherwise the cache is
+also test-owned. This test is opt-in, not a new default-CI live-service requirement.
+
+The two-page selectable-text `PDF_MARKDOWN_V2` fixture produces persisted
+structured JSON containing Markdown. Evidence records real queue/message/job IDs,
+actor PID, Redis `queued`/`running`/`succeeded` observations, timestamps, artifact
+size/SHA-256 and process exits. Test-only middleware and an audit hook observe
+real actor deliveries and native subprocess starts; they replace no application
+function, broker, claim, storage or engine. Two enqueued deliveries of the same
+job produce one native transformation, preserving the successful artifact.
+
+Negative cases reject tampered bytes, missing/malformed hashes, invalid HMAC and
+hashless signatures with HTTP 401, zero jobs and zero broker messages. A signed
+status request succeeds once and rejects nonce replay. Result retrieval without
+a signature fails. Missing objects and corrupt synthetic PDFs reach safe failed
+states through the real actor, with no published result or internal path in the
+public error; signed result retrieval is rejected.
+
+The harness checks consumed broker payloads, released leases, removal of input,
+processing and result-readback files, and absence of open unlinked auth spools.
+The native subsystem's one persistent empty capacity-lock inode is expected:
+its lock must be released, and it is removed only with the complete test-owned
+root after shutdown. Redis and actor exit normally; the loopback Uvicorn process
+exits on the requested SIGTERM. All test processes/descendants are stopped before
+the temporary root is removed. Only the synthetic JSON evidence report is retained.
+
+Local qualification passed the complete chain and 258 focused existing
+security/Markdown-admission/output-contract regressions. Initial harness-only
+launch/cleanup assertions were corrected (preserve Redis multicall executable
+name; distinguish the expected fixed lock inode from leaked processing files).
+No application correction was needed. Mid-native cancellation was **not tested**:
+there is no externally signalled deterministic processing checkpoint in this
+harness; no timing-dependent cancellation guarantee is claimed. Abrupt actor-host
+failure, multi-replica duplicate races, production senders/storage, size-policy
+reconciliation and the authorized actor/Web API rollout/rollback decision remain
+outside this qualification.
