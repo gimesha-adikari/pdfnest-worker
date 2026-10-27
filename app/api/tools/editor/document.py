@@ -562,6 +562,26 @@ def tokenize_words(text: str) -> list[dict[str, Any]]:
     return words
 
 
+def _text_diff_range(orig: str, edit: str, o_start: int, o_end: int, e_start: int, e_end: int) -> dict[str, Any] | None:
+    """Keep changed separators while leaving shared boundary whitespace alone."""
+    while o_start < o_end and e_start < e_end and orig[o_start] == edit[e_start] and orig[o_start].isspace():
+        o_start += 1
+        e_start += 1
+    while o_end > o_start and e_end > e_start and orig[o_end - 1] == edit[e_end - 1] and orig[o_end - 1].isspace():
+        o_end -= 1
+        e_end -= 1
+    if orig[o_start:o_end] == edit[e_start:e_end]:
+        return None
+    return {
+        "operation": "insert" if o_start == o_end else "delete" if e_start == e_end else "replace",
+        "original_start": o_start, "original_end": o_end,
+        "original_substring": orig[o_start:o_end],
+        "edited_start": e_start, "edited_end": e_end,
+        "replacement_substring": edit[e_start:e_end],
+        "sub_word_punctuation": False,
+    }
+
+
 def compute_text_diff(original_text: str, edited_text: str) -> list[dict[str, Any]]:
     """Compute semantic edit diff operations between original_text and edited_text.
 
@@ -578,6 +598,9 @@ def compute_text_diff(original_text: str, edited_text: str) -> list[dict[str, An
     edit_word_list = [t["word"] for t in edit_tokens]
 
     diff_ops: list[dict[str, Any]] = []
+    if not orig_tokens and not edit_tokens:
+        op = _text_diff_range(orig, edit, 0, len(orig), 0, len(edit))
+        return [op] if op else []
 
     # 1. Fast-path: Equal number of word tokens (1-to-1 word alignment)
     if len(orig_word_list) == len(edit_word_list) and len(orig_word_list) > 0:
@@ -631,53 +654,56 @@ def compute_text_diff(original_text: str, edited_text: str) -> list[dict[str, An
                 })
             else:
                 i += 1
-        return diff_ops
+        # Word matching alone cannot represent a changed separator.
+        for index in range(len(orig_tokens) + 1):
+            gap_start = orig_tokens[index - 1]["end"] if index else 0
+            gap_end = orig_tokens[index]["start"] if index < len(orig_tokens) else len(orig)
+            if any(op["original_start"] < gap_start and gap_end < op["original_end"] for op in diff_ops):
+                continue  # Already included in a multi-word replacement.
+            op = _text_diff_range(
+                orig, edit,
+                gap_start, gap_end,
+                edit_tokens[index - 1]["end"] if index else 0,
+                edit_tokens[index]["start"] if index < len(edit_tokens) else len(edit),
+            )
+            if op:
+                diff_ops.append(op)
+        return sorted(diff_ops, key=lambda op: op["original_start"])
 
     # 2. General-path for unequal token counts using SequenceMatcher on word tokens
     matcher = difflib.SequenceMatcher(None, orig_word_list, edit_word_list)
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
         if tag == "equal":
+            if i1 == 0 and j1 == 0:
+                op = _text_diff_range(orig, edit, 0, orig_tokens[0]["start"], 0, edit_tokens[0]["start"])
+                if op:
+                    diff_ops.append(op)
+            # Preserve whitespace changes inside an otherwise equal word run.
+            for offset in range(1, i2 - i1):
+                op = _text_diff_range(orig, edit, orig_tokens[i1 + offset - 1]["end"], orig_tokens[i1 + offset]["start"],
+                                      edit_tokens[j1 + offset - 1]["end"], edit_tokens[j1 + offset]["start"])
+                if op:
+                    diff_ops.append(op)
+            if i2 == len(orig_tokens) and j2 == len(edit_tokens):
+                op = _text_diff_range(orig, edit, orig_tokens[-1]["end"], len(orig), edit_tokens[-1]["end"], len(edit))
+                if op:
+                    diff_ops.append(op)
             continue
 
-        if i1 < len(orig_tokens):
-            o_start = orig_tokens[i1]["start"]
-        elif orig_tokens:
-            o_start = orig_tokens[-1]["end"]
-        else:
-            o_start = 0
+        # Include the gap between unchanged anchors. Trimming only their
+        # shared whitespace retains inserted/deleted spaces and valid empty
+        # ranges (an insertion always has start == end).
+        op = _text_diff_range(
+            orig, edit,
+            orig_tokens[i1 - 1]["end"] if i1 else 0,
+            orig_tokens[i2]["start"] if i2 < len(orig_tokens) else len(orig),
+            edit_tokens[j1 - 1]["end"] if j1 else 0,
+            edit_tokens[j2]["start"] if j2 < len(edit_tokens) else len(edit),
+        )
+        if op:
+            diff_ops.append(op)
 
-        if i2 > 0 and i2 - 1 < len(orig_tokens):
-            o_end = orig_tokens[i2 - 1]["end"]
-        else:
-            o_end = o_start
-
-        if j1 < len(edit_tokens):
-            e_start = edit_tokens[j1]["start"]
-        elif edit_tokens:
-            e_start = edit_tokens[-1]["end"]
-        else:
-            e_start = 0
-
-        if j2 > 0 and j2 - 1 < len(edit_tokens):
-            e_end = edit_tokens[j2 - 1]["end"]
-        else:
-            e_end = e_start
-
-        o_sub = orig[o_start:o_end] if i1 < i2 else ""
-        e_sub = edit[e_start:e_end] if j1 < j2 else ""
-
-        diff_ops.append({
-            "operation": tag,
-            "original_start": o_start,
-            "original_end": o_end,
-            "original_substring": o_sub,
-            "edited_start": e_start,
-            "edited_end": e_end,
-            "replacement_substring": e_sub,
-            "sub_word_punctuation": False,
-        })
-
-    return diff_ops
+    return sorted(diff_ops, key=lambda op: op["original_start"])
 
 
 def extract_page_char_map(page: fitz.Page) -> list[dict[str, Any]]:
@@ -827,6 +853,24 @@ def resolve_surgical_targets(page: fitz.Page, element: dict[str, Any]) -> list[d
                 text_matches,
                 key=lambda l: difflib.SequenceMatcher(None, l["text"], orig_text).ratio()
             )
+
+    # Interior insertions need to move the remaining text, not paint over it.
+    # Reuse the renderer on only the edited element's affected suffix. Never
+    # extend this redaction into unrelated text on a loosely matched line.
+    if matched_line and matched_line["text"] == orig_text:
+        structural = next((op for op in diff_ops if op["operation"] in ("insert", "delete")
+                           and op["original_start"] < len(orig_text)), None)
+        if structural:
+            start, edited_start = structural["original_start"], structural["edited_start"]
+            diff_ops = [op for op in diff_ops if op["original_start"] < start]
+            diff_ops.append({
+                "operation": "replace" if edit_text[edited_start:] else "delete",
+                "original_start": start, "original_end": len(orig_text),
+                "original_substring": orig_text[start:],
+                "edited_start": edited_start, "edited_end": len(edit_text),
+                "replacement_substring": edit_text[edited_start:],
+                "sub_word_punctuation": False,
+            })
 
     targets: list[dict[str, Any]] = []
 
@@ -1208,7 +1252,9 @@ def compute_effective_style(element: dict[str, Any], font_info: dict[str, Any] |
         font_family = str(font_family_override).lower()
         font_source = "user_override"
 
-    font_size = float(style_override.get("fontSize") or element.get("size", orig_size))
+    # ``size`` may be an OCR projection estimate even on a native-text page.
+    # Exact source glyph metrics win unless the user supplied a style override.
+    font_size = float(style_override.get("fontSize") or orig_size)
     color = str(style_override.get("color") or element.get("text_color", orig_color))
 
     bold = bool(style_override.get("bold", element.get("bold", False)))

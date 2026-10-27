@@ -199,18 +199,18 @@ def test_compute_text_diff_all_cases_phase2_5():
     assert len(diffC) == 1
     assert diffC[0]["operation"] == "insert"
     assert diffC[0]["original_substring"] == ""
-    assert diffC[0]["replacement_substring"] == "wonderful"
+    assert diffC[0]["replacement_substring"] == "wonderful "
     assert diffC[0]["original_start"] == 6
-    assert diffC[0]["original_end"] == 5
+    assert diffC[0]["original_end"] == 6
 
     # D. Word deletion: 'Hello wonderful world' -> 'Hello world'
     diffD = compute_text_diff("Hello wonderful world", "Hello world")
     assert len(diffD) == 1
     assert diffD[0]["operation"] == "delete"
-    assert diffD[0]["original_substring"] == "wonderful"
+    assert diffD[0]["original_substring"] == "wonderful "
     assert diffD[0]["replacement_substring"] == ""
     assert diffD[0]["original_start"] == 6
-    assert diffD[0]["original_end"] == 15
+    assert diffD[0]["original_end"] == 16
 
     # E. Ambiguous repeated word: 'Java Java Java' -> 'Java Python Java'
     diffE = compute_text_diff("Java Java Java", "Java Python Java")
@@ -226,7 +226,7 @@ def test_compute_text_diff_all_cases_phase2_5():
     assert len(diffF) == 1
     assert diffF[0]["operation"] == "insert"
     assert diffF[0]["original_substring"] == ""
-    assert diffF[0]["replacement_substring"] == "Senior"
+    assert diffF[0]["replacement_substring"] == "Senior "
     assert diffF[0]["original_start"] == 0
 
     # G. Truncation / shortening: 'Developer' -> 'Dev'
@@ -300,7 +300,7 @@ def test_insertion_target_has_no_original_glyph_bbox():
     page.insert_text((50, 50), "Hello world", fontsize=12)
 
     element = {
-        "text": "Hello wonderful world",
+        "text": "Hello world wonderful",
         "original_text": "Hello world",
         "x": 50,
         "y": 40,
@@ -314,7 +314,7 @@ def test_insertion_target_has_no_original_glyph_bbox():
 
     target = targets[0]
     assert target["operation"] == "insert"
-    assert target["replacement_substring"] == "wonderful"
+    assert target["replacement_substring"] == " wonderful"
     assert target["target_bbox"] is None  # Must NOT invent fake bbox for non-existent original text
     assert target["insertion_point"] is not None
     assert target["insertion_point"][0] > 50  # Right edge of 'Hello '
