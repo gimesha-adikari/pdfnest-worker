@@ -64,7 +64,7 @@ async def test_session_subprocess_no_cache_and_cleanup(tmp_path, monkeypatch):
     monkeypatch.setattr(service, 'session_manager', manager)
     path = tmp_path / 'sample.pdf'
     path.write_bytes(pdf())
-    item = manager.create(path, path.stat().st_size, 'fixture')
+    item = await manager.create(path, path.stat().st_size, 'fixture')
     assert item.document is None
     for dpi in (72, 108.5, 144):
         result = await service.get_render_session_page(item.session_id, 1, dpi)
@@ -73,7 +73,7 @@ async def test_session_subprocess_no_cache_and_cleanup(tmp_path, monkeypatch):
     manager.delete(item.session_id)
     assert not item.file_path.exists()
     with pytest.raises(KeyError): manager.get(item.session_id)
-    item = manager.create(path, path.stat().st_size, 'fixture')
+    item = await manager.create(path, path.stat().st_size, 'fixture')
     item.last_accessed_at = 0
     with pytest.raises(KeyError): manager.get(item.session_id)
     assert not item.file_path.exists()

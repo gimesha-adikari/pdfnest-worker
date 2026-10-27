@@ -16,6 +16,7 @@ from .persistent_pool import (
 )
 from .renderer import validate_preview_dpi
 from .session import RenderSession, session_manager, sha256_file
+from .session_metadata import session_file_io
 
 
 async def render_page_to_jpeg_bytes_subprocess(
@@ -200,6 +201,16 @@ async def render_page_to_jpeg_bytes(
 async def create_render_session(
         file: UploadFile,
 ) -> RenderSession:
+    from .limiter import render_limiter
+    operation = _create_render_session(file)
+    try:
+        return await render_limiter.run(operation)
+    finally:
+        # Admission may reject before the coroutine is ever awaited.
+        operation.close()
+
+
+async def _create_render_session(file: UploadFile) -> RenderSession:
     temp_file = tempfile.NamedTemporaryFile(
         prefix="pdfnest-session-upload-",
         suffix=".pdf",
@@ -215,7 +226,7 @@ async def create_render_session(
             if not chunk:
                 break
 
-            temp_file.write(chunk)
+            await session_file_io(temp_file.write, chunk)
 
         temp_file.flush()
         temp_file.close()
@@ -225,14 +236,14 @@ async def create_render_session(
         if file_size <= 0:
             raise ValueError("Empty file uploaded")
 
-        sha256 = sha256_file(temp_path)
+        sha256 = await session_file_io(sha256_file, temp_path)
 
         existing = session_manager.find_by_hash(sha256)
 
         if existing is not None:
             return existing
 
-        return session_manager.create(
+        return await session_manager.create(
             file_path=temp_path,
             file_size=file_size,
             sha256=sha256,
@@ -240,9 +251,12 @@ async def create_render_session(
 
     finally:
         try:
-            temp_path.unlink(missing_ok=True)
-        except Exception:
-            pass
+            temp_file.close()
+        finally:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 async def get_render_session_page(
