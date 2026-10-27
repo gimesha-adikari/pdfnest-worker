@@ -62,18 +62,21 @@ instance using that client key. Missing, broken or inconclusive replay storage
 fails closed. Only the tests provide an in-memory implementation: distributed
 and persistent replay enforcement is **not implemented or qualified** here.
 
-### Body integrity limitation
+### Body integrity compatibility (F-15)
 
-The worker signs an optional body-hash **claim** but never independently hashes
-received body bytes. Tests demonstrate that different bodies with the same signed
-claim both pass the real verifier. Neither a gateway signature nor that header
-proves document-body integrity. A production transport must authenticate its peer
-and protect both hops against modification and disclosure, normally with verified
-TLS (or a separately reviewed authenticated encrypted private channel). Railway
-private-network reachability alone is not evidence of that protection. Independently
-verified end-to-end body integrity would require a separately reviewed protocol
-change; it cannot be claimed from this foundation. No body buffering/hash scheme
-or production authentication change is introduced here.
+The corrected Worker HTTP verifier requires canonical lowercase SHA-256 of the
+actual raw request body, including the empty body. It rejects legacy hashless
+signatures, malformed claims and valid HMACs over incorrect body claims before
+routing. Tests cover this strict origin boundary, unchanged target signing and
+nonce non-poisoning on a body mismatch.
+
+This inert foundation still authenticates/forwards an optional **claim** and
+streams without verifying client bytes. It has no production listener or
+transport. Its legacy examples therefore cannot be activated against the strict
+Worker unchanged. A future adapter must supply the actual body digest; the
+Worker independently verifies it. A gateway must not claim verified client-body
+integrity from its current header-only authenticator. No gateway implementation,
+activation, admission redesign or rollout is part of F-15.
 
 ## Classification and admission
 

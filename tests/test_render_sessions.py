@@ -4,7 +4,7 @@ import io
 from fastapi.testclient import TestClient
 import fitz
 from app.main import app
-from tests.test_security import generate_headers
+from tests.test_security import generate_headers, signed_post
 
 client = TestClient(app)
 
@@ -24,7 +24,7 @@ def test_render_session_lifecycle():
 
     # 1. Create Session
     headers1 = generate_headers("POST", "/api/v1/render/sessions")
-    res_session = client.post(
+    res_session = signed_post(client,
         "/api/v1/render/sessions",
         files={"file": ("test.pdf", pdf_bytes, "application/pdf")},
         headers=headers1,
@@ -37,7 +37,7 @@ def test_render_session_lifecycle():
 
     # 2. Duplicate Session Creation (SHA256 Deduplication test)
     headers2 = generate_headers("POST", "/api/v1/render/sessions")
-    res_session_dup = client.post(
+    res_session_dup = signed_post(client,
         "/api/v1/render/sessions",
         files={"file": ("test.pdf", pdf_bytes, "application/pdf")},
         headers=headers2,
