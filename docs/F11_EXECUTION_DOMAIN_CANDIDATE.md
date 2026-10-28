@@ -145,3 +145,46 @@ Use a clean Python 3.12 environment from the frozen lock, installed SDK 0.1.9 an
 The next separately bounded task must select an operator-owned nonproduction controller and prove protected control access, pre-native membership, kernel controls, independent timeout/owner-death behavior, complete detached-tree drainage, durable quarantine/recovery and safe pool reuse. A user-level scope with an unrestricted bus accessible to native children is insufficient. No privilege, service provisioning, production budget, fleet admission or rollout is approved here.
 
 F-11, F-07 and F-15 remain **PARTIALLY RESOLVED / OPEN**. F-15 production activation remains **NO-GO**. This candidate is **draft only; do not merge**.
+
+## 2026-10-29 implementation addendum — control receipts and deployment gate
+
+This addendum preserves the historical candidate and F11-10-01, F11-10-02 and
+F11-10-03 evidence above. Required mode remains dormant: no runtime adapter or
+startup registration is installed, and legacy behavior is unchanged.
+
+The client now rejects late capability, acquisition, preparation, execution and
+drain receipts, including the handoff capability refresh. Zero admission wait
+still means no capacity queue; an immediate acquisition outcome has a separate
+finite five-second control delivery budget. Cancellation is rechecked after
+control responses and native completion. Late/uncertain outcomes cannot free a
+slot or publish output. These checks reject late responses; they cannot interrupt
+a hung adapter and do not implement an independent deadline.
+
+Required-mode launch hints now have finite command, environment-value and output
+bounds. Only exact reviewed OCR settings, locale and temporary-directory names
+are forwarded. Worker service credentials, manager endpoints, loader hooks and
+`PYTHONPATH` are excluded. The controller must provide its own immutable runtime,
+fixed executable/module allowlist and environment, and validate all path hints.
+This is not filesystem or identity confinement.
+
+The repository's API/actor Dockerfiles run unprivileged containers. Railway's
+[runner guide](https://docs.railway.com/guides/github-actions-runners) states that
+its containers are non-privileged, while its
+[replica limits](https://docs.railway.com/pricing/cost-control) document CPU/memory
+limits for an entire replica. These public interfaces do not establish the
+independent per-operation system manager, protected native identities, swap/tasks
+controls or cleanup authority required by specification #99. A separate Railway
+service and private networking alone do not establish those properties. Railway
+[Sandboxes](https://docs.railway.com/sandboxes) use VMs and are outside this task's
+explicit no-VM constraint.
+
+The viable conditional topology is an operator-controlled Linux execution service
+outside the existing unprivileged API/actor containers, with a protected broker,
+separate native identities and manager-owned cgroup v2 domains as specified in
+#99. Crossing a container/host boundary requires bounded authenticated input,
+output and callback transfer; client interpreter paths, PIDs and temporary paths
+cannot be executed or mapped blindly. No supported host, provisioning authority
+or complete transfer/runtime adapter has been established here. **Deployment,
+real aggregate enforcement, detached-descendant cleanup and durable recovery
+remain BLOCKED. F-11 remains PARTIALLY RESOLVED / OPEN.** Synthetic tests verify
+only the client boundary and preserve refusal without a verified controller.
