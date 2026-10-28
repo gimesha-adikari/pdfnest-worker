@@ -211,78 +211,103 @@ def execute(operation, *args, **kwargs):
             if callback is not None:
                 callback()
     check()
-    with _capacity(check, 30), tempfile.TemporaryDirectory(prefix='platen-native-') as directory:
-        root = Path(directory)
-        scratch = root / 'tmp'
-        scratch.mkdir()
-        arguments = list(args)
-        # Native output and renderer sibling temporaries stay in the owned
-        # job directory. Publish only after successful exit and result decode.
-        output = None
-        output_name = OPERATIONS[operation][2]
-        if output_name:
-            if len(arguments) >= 2:
-                output = Path(arguments[1])
-                arguments[1] = str(scratch / ('output' + output.suffix))
-            elif output_name in options:
-                output = Path(options[output_name])
-                options[output_name] = str(scratch / ('output' + output.suffix))
-        request = {'operation': operation, 'args': encode(arguments), 'kwargs': encode(options),
-                   'callbacks': list(callbacks), 'raster_limit': limit}
-        write_frame(root / 'request.json', request)
-        events = 0
-        total_event_bytes = 0
-        def poll():
-            nonlocal events, total_event_bytes
+    from app.core.native_domain import admit, staged_directory, DomainBusy, DomainUnavailable
+    pending = None
+    try:
+        with admit(check, 30, lambda: _capacity(check, 30)) as domain:
+            with staged_directory(domain, prefix='platen-native-') as directory:
+                root = Path(directory)
+                scratch = root / 'tmp'
+                scratch.mkdir()
+                arguments = list(args)
+                # Native output and renderer sibling temporaries stay in the owned
+                # job directory. Publish only after successful exit and result decode.
+                output = None
+                output_name = OPERATIONS[operation][2]
+                if output_name:
+                    if len(arguments) >= 2:
+                        output = Path(arguments[1])
+                        arguments[1] = str(scratch / ('output' + output.suffix))
+                    elif output_name in options:
+                        output = Path(options[output_name])
+                        options[output_name] = str(scratch / ('output' + output.suffix))
+                request = {'operation': operation, 'args': encode(arguments), 'kwargs': encode(options),
+                           'callbacks': list(callbacks), 'raster_limit': limit}
+                write_frame(root / 'request.json', request)
+                events = 0
+                total_event_bytes = 0
+                def poll():
+                    nonlocal events, total_event_bytes
+                    check()
+                    event_path = root / 'event.json'
+                    if event_path.exists():
+                        events += 1
+                        total_event_bytes += event_path.stat().st_size
+                        if events > MAX_EVENTS or total_event_bytes > 64 * 1024 * 1024:
+                            raise ValueError('Native callback budget exceeded')
+                        event = read_frame(event_path)
+                        callback = callbacks[event['name']]
+                        if event['name'] == 'cancellation_check':
+                            raise ValueError('Invalid native callback')
+                        callback(*decode(event['args']))
+                        event_path.unlink()  # Acknowledges validation/progress before continuation.
+                env = os.environ.copy()
+                env.update(TMPDIR=str(scratch), TMP=str(scratch), TEMP=str(scratch),
+                           OPENBLAS_NUM_THREADS='1', OMP_NUM_THREADS='1',
+                           OCR_PAGE_WORKERS='1', GLOBAL_TESSERACT_CAPACITY='1')
+                env['PYTHONPATH'] = str(Path(__file__).resolve().parents[2])
+                try:
+                    completed = domain.run(
+                        [sys.executable, '-m', 'app.core.native_supervisor', str(root), str(os.getpid())],
+                        timeout=CHILD_WALL, cancellation_check=poll, env=env,
+                        max_output_bytes=64 * 1024, cleanup_group_on_exit=True,
+                        legacy_runner=run_hardened_subprocess,
+                    )
+                except subprocess.TimeoutExpired as exc:
+                    raise OCRTimeoutError('Isolated native processing timed out') from exc
+                domain.drain()
+                if completed.returncode != 0 or not (root / 'result.json').is_file():
+                    raise EngineUnavailableError('Isolated native processing failed or exceeded resource limits')
+                frame = read_frame(root / 'result.json')
+                if 'error' in frame:
+                    raise_error(frame['error'])
+                result = decode(frame['result'])
+                check()
+                if output is not None:
+                    staged = scratch / ('output' + output.suffix)
+                    if not staged.exists() or not stat.S_ISREG(staged.lstat().st_mode) or staged.stat().st_size > CHILD_FILES:
+                        raise EngineUnavailableError('Isolated native output is missing or oversized')
+                    output.parent.mkdir(parents=True, exist_ok=True)
+                    fd, sibling_name = tempfile.mkstemp(prefix='.native-output-', dir=output.parent)
+                    sibling = Path(sibling_name)
+                    try:
+                        with os.fdopen(fd, 'wb') as destination, staged.open('rb') as source:
+                            shutil.copyfileobj(source, destination, length=64 * 1024)
+                            destination.flush()
+                            os.fsync(destination.fileno())
+                        if domain.required:
+                            pending = sibling
+                        else:
+                            os.replace(sibling, output)
+                    finally:
+                        if sibling != pending:
+                            sibling.unlink(missing_ok=True)
+            if domain.required:
+                check()
+            domain.cleanup_complete()
+        # Hard-mode publication follows domain drainage, validation, staging
+        # cleanup and controller release. Legacy publication keeps its old order.
+        if pending is not None:
             check()
-            event_path = root / 'event.json'
-            if event_path.exists():
-                events += 1
-                total_event_bytes += event_path.stat().st_size
-                if events > MAX_EVENTS or total_event_bytes > 64 * 1024 * 1024:
-                    raise ValueError('Native callback budget exceeded')
-                event = read_frame(event_path)
-                callback = callbacks[event['name']]
-                if event['name'] == 'cancellation_check':
-                    raise ValueError('Invalid native callback')
-                callback(*decode(event['args']))
-                event_path.unlink()  # Acknowledges validation/progress before continuation.
-        env = os.environ.copy()
-        env.update(TMPDIR=str(scratch), TMP=str(scratch), TEMP=str(scratch),
-                   OPENBLAS_NUM_THREADS='1', OMP_NUM_THREADS='1',
-                   OCR_PAGE_WORKERS='1', GLOBAL_TESSERACT_CAPACITY='1')
-        env['PYTHONPATH'] = str(Path(__file__).resolve().parents[2])
-        try:
-            completed = run_hardened_subprocess(
-                [sys.executable, '-m', 'app.core.native_supervisor', str(root), str(os.getpid())],
-                timeout=CHILD_WALL, cancellation_check=poll, env=env,
-                max_output_bytes=64 * 1024, cleanup_group_on_exit=True,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise OCRTimeoutError('Isolated native processing timed out') from exc
-        if completed.returncode != 0 or not (root / 'result.json').is_file():
-            raise EngineUnavailableError('Isolated native processing failed or exceeded resource limits')
-        frame = read_frame(root / 'result.json')
-        if 'error' in frame:
-            raise_error(frame['error'])
-        result = decode(frame['result'])
-        check()
-        if output is not None:
-            staged = scratch / ('output' + output.suffix)
-            if not staged.exists() or not stat.S_ISREG(staged.lstat().st_mode) or staged.stat().st_size > CHILD_FILES:
-                raise EngineUnavailableError('Isolated native output is missing or oversized')
-            output.parent.mkdir(parents=True, exist_ok=True)
-            fd, sibling_name = tempfile.mkstemp(prefix='.native-output-', dir=output.parent)
-            sibling = Path(sibling_name)
-            try:
-                with os.fdopen(fd, 'wb') as destination, staged.open('rb') as source:
-                    shutil.copyfileobj(source, destination, length=64 * 1024)
-                    destination.flush()
-                    os.fsync(destination.fileno())
-                os.replace(sibling, output)
-            finally:
-                sibling.unlink(missing_ok=True)
+            os.replace(pending, output)
         return result
+    except DomainBusy as exc:
+        raise OCRTimeoutError('Native processing capacity wait timed out') from exc
+    except DomainUnavailable as exc:
+        raise EngineUnavailableError('Native execution domain is unavailable') from exc
+    finally:
+        if pending is not None:
+            pending.unlink(missing_ok=True)
 
 
 async def execute_async(operation, *args, **kwargs):
@@ -295,13 +320,25 @@ async def execute_async(operation, *args, **kwargs):
             raise JobCancelledException('Native request cancelled')
         if original is not None:
             original()
+    required = os.environ.get('NATIVE_EXECUTION_DOMAIN_MODE', 'legacy') != 'legacy'
     task = asyncio.create_task(asyncio.to_thread(execute, operation, *args, cancellation_check=check, **kwargs))
     try:
         return await asyncio.shield(task)
     except asyncio.CancelledError:
         cancelled.set()
-        try:
-            await asyncio.shield(task)
-        except Exception:
-            pass
+        if not required:
+            try:
+                await asyncio.shield(task)
+            except Exception:
+                pass
+            raise
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+        if not task.cancelled():
+            task.exception()
         raise

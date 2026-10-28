@@ -127,6 +127,15 @@ jobs:
           raise SystemExit(result)
           PY
 
+      - name: Qualify dormant native execution-domain contract (fake controller only)
+        env:
+          APP_ENV: test
+          STORAGE_MODE: local
+          WORKER_SHARED_SECRET: synthetic-domain-ci-secret
+          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/f11-sdk019-venv
+        run: |
+          timeout 90s prlimit --as=1073741824 --cpu=70 -- "$UV_PROJECT_ENVIRONMENT/bin/python" -m pytest -q --tb=short -p no:cacheprovider tests/test_native_execution_domain.py
+
       - name: Qualify native OCR process isolation
         env:
           APP_ENV: test
