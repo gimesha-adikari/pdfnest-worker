@@ -149,6 +149,11 @@ class Registration:
     lock: threading.Lock = field(default_factory=threading.Lock)
     verified: Capabilities | None = None
     active: dict[str, str] = field(default_factory=dict)
+    releasing: dict[str, Lease] = field(default_factory=dict)
+    condition: threading.Condition = field(init=False, repr=False)
+
+    def __post_init__(self):
+        self.condition = threading.Condition(self.lock)
 
 
 # Deliberately no manager socket, plugin loader, fake-controller flag or runtime
@@ -156,6 +161,8 @@ class Registration:
 _registration: Registration | None = None
 CONTROL_SECONDS = 5.0
 DRAIN_SECONDS = 5.0
+HANDOFF_SECONDS = 5.0
+HANDOFF_POLL_SECONDS = 0.05  # Poll callable cancellation while condition-waiting.
 
 
 def _tag(value):
@@ -174,6 +181,7 @@ def _limits(value):
 class Operation:
     def __init__(self, registration=None, check=lambda: None, wait=0):
         self.registration = registration
+        self.controller = registration.controller if registration is not None else None
         self.required = registration is not None
         self.check = check
         self.lease = None
@@ -198,7 +206,7 @@ class Operation:
                 callback_error = exc
                 raise
         try:
-            caps = r.controller.capabilities(time.monotonic() + CONTROL_SECONDS)
+            caps = self.controller.capabilities(time.monotonic() + CONTROL_SECONDS)
             identity = r.expected
             if (type(identity) is not Identity or not _tag(identity.name) or not _tag(identity.epoch)
                     or re.fullmatch('[0-9a-f]{64}', identity.policy_sha256) is None
@@ -218,14 +226,14 @@ class Operation:
                 r.verified = caps
             operation = uuid.uuid4().hex
             self.operation_id = operation
-            result = r.controller.acquire(operation, time.monotonic() + wait, admission_check)
+            result = self.controller.acquire(operation, time.monotonic() + wait, admission_check)
             busy = type(result) is BusyReceipt
             if busy:
                 if (type(result.identity) is not Identity or result.identity != identity
                         or type(result.operation) is not str or result.operation != operation):
                     raise DomainUnavailable()
                 with r.lock:
-                    if r.blocked:
+                    if r.blocked or not self._policy_current():
                         raise DomainUnavailable()
             else:
                 self.lease = result
@@ -237,12 +245,7 @@ class Operation:
                         or type(lease.generation) is not int or not 0 < lease.generation < 2**63
                         or lease.domain != domain_identity(identity, operation, lease.slot, lease.generation)):
                     raise DomainUnavailable()
-                with r.lock:
-                    previous = r.seen.get(lease.slot, 0)
-                    if r.blocked or lease.slot in r.active or lease.generation <= previous:
-                        raise DomainUnavailable()
-                    r.seen[lease.slot] = lease.generation
-                    r.active[lease.slot] = lease.operation
+                self._claim_lease(admission_check)
         except BaseException as exc:
             self.quarantine()
             if exc is callback_error or isinstance(exc, (KeyboardInterrupt, SystemExit)):
@@ -253,16 +256,66 @@ class Operation:
         if busy:
             raise DomainBusy()
 
+    def _policy_current(self):
+        """Local pinned state only; never call controller code under the lock."""
+        r = self.registration
+        return (r.controller is self.controller and r.expected == self.caps.identity
+                and r.expected_limits == self.caps.limits and r.expected_slots == self.caps.slots
+                and r.verified == self.caps)
+
+    def _claim_lease(self, check):
+        r, lease = self.registration, self.lease
+        deadline = time.monotonic() + HANDOFF_SECONDS
+        waited, reverified = False, False
+        while True:
+            check()  # Callbacks may re-enter registration; no lock held here.
+            if waited and time.monotonic() >= deadline:
+                raise DomainUnavailable()
+            with r.condition:
+                previous = r.seen.get(lease.slot, 0)
+                if r.blocked or not self._policy_current() or lease.generation <= previous:
+                    raise DomainUnavailable()
+                owner = r.active.get(lease.slot)
+                if owner is None:
+                    if lease.slot in r.releasing:
+                        raise DomainUnavailable()
+                    if not waited or reverified:
+                        r.seen[lease.slot] = lease.generation
+                        r.active[lease.slot] = lease.operation
+                        return
+                else:
+                    prior = r.releasing.get(lease.slot)
+                    if (type(prior) is not Lease or prior.operation != owner
+                            or prior.identity != self.caps.identity or prior.slot != lease.slot
+                            or prior.generation != previous or prior.domain != domain_identity(
+                                self.caps.identity, owner, lease.slot, previous)):
+                        # RUNNING/DRAINING overlap or inconsistent local state.
+                        raise DomainUnavailable()
+                    waited = True
+                    reverified = False
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise DomainUnavailable()
+                    r.condition.wait(min(remaining, HANDOFF_POLL_SECONDS))
+                    continue
+            # A release completed. Revalidate the pinned controller/epoch before
+            # claiming, then recheck local ownership/generation under the lock.
+            caps = self.controller.capabilities(min(deadline, time.monotonic() + CONTROL_SECONDS))
+            if type(caps) is not Capabilities or caps != self.caps:
+                raise DomainUnavailable()
+            reverified = True
+
     def quarantine(self):
         if not self.required:
             return
         r = self.registration
         self.state = 'QUARANTINED'
-        with r.lock:
+        with r.condition:
             r.blocked = True  # No local reset or time-only recovery.
+            r.condition.notify_all()
         if self.operation_id is not None:
             try:
-                r.controller.quarantine(self.operation_id, time.monotonic() + CONTROL_SECONDS)
+                self.controller.quarantine(self.operation_id, time.monotonic() + CONTROL_SECONDS)
             except BaseException:
                 # Remains blocked even if the controller is gone. Independent
                 # deadline/recovery is an adapter obligation, not a flock close.
@@ -295,7 +348,7 @@ class Operation:
         launch = Launch(tuple(command), MappingProxyType(launch_env), timeout, max_output_bytes)
         try:
             check()
-            member = r.controller.prepare(self.lease, launch, time.monotonic() + CONTROL_SECONDS)
+            member = self.controller.prepare(self.lease, launch, time.monotonic() + CONTROL_SECONDS)
             if (type(member) is not Membership or member.lease != self.lease
                     or member.limits != self.caps.limits or member.native_started is not False
                     or not _tag(member.token)):
@@ -303,7 +356,7 @@ class Operation:
             check()
             self.started = True
             self.state = 'RUNNING'
-            result = r.controller.run(self.lease, member, launch, time.monotonic() + timeout, check)
+            result = self.controller.run(self.lease, member, launch, time.monotonic() + timeout, check)
             if (not isinstance(result, subprocess.CompletedProcess) or type(result.returncode) is not int
                     or type(result.stdout) is not str or type(result.stderr) is not str
                     or any(len(s.encode('utf-8')) > max_output_bytes for s in (result.stdout, result.stderr))):
@@ -322,7 +375,7 @@ class Operation:
         self.drain_attempted = True
         try:
             self.state = 'DRAINING'
-            receipt = self.registration.controller.drain(self.lease, time.monotonic() + DRAIN_SECONDS)
+            receipt = self.controller.drain(self.lease, time.monotonic() + DRAIN_SECONDS)
             if (type(receipt) is not Drain or receipt.lease != self.lease
                     or not all(v is True for v in (receipt.empty, receipt.reaped, receipt.reconciled))):
                 raise DomainUnavailable()
@@ -343,15 +396,27 @@ class Operation:
             self.drain()
             if failed or not self.cleaned or not self.started:
                 raise DomainUnavailable()
-            with self.registration.lock:
-                if self.registration.blocked:
+            r, lease = self.registration, self.lease
+            with r.condition:
+                if (r.blocked or not self._policy_current() or r.active.get(lease.slot) != lease.operation
+                        or r.seen.get(lease.slot) != lease.generation or lease.slot in r.releasing):
                     raise DomainUnavailable()
-            self.registration.controller.release(self.lease, time.monotonic() + CONTROL_SECONDS)
-            with self.registration.lock:
-                if self.registration.active.get(self.lease.slot) != self.lease.operation:
+                r.releasing[lease.slot] = lease
+                self.state = 'RELEASING'
+            # The trusted adapter must verify authoritative release before
+            # returning None. No global registration lock covers this RPC.
+            release_deadline = time.monotonic() + CONTROL_SECONDS
+            response = self.controller.release(lease, release_deadline)
+            if response is not None or time.monotonic() >= release_deadline:
+                raise DomainUnavailable()
+            with r.condition:
+                if (r.blocked or not self._policy_current() or r.active.get(lease.slot) != lease.operation
+                        or r.seen.get(lease.slot) != lease.generation or r.releasing.get(lease.slot) != lease):
                     raise DomainUnavailable()
-                del self.registration.active[self.lease.slot]
-            self.state = 'FREE'
+                del r.active[lease.slot]
+                del r.releasing[lease.slot]
+                self.state = 'FREE'
+                r.condition.notify_all()
         except BaseException:
             self.quarantine()
             if not failed:

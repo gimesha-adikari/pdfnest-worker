@@ -1,6 +1,8 @@
 """Source-contract tests; the fake controller is NOT kernel enforcement."""
 from dataclasses import replace
 import subprocess
+from queue import Queue
+from threading import Condition, Event, Lock, Thread, current_thread
 from typing import Optional
 import pytest
 
@@ -921,3 +923,380 @@ def test_metadata_http_capacity_mapping_distinguishes_atomic_busy(controller, mo
     assert not manager._sessions and not list(root.iterdir())
     assert 'PREPARED' not in controller.events and 'RUNNING' not in controller.events
     assert d._registration.blocked is not atomic
+
+
+class HandoffController(FakeController):
+    """Synthetic server commits FREE before delivering its release response."""
+    def __init__(self, slots):
+        super().__init__()
+        self.slots = slots
+        self.server_lock = Lock()
+        self.allocated = {}
+        self.generations = {slot: 0 for slot in slots}
+        self.release_started, self.allow_release = Event(), Event()
+        self.lease_returned, self.allow_acquire = Event(), Event()
+        self.allow_acquire.set()
+        self.release_error = False
+        self.release_response = None
+        self.force_grant = False
+        self.next_slot = None
+        self.quarantined = []
+        self.leases = []
+        self.acquire_gates = {}
+        self.acquire_events = {}
+
+    def capabilities(self, deadline):
+        return replace(super().capabilities(deadline), slots=self.slots)
+
+    def acquire(self, operation, deadline, check):
+        check()
+        with self.server_lock:
+            occupied = {lease.slot for lease in self.allocated.values()}
+            slot = self.next_slot
+            self.next_slot = None
+            if slot is None:
+                slot = next((s for s in self.slots if s not in occupied), None)
+            if self.force_grant:
+                slot = self.slots[0]
+            if slot is None:
+                return d.BusyReceipt(self.identity, operation)
+            self.generations[slot] += 1
+            generation = self.generations[slot]
+            lease = d.Lease(self.identity, operation, slot, generation,
+                            d.domain_identity(self.identity, operation, slot, generation))
+            self.allocated[operation] = lease
+            self.leases.append(lease)
+            event = self.acquire_events.get(current_thread().name)
+            if event is not None:
+                event.set()
+        if slot == 'slot-1' and generation > 1:
+            self.lease_returned.set()
+            assert self.acquire_gates.get(current_thread().name, self.allow_acquire).wait(2)
+        return lease
+
+    def release(self, lease, deadline):
+        with self.server_lock:
+            assert self.allocated.pop(lease.operation) == lease
+        if lease.slot == 'slot-1' and lease.generation == 1:
+            self.release_started.set()
+            assert self.allow_release.wait(2)
+            if self.release_error:
+                raise OSError('synthetic lost release reply')
+        return self.release_response
+
+    def quarantine(self, operation, deadline):
+        with self.server_lock:
+            self.quarantined.append(operation)
+            self.allocated.pop(operation, None)
+        self.dirty = True
+
+
+class ObservedHandoffCondition(Condition):
+    """Observe condition entry without adding a hook to application code."""
+    def __init__(self, lock, progress):
+        super().__init__(lock)
+        self.progress = progress
+        self.waits = Queue()
+
+    def wait(self, timeout=None):
+        self.waits.put(current_thread().name)
+        self.progress.set()
+        return super().wait(timeout)
+
+
+@pytest.fixture
+def handoff(monkeypatch):
+    class Rig:
+        def __init__(self):
+            self.controller = HandoffController(('slot-1', 'slot-2'))
+            c = self.controller
+            self.registration = d.Registration(c, c.identity, c.limits, c.slots)
+            self.progress = Event()
+            self.registration.condition = ObservedHandoffCondition(self.registration.lock, self.progress)
+            self.threads, self.errors, self.admitted = [], [], []
+
+        def prepared(self):
+            operation = d.Operation(self.registration)
+            run(operation);operation.drain();operation.cleanup_complete()
+            return operation
+
+        def start(self, name, operation=None, check=lambda: None, complete=True):
+            done = Event()
+            def work():
+                domain = operation
+                try:
+                    if domain is None:
+                        domain = d.Operation(self.registration, check)
+                        self.admitted.append(domain)
+                        if complete:
+                            run(domain);domain.drain();domain.cleanup_complete()
+                    if complete:
+                        domain.finish(False)
+                except BaseException as exc:
+                    self.errors.append(exc)
+                    if domain is not None and domain.state not in ('FREE', 'QUARANTINED'):
+                        domain.finish(True)
+                finally:
+                    done.set();self.progress.set()
+            thread = Thread(target=work, name=name)
+            self.threads.append(thread);thread.start()
+            return done
+
+        def join(self):
+            for thread in self.threads:
+                thread.join(3)
+                assert not thread.is_alive()
+
+    rig = Rig()
+    monkeypatch.setenv('NATIVE_EXECUTION_DOMAIN_MODE', 'required-nonproduction')
+    monkeypatch.setattr(d, '_registration', rig.registration)
+    try:
+        yield rig
+    finally:
+        rig.controller.allow_release.set();rig.controller.allow_acquire.set()
+        for gate in rig.controller.acquire_gates.values():
+            gate.set()
+        rig.join()
+
+
+def test_legitimate_concurrent_release_handoff_does_not_quarantine(handoff):
+    c, r = handoff.controller, handoff.registration
+    first = handoff.prepared()
+    handoff.start('releasing-A', first)
+    assert c.release_started.wait(2)
+    handoff.start('admitting-B')
+    assert handoff.progress.wait(2)
+    assert c.lease_returned.is_set()
+    later = c.leases[-1]
+    assert later.slot == first.lease.slot and later.operation != first.lease.operation
+    assert later.generation > first.lease.generation
+    assert later.domain == d.domain_identity(c.identity, later.operation, later.slot, later.generation)
+    c.allow_release.set()
+    handoff.join()
+    assert not handoff.errors
+    assert first.state == 'FREE' and handoff.admitted[0].state == 'FREE'
+    assert not r.blocked and not r.active and not c.allocated and not c.quarantined
+
+
+def wait_for_handoff(handoff):
+    assert handoff.registration.condition.waits.get(timeout=2) == 'admitting-B'
+    assert not handoff.admitted
+    assert handoff.controller.events.count('RUNNING') == 1
+
+
+def test_release_finalized_just_before_later_lease_validation(handoff):
+    c, r = handoff.controller, handoff.registration
+    first = handoff.prepared()
+    handoff.start('releasing-A', first)
+    assert c.release_started.wait(2)
+    c.allow_acquire.clear()
+    handoff.start('admitting-B')
+    assert c.lease_returned.wait(2)
+    c.allow_release.set()
+    handoff.threads[0].join(2)
+    assert first.state == 'FREE' and not r.active
+    c.allow_acquire.set()
+    handoff.join()
+    assert not handoff.errors and handoff.admitted[0].state == 'FREE'
+    assert not r.blocked and not r.releasing and not c.allocated
+
+
+def test_later_lease_waits_until_release_rpc_acknowledged(handoff):
+    c, r = handoff.controller, handoff.registration
+    first = handoff.prepared()
+    handoff.start('releasing-A', first)
+    assert c.release_started.wait(2)
+    handoff.start('admitting-B')
+    wait_for_handoff(handoff)
+    assert first.state == 'RELEASING'
+    assert r.active == {'slot-1': first.operation_id}
+    assert r.releasing == {'slot-1': first.lease}
+    assert not r.blocked and not c.quarantined
+    c.allow_release.set()
+    handoff.join()
+    assert not handoff.errors and first.state == 'FREE'
+    assert handoff.admitted[0].state == 'FREE' and not r.active and not r.releasing
+
+
+@pytest.mark.parametrize('state', ['RUNNING', 'DRAINING'])
+def test_genuine_overlapping_grant_still_quarantines(handoff, state):
+    c, r = handoff.controller, handoff.registration
+    first = d.Operation(r)
+    run(first)
+    if state == 'DRAINING':
+        first.drain()
+    assert first.state == state
+    c.force_grant = True
+    with pytest.raises(d.DomainUnavailable):
+        d.Operation(r)
+    assert r.blocked and not r.releasing
+    assert c.events.count('RUNNING') == 1
+    assert c.quarantined == [c.leases[-1].operation]
+    first.finish(True)
+    assert not c.allocated
+
+
+@pytest.mark.parametrize('fault', ['exception', 'unverified-response', 'quarantine-exception'])
+def test_release_failure_wakes_waiting_admission_and_refuses_reuse(handoff, fault):
+    c, r = handoff.controller, handoff.registration
+    first = handoff.prepared()
+    handoff.start('releasing-A', first)
+    assert c.release_started.wait(2)
+    done = handoff.start('admitting-B')
+    wait_for_handoff(handoff)
+    c.release_error = fault in ('exception', 'quarantine-exception')
+    c.release_response = True if fault == 'unverified-response' else None
+    if fault == 'quarantine-exception':
+        original = c.quarantine
+        def quarantine(operation, deadline):
+            original(operation, deadline)
+            raise OSError('synthetic lost quarantine reply')
+        c.quarantine = quarantine
+    c.allow_release.set()
+    assert done.wait(2)
+    handoff.join()
+    assert len(handoff.errors) == 2
+    assert all(type(error) is d.DomainUnavailable for error in handoff.errors)
+    assert r.blocked and first.state == 'QUARANTINED' and not handoff.admitted
+    assert r.active['slot-1'] == first.operation_id and r.releasing['slot-1'] == first.lease
+    assert c.events.count('RUNNING') == 1 and not c.allocated
+    with pytest.raises(d.DomainUnavailable):
+        d.Operation(r)
+
+
+def test_late_release_response_cannot_finalize_local_ownership(handoff, monkeypatch):
+    c, r = handoff.controller, handoff.registration
+    first = handoff.prepared()
+    original = c.release
+    c.allow_release.set()
+    def release(lease, deadline):
+        response = original(lease, deadline)
+        monkeypatch.setattr(d.time, 'monotonic', lambda: deadline + 1)
+        return response
+    c.release = release
+    with pytest.raises(d.DomainUnavailable):
+        first.finish(False)
+    assert first.state == 'QUARANTINED' and r.blocked
+    assert r.active == {'slot-1': first.operation_id} and r.releasing == {'slot-1': first.lease}
+
+
+def test_unresolved_handoff_timeout_is_bounded_and_quarantined(handoff, monkeypatch):
+    c, r = handoff.controller, handoff.registration
+    monkeypatch.setattr(d, 'HANDOFF_SECONDS', 0.05)
+    first = handoff.prepared()
+    handoff.start('releasing-A', first)
+    assert c.release_started.wait(2)
+    done = handoff.start('admitting-B')
+    wait_for_handoff(handoff)
+    assert done.wait(2)  # Deadline, without releasing A or using a scheduling sleep.
+    assert r.blocked and not handoff.admitted and first.state == 'RELEASING'
+    assert c.leases[-1].operation in c.quarantined
+    c.allow_release.set();handoff.join()
+    assert first.state == 'QUARANTINED' and not c.allocated
+
+
+def test_waiter_cancellation_runs_callback_without_lock_and_quarantines(handoff):
+    c, r = handoff.controller, handoff.registration
+    cancelled = Event()
+    class Cancelled(Exception):
+        pass
+    error = Cancelled('synthetic handoff cancellation')
+    def check():
+        assert r.lock.acquire(blocking=False), 'Callback called under global lock'
+        r.lock.release()
+        if cancelled.is_set():
+            raise error
+    first = handoff.prepared()
+    handoff.start('releasing-A', first)
+    assert c.release_started.wait(2)
+    done = handoff.start('admitting-B', check=check)
+    wait_for_handoff(handoff)
+    with r.condition:
+        cancelled.set();r.condition.notify_all()
+    assert done.wait(2)
+    assert error in handoff.errors and r.blocked and not handoff.admitted
+    assert c.leases[-1].operation in c.quarantined and c.events.count('RUNNING') == 1
+    c.allow_release.set();handoff.join()
+    assert not c.allocated
+
+
+def test_spurious_notifications_cannot_complete_unconfirmed_handoff(handoff):
+    c, r = handoff.controller, handoff.registration
+    first = handoff.prepared()
+    handoff.start('releasing-A', first)
+    assert c.release_started.wait(2)
+    handoff.start('admitting-B')
+    for _ in range(3):
+        wait_for_handoff(handoff)
+        with r.condition:
+            r.condition.notify_all()
+    wait_for_handoff(handoff)
+    assert r.active == {'slot-1': first.operation_id} and not r.blocked
+    c.allow_release.set();handoff.join()
+    assert not handoff.errors and not r.blocked and not r.active
+
+
+def test_competing_faulty_grant_cannot_create_duplicate_local_ownership(handoff):
+    c, r = handoff.controller, handoff.registration
+    first = handoff.prepared()
+    handoff.start('releasing-A', first)
+    assert c.release_started.wait(2)
+    done = handoff.start('admitting-B', complete=False)
+    wait_for_handoff(handoff)
+    gate = Event();c.acquire_gates['competing-C'] = gate
+    acquired = Event();c.acquire_events['competing-C'] = acquired
+    c.force_grant = True
+    handoff.start('competing-C', complete=False)
+    # Synchronize on C's acquired lease before allowing the original release.
+    assert acquired.wait(2)
+    c.allow_release.set()
+    assert done.wait(2) and len(handoff.admitted) == 1
+    winner = handoff.admitted[0]
+    assert r.active == {'slot-1': winner.operation_id}
+    gate.set();handoff.join()
+    assert len(handoff.admitted) == 1 and len(handoff.errors) == 1
+    assert type(handoff.errors[0]) is d.DomainUnavailable and r.blocked
+    winner.finish(True)
+    assert not c.allocated
+
+
+def test_independent_slot_progresses_during_controller_release_and_handoff_wait(handoff):
+    c, r = handoff.controller, handoff.registration
+    first = handoff.prepared()
+    handoff.start('releasing-A', first)
+    assert c.release_started.wait(2)
+    handoff.start('admitting-B')
+    wait_for_handoff(handoff)
+    c.next_slot = 'slot-2'
+    other = handoff.prepared()
+    other.finish(False)
+    assert other.state == 'FREE' and first.state == 'RELEASING'
+    assert not r.blocked and not handoff.admitted
+    c.allow_release.set();handoff.join()
+    assert not handoff.errors and not r.active and not r.releasing and not c.allocated
+
+
+@pytest.mark.parametrize('change', ['epoch', 'policy', 'controller', 'generation', 'owner'])
+def test_waiting_admission_revalidates_controller_policy_and_ownership(handoff, change):
+    c, r = handoff.controller, handoff.registration
+    first = handoff.prepared()
+    handoff.start('releasing-A', first)
+    assert c.release_started.wait(2)
+    handoff.start('admitting-B')
+    wait_for_handoff(handoff)
+    with r.condition:
+        if change == 'epoch':
+            c.identity = replace(c.identity, epoch='changed-epoch')
+        elif change == 'policy':
+            c.limits = replace(c.limits, tasks=8)
+        elif change == 'controller':
+            r.controller = object()
+        elif change == 'generation':
+            r.seen['slot-1'] = 2
+        else:
+            r.active['slot-1'] = 'unexpected-owner'
+        r.condition.notify_all()
+    c.allow_release.set();handoff.join()
+    assert r.blocked and not handoff.admitted
+    assert any(type(error) is d.DomainUnavailable for error in handoff.errors)
+    assert c.events.count('RUNNING') == 1 and not c.allocated
