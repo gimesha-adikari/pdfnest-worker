@@ -88,6 +88,34 @@ Two environment/fixture failures were retained in local logs: the restricted PAT
 
 The default source gates were run before that final legacy-order preservation adjustment; final source-contract and F-15-overlay runs include it. Exact draft-head CI requalifies the complete combined source. The pytest client emits an existing Starlette/httpx deprecation warning; no unrelated dependency upgrade was made. Local results and CI/container-build conclusions remain separate evidence.
 
+## Independent review corrections — October 28, 2026
+
+Review baseline: `c57248415df9c026556e4a066f6ea65d10bb33b3`. The two focused regressions failed on that source: a controller that allocated then raised `DomainBusy` escaped quarantine, and same-slot domain A -> B -> A was accepted on the third operation. Earlier qualification counts above describe that historical candidate, not this correction.
+
+### F11-10-01: atomic refusal versus indeterminate acquisition
+
+`acquire` now returns either a lease or an exact `BusyReceipt(identity, operation)` from the pinned trusted controller. A valid receipt attests an **atomic zero-side-effect decision for that fresh operation nonce**: no slot/domain/gate was allocated, and no controller state for the attempted acquisition changed. The receipt must match the exact identity, including epoch/policy, and the fresh nonce. Boolean values, lookalike/subclass receipts, malformed bindings and stale receipts are refused.
+
+A bare exception from `acquire`, **including `DomainBusy`**, is indeterminate even when no lease was returned. The registration is latched blocked and quarantine is requested using the known fresh nonce; a failed quarantine call cannot clear that latch. No native child, staging or capacity reuse follows. Timeout/interrupted responses have the same rule. Caller cancellation is preserved after the quarantine attempt. There is no automatic retry, time-based reset or local recovery mechanism.
+
+Only the validated zero-side-effect return is translated into the existing capacity result: native operation capacity timeout, or metadata `SESSION_METADATA_BUSY` / HTTP 429. It leaves the registration usable when capacity later becomes available. Uncertain acquisition maps to the existing safe unavailable result (native engine unavailable; metadata `SESSION_METADATA_UNAVAILABLE` / HTTP 503), without raw controller details.
+
+**A Python dataclass or boolean cannot prove actual atomicity.** Receipt acceptance is a contract with a separately verified controller, not trust in an arbitrary Python object. The test double records synthetic before/after state; no real controller or kernel atomicity was added. A real controller must atomically commit either the refusal or a nonce-addressable lease, durably retain uncertain acquisition state, and reconcile it under independent authority. Calls require bounded transport and an external watchdog; source checks cannot interrupt a hung/malicious in-process adapter.
+
+### F11-10-02: non-reusable acquisition identity
+
+Every lease's domain must exactly equal `native-` followed by the lowercase SHA-256 of ASCII newline-joined controller name, epoch, policy digest, fresh operation nonce, slot and decimal generation (`domain_identity`). Validated tags contain no newline. This is a deterministic identity binding, **not a bearer capability or kernel proof**. The returned controller/nonce, finite slot and positive monotonic generation are independently checked. A valid domain for another nonce, slot, generation or controller cannot be substituted. Same-slot A -> B -> A and cross-slot identity reuse fail closed and quarantine before native work.
+
+Local history stores only the highest generation for each pinned slot (at most 64 entries), not an unbounded history of domain strings. Successful subsequent operations receive new nonces and identities. A future real controller must independently guarantee durable domain non-reuse, nonce uniqueness/association and monotonic slot generations; it must reconcile active/quarantined leases and all previous epochs before asserting recovery. The fresh random nonce and process-local checks do not prove durable state after restart. Constructing a new `Registration`, changing an epoch or restarting Worker is **not recovery**. Tests simulate refusal against unreconciled controller state; they do not qualify actual owner-death recovery.
+
+### Correction qualification
+
+The expanded source-contract suite covers atomic busy state preservation, partial/exceptional admission (including timeout/interrupted replies), failed quarantine, stale/malformed refusals, nonce/controller/slot/generation substitution, A -> B -> A reuse, valid next leases, local registration replacement, epoch change, permanent latch behavior, and mounted 429/503 mapping. Existing callbacks, cancellation, output staging and legacy/default behavior remain covered. The test-only exception field is explicitly `BaseException | None` and guarded with `is not None`; the Codeac diagnostic is addressed without suppression or weaker assertions.
+
+Local correction results: **91 source-contract tests passed** (all prior 53 plus 38 new cases); installed SDK 0.1.9/security 592; native isolation 55; F-12 rendering/metadata 59; F-14 admission 42; F-16 Editor 110. The temporary unchanged-PR-#6 overlay passed all 57 strict-auth/render-session tests. The existing Starlette/httpx deprecation warning remains. Frozen-lock dependency checking, syntax parsing and diff checks passed. Runs used the same finite outer user-scope limits described above, disposable synthetic configuration and only the existing test-owned loopback Redis fixture. Exact-head GitHub Actions/container and Codeac results are recorded on PR #10 separately from these local results; a green Codeac status is not a clean static-analysis verdict.
+
+Runtime integration, independent watchdog/restart authority and real kernel qualification remain **BLOCKED**. These corrections do not make the legacy default contain detached descendants and do not resolve F-11's operational resource-safety gap.
+
 ## Reproduction and next authorization
 
 Use a clean Python 3.12 environment from the frozen lock, installed SDK 0.1.9 and synthetic `APP_ENV=test`/local storage configuration. Run `tests/test_native_execution_domain.py` under finite outer CPU, memory, task and wall limits. Tiny subprocess fixtures self-expire and are explicitly killed/waited. Do not use real documents, production environment files, shared Redis or hosted endpoints.

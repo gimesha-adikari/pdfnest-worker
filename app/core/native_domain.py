@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+import hashlib
 import math
 import os
 import re
@@ -70,6 +71,28 @@ class Lease:
 
 
 @dataclass(frozen=True)
+class BusyReceipt:
+    """Trusted controller's atomic refusal: no state changed for this nonce.
+
+    The type/binding checks are not proof of runtime atomicity. Only an
+    independently verified controller can establish this assertion's truth.
+    A bare exception, including DomainBusy, makes no such assertion.
+    """
+    identity: Identity
+    operation: str
+
+
+def domain_identity(identity: Identity, operation: str, slot: str, generation: int) -> str:
+    """Canonical acquisition binding, not a capability or kernel attestation.
+
+    Identity/slot tags and the fresh nonce are validated by the caller. The
+    controller must durably enforce uniqueness and reconcile previous epochs.
+    """
+    fields = (identity.name, identity.epoch, identity.policy_sha256, operation, slot, str(generation))
+    return 'native-' + hashlib.sha256('\n'.join(fields).encode('ascii')).hexdigest()
+
+
+@dataclass(frozen=True)
 class Membership:
     lease: Lease
     limits: Limits
@@ -104,7 +127,9 @@ class Controller(Protocol):
     an independent operator-owned runtime; Python assertions cannot supply one.
     """
     def capabilities(self, deadline: float) -> Capabilities: ...
-    def acquire(self, operation: str, deadline: float, check: Callable) -> Lease: ...
+    # BusyReceipt must be an atomic zero-side-effect decision for this nonce.
+    # Any interrupted/exceptional acquisition is indeterminate and quarantined.
+    def acquire(self, operation: str, deadline: float, check: Callable) -> Lease | BusyReceipt: ...
     def prepare(self, lease: Lease, launch: Launch, deadline: float) -> Membership: ...
     def run(self, lease: Lease, member: Membership, launch: Launch,
             deadline: float, check: Callable) -> subprocess.CompletedProcess: ...
@@ -120,7 +145,7 @@ class Registration:
     expected_limits: Limits | None = None
     expected_slots: tuple[str, ...] = ()
     blocked: bool = False
-    seen: dict[str, tuple[int, str]] = field(default_factory=dict)
+    seen: dict[str, int] = field(default_factory=dict)
     lock: threading.Lock = field(default_factory=threading.Lock)
     verified: Capabilities | None = None
     active: dict[str, str] = field(default_factory=dict)
@@ -193,26 +218,40 @@ class Operation:
                 r.verified = caps
             operation = uuid.uuid4().hex
             self.operation_id = operation
-            self.lease = r.controller.acquire(operation, time.monotonic() + wait, admission_check)
-            lease = self.lease
-            if (type(lease) is not Lease or lease.identity != identity or lease.operation != operation
-                    or lease.slot not in caps.slots or not _tag(lease.domain)
-                    or type(lease.generation) is not int or not 0 < lease.generation < 2**63):
-                raise DomainUnavailable()
-            with r.lock:
-                previous = r.seen.get(lease.slot, (0, ''))
-                if (r.blocked or lease.slot in r.active or lease.generation <= previous[0]
-                        or any(lease.domain == old_domain for _, old_domain in r.seen.values())):
+            result = r.controller.acquire(operation, time.monotonic() + wait, admission_check)
+            busy = type(result) is BusyReceipt
+            if busy:
+                if (type(result.identity) is not Identity or result.identity != identity
+                        or type(result.operation) is not str or result.operation != operation):
                     raise DomainUnavailable()
-                r.seen[lease.slot] = (lease.generation, lease.domain)
-                r.active[lease.slot] = lease.operation
-        except DomainBusy:
-            raise
+                with r.lock:
+                    if r.blocked:
+                        raise DomainUnavailable()
+            else:
+                self.lease = result
+                lease = self.lease
+                if (type(lease) is not Lease or type(lease.identity) is not Identity
+                        or lease.identity != identity or type(lease.operation) is not str
+                        or lease.operation != operation or type(lease.slot) is not str
+                        or lease.slot not in caps.slots or type(lease.domain) is not str
+                        or type(lease.generation) is not int or not 0 < lease.generation < 2**63
+                        or lease.domain != domain_identity(identity, operation, lease.slot, lease.generation)):
+                    raise DomainUnavailable()
+                with r.lock:
+                    previous = r.seen.get(lease.slot, 0)
+                    if r.blocked or lease.slot in r.active or lease.generation <= previous:
+                        raise DomainUnavailable()
+                    r.seen[lease.slot] = lease.generation
+                    r.active[lease.slot] = lease.operation
         except BaseException as exc:
             self.quarantine()
             if exc is callback_error or isinstance(exc, (KeyboardInterrupt, SystemExit)):
                 raise
             raise DomainUnavailable() from exc
+        # Only a validated return value reaches this branch. An exception of
+        # the same name from acquire is uncertain and follows quarantine above.
+        if busy:
+            raise DomainBusy()
 
     def quarantine(self):
         if not self.required:

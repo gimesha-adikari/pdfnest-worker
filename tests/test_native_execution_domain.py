@@ -15,7 +15,7 @@ class FakeController:
         self.generation = 0
         self.busy = False
         self.dirty = False
-        self.fail = None
+        self.fail: BaseException | None = None
         self.limits = d.Limits(256 << 20, 0, 16, 50000, 100000, 300.0)
 
     def capabilities(self, deadline):
@@ -26,12 +26,12 @@ class FakeController:
     def acquire(self, operation, deadline, check):
         check()
         if self.busy:
-            raise d.DomainBusy()
+            return d.BusyReceipt(self.identity, operation)
         self.busy = True
         self.generation += 1
         self.events.append('LEASED')
         return d.Lease(self.identity, operation, 'slot-1', self.generation,
-                       'domain-' + str(self.generation))
+                       d.domain_identity(self.identity, operation, 'slot-1', self.generation))
 
     def prepare(self, lease, launch, deadline):
         self.events.append('PREPARED')
@@ -40,7 +40,7 @@ class FakeController:
     def run(self, lease, member, launch, deadline, check):
         self.events.append('RUNNING')
         check()
-        if self.fail:
+        if self.fail is not None:
             raise self.fail
         return subprocess.CompletedProcess(launch.command, 0, 'ok', '')
 
@@ -609,3 +609,314 @@ def test_metadata_legacy_validation_remains_after_capacity_release(monkeypatch, 
         return original(*args)
     monkeypatch.setattr(metadata, '_verified_count', validate)
     assert metadata._inspect(tmp_path / 'synthetic.pdf', threading.Event()) == 1
+
+
+def test_partial_acquire_busy_is_uncertain_and_quarantined(controller):
+    original = controller.acquire
+    operations = []
+    def acquire(operation, deadline, check):
+        original(operation, deadline, check)
+        operations.append(operation)
+        raise d.DomainBusy()
+    controller.acquire = acquire
+    with pytest.raises(d.DomainUnavailable) as caught:
+        with admission():
+            pytest.fail('Native work after indeterminate admission')
+    assert type(caught.value) is d.DomainUnavailable
+    assert d._registration.blocked
+    assert controller.events == ['LEASED', 'QUARANTINED']
+    assert len(operations) == 1
+
+
+def test_same_slot_a_b_a_domain_reuse_is_rejected(controller):
+    original = controller.acquire
+    domains = []
+    def acquire(*args):
+        lease = original(*args)
+        if len(domains) == 2:
+            return replace(lease, domain=domains[0])
+        domains.append(lease.domain)
+        return lease
+    controller.acquire = acquire
+    for _ in range(2):
+        with admission() as domain:
+            run(domain);domain.drain();domain.cleanup_complete()
+    with pytest.raises(d.DomainUnavailable):
+        with admission():
+            pytest.fail('Reused domain A after B')
+    assert d._registration.blocked
+    assert controller.events.count('RUNNING') == 2
+
+
+def test_atomic_busy_receipt_changes_no_acquisition_state_and_allows_later_work(controller):
+    # Full synthetic state snapshot, not an inference from an exception name.
+    controller.busy = True
+    original = controller.acquire
+    observations = []
+    def acquire(operation, deadline, check):
+        before = (controller.busy, controller.generation, controller.dirty, tuple(controller.events))
+        result = original(operation, deadline, check)
+        after = (controller.busy, controller.generation, controller.dirty, tuple(controller.events))
+        observations.append((operation, before, after, result))
+        return result
+    controller.acquire = acquire
+    with pytest.raises(d.DomainBusy):
+        with admission():
+            pytest.fail('Busy refusal started work')
+    operation, before, after, receipt = observations[0]
+    assert before == after == (True, 0, False, ())
+    assert type(receipt) is d.BusyReceipt
+    assert receipt.operation == operation and receipt.identity == controller.identity
+    assert not d._registration.blocked and not d._registration.active and not d._registration.seen
+    controller.busy = False  # Independently simulated existing capacity becomes free.
+    with admission() as domain:
+        run(domain);domain.drain();domain.cleanup_complete()
+    assert controller.events == ['LEASED', 'PREPARED', 'RUNNING', 'DRAINING', 'FREE']
+
+
+@pytest.mark.parametrize('failure', [d.DomainBusy(), OSError('private controller diagnostic'),
+    TimeoutError('interrupted acquisition'), subprocess.TimeoutExpired('acquire', 1),
+    InterruptedError('interrupted response'), EOFError('lost reply')])
+@pytest.mark.parametrize('partial', [False, True])
+def test_any_exceptional_acquisition_is_quarantined_by_fresh_nonce(controller, failure, partial):
+    original = controller.acquire
+    attempted, quarantined = [], []
+    def acquire(operation, deadline, check):
+        attempted.append(operation)
+        if partial:
+            original(operation, deadline, check)
+        raise failure
+    quarantine = controller.quarantine
+    def quarantine_nonce(operation, deadline):
+        quarantined.append(operation)
+        quarantine(operation, deadline)
+    controller.acquire, controller.quarantine = acquire, quarantine_nonce
+    with pytest.raises(d.DomainUnavailable) as caught:
+        with admission():
+            pytest.fail('Refused/uncertain acquisition started native work')
+    assert type(caught.value) is d.DomainUnavailable
+    assert str(caught.value) == 'Native execution domain is unavailable'
+    assert quarantined == attempted and len(attempted) == 1
+    assert 'PREPARED' not in controller.events and 'RUNNING' not in controller.events
+    assert 'FREE' not in controller.events and d._registration.blocked
+    with pytest.raises(d.DomainUnavailable):
+        with admission():
+            pytest.fail('Uncertain registration reused')
+    assert len(attempted) == 1
+
+
+def test_ambiguous_acquisition_quarantine_failure_latches_without_time_reset(controller, monkeypatch):
+    original = controller.acquire
+    attempts, quarantines = [], []
+    def acquire(operation, deadline, check):
+        attempts.append(operation)
+        original(operation, deadline, check)
+        raise d.DomainBusy()
+    def quarantine(operation, deadline):
+        quarantines.append(operation)
+        raise OSError('controller unavailable')
+    controller.acquire, controller.quarantine = acquire, quarantine
+    with pytest.raises(d.DomainUnavailable) as caught:
+        with admission():
+            pytest.fail('Uncertain admission')
+    assert type(caught.value) is d.DomainUnavailable
+    assert attempts == quarantines and len(attempts) == 1
+    monkeypatch.setattr(d.time, 'monotonic', lambda: 10**12)
+    for _ in range(2):
+        with pytest.raises(d.DomainUnavailable):
+            with admission():
+                pytest.fail('Time/reset bypass')
+    assert len(attempts) == 1 and d._registration.blocked
+    assert controller.events == ['LEASED']  # External cleanup remains unverified.
+
+
+@pytest.mark.parametrize('kind', ['nonce', 'identity', 'subclass', 'lookalike', 'boolean', 'none'])
+def test_busy_receipt_requires_exact_type_and_current_binding(controller, kind):
+    from dataclasses import dataclass
+    @dataclass(frozen=True)
+    class Lookalike:
+        identity: d.Identity
+        operation: str
+    class Subclass(d.BusyReceipt):
+        pass
+    def acquire(operation, deadline, check):
+        if kind == 'nonce':
+            return d.BusyReceipt(controller.identity, 'stale-nonce')
+        if kind == 'identity':
+            return d.BusyReceipt(replace(controller.identity, epoch='stale'), operation)
+        if kind == 'subclass':
+            return Subclass(controller.identity, operation)
+        if kind == 'lookalike':
+            return Lookalike(controller.identity, operation)
+        return True if kind == 'boolean' else None
+    controller.acquire = acquire
+    with pytest.raises(d.DomainUnavailable) as caught:
+        with admission():
+            pytest.fail('Malformed refusal')
+    assert type(caught.value) is d.DomainUnavailable
+    assert d._registration.blocked and controller.events == ['QUARANTINED']
+
+
+def test_busy_receipt_from_previous_attempt_is_not_reusable(controller):
+    receipts = []
+    def acquire(operation, deadline, check):
+        if not receipts:
+            receipts.append(d.BusyReceipt(controller.identity, operation))
+        return receipts[0]
+    controller.acquire = acquire
+    with pytest.raises(d.DomainBusy):
+        with admission():
+            pytest.fail('Capacity refusal started work')
+    assert not d._registration.blocked
+    with pytest.raises(d.DomainUnavailable) as caught:
+        with admission():
+            pytest.fail('Stale busy receipt accepted')
+    assert type(caught.value) is d.DomainUnavailable
+    assert d._registration.blocked and controller.events == ['QUARANTINED']
+
+
+@pytest.mark.parametrize('kind', ['nonce', 'identity', 'old-domain', 'cross-slot'])
+def test_domain_identity_cannot_be_substituted(controller, kind):
+    original = controller.acquire
+    def acquire(*args):
+        lease = original(*args)
+        if kind == 'nonce':
+            return replace(lease, operation='another-operation')
+        if kind == 'identity':
+            return replace(lease, identity=replace(lease.identity, epoch='another-epoch'))
+        if kind == 'cross-slot':
+            return replace(lease, domain=d.domain_identity(
+                lease.identity, lease.operation, 'slot-2', lease.generation))
+        return replace(lease, domain=d.domain_identity(
+            lease.identity, 'previous-operation', lease.slot, lease.generation))
+    controller.acquire = acquire
+    with pytest.raises(d.DomainUnavailable):
+        with admission():
+            pytest.fail('Identity substitution')
+    assert controller.events == ['LEASED', 'QUARANTINED'] and d._registration.blocked
+
+
+@pytest.mark.parametrize('cross_slot', [False, True])
+def test_old_domain_rejected_with_increased_generation_or_another_slot(controller, cross_slot):
+    first_domain = None
+    if cross_slot:
+        caps = controller.capabilities
+        controller.capabilities = lambda deadline: replace(caps(deadline), slots=('slot-1', 'slot-2'))
+        d._registration.expected_slots = ('slot-1', 'slot-2')
+    with admission() as domain:
+        first_domain = domain.lease.domain
+        run(domain);domain.drain();domain.cleanup_complete()
+    original = controller.acquire
+    def acquire(*args):
+        lease = original(*args)
+        return replace(lease, domain=first_domain, slot='slot-2' if cross_slot else lease.slot)
+    controller.acquire = acquire
+    with pytest.raises(d.DomainUnavailable):
+        with admission():
+            pytest.fail('Old identity reused')
+    assert controller.events.count('RUNNING') == 1 and d._registration.blocked
+
+
+def test_repeated_generation_with_new_nonce_and_new_identity_is_rejected(controller):
+    leases = []
+    original = controller.acquire
+    def acquire(*args):
+        lease = original(*args)
+        leases.append(lease)
+        return lease
+    controller.acquire = acquire
+    with admission() as domain:
+        run(domain);domain.drain();domain.cleanup_complete()
+    controller.generation = 0
+    with pytest.raises(d.DomainUnavailable):
+        with admission():
+            pytest.fail('Generation reused')
+    assert leases[0].operation != leases[1].operation
+    assert leases[0].domain != leases[1].domain
+    assert leases[0].generation == leases[1].generation == 1
+    assert d._registration.blocked
+
+
+def test_completed_leases_have_fresh_exactly_bound_domains_and_bounded_history(controller):
+    leases = []
+    for _ in range(3):
+        with admission() as domain:
+            lease = domain.lease
+            assert lease.domain == d.domain_identity(lease.identity, lease.operation, lease.slot, lease.generation)
+            leases.append(lease)
+            run(domain);domain.drain();domain.cleanup_complete()
+    assert len({lease.domain for lease in leases}) == 3
+    assert len({lease.operation for lease in leases}) == 3
+    assert [lease.generation for lease in leases] == [1, 2, 3]
+    assert d._registration.seen == {'slot-1': 3} and not d._registration.active
+
+
+@pytest.mark.parametrize('new_epoch', [False, True])
+def test_replacing_registration_cannot_reconcile_unresolved_controller_state(controller, monkeypatch, new_epoch):
+    # Simulated external durable recovery authority, not local-memory recovery.
+    first = d.Operation(d._registration)
+    assert first.lease is not None and controller.busy
+    prior_lease = first.lease
+    controller.dirty = True
+    if new_epoch:
+        controller.identity = replace(controller.identity, epoch='epoch-2')
+    monkeypatch.setattr(d, '_registration', d.Registration(
+        controller, controller.identity, controller.limits, ('slot-1',)))
+    before = list(controller.events)
+    with pytest.raises(d.DomainUnavailable):
+        with admission():
+            pytest.fail('Local registration treated as recovery')
+    assert controller.events == before and controller.busy and controller.dirty
+    assert prior_lease.operation == first.operation_id and d._registration.blocked
+
+
+def test_changed_epoch_on_existing_registration_requires_independent_recovery(controller):
+    with admission() as domain:
+        run(domain);domain.drain();domain.cleanup_complete()
+    controller.identity = replace(controller.identity, epoch='epoch-2')
+    with pytest.raises(d.DomainUnavailable):
+        with admission():
+            pytest.fail('Unpinned epoch')
+    assert controller.events.count('LEASED') == 1 and d._registration.blocked
+
+
+@pytest.mark.parametrize('atomic', [True, False])
+def test_native_capacity_mapping_distinguishes_receipt_from_bare_busy(controller, monkeypatch, tmp_path, atomic):
+    from app.core import native_isolation as boundary
+    from app.core.ocr_v2.errors import EngineUnavailableError, OCRTimeoutError
+    controller.busy = True
+    if not atomic:
+        def acquire(*args):
+            raise d.DomainBusy()
+        controller.acquire = acquire
+    monkeypatch.setattr(boundary, 'run_hardened_subprocess', lambda *a, **kw: pytest.fail('Legacy child'))
+    monkeypatch.setattr(boundary.tempfile, 'tempdir', str(tmp_path))
+    with pytest.raises(OCRTimeoutError if atomic else EngineUnavailableError):
+        boundary.execute('inspect_pdf', 'unused.pdf')
+    assert not list(tmp_path.iterdir()) and not d._registration.active
+    assert d._registration.blocked is not atomic
+
+
+@pytest.mark.parametrize('atomic', [True, False])
+def test_metadata_http_capacity_mapping_distinguishes_atomic_busy(controller, monkeypatch, tmp_path, atomic):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from app.api.tools.render import router, service, session
+    controller.busy = True
+    if not atomic:
+        def acquire(*args):
+            raise d.DomainBusy()
+        controller.acquire = acquire
+    root = tmp_path / 'sessions';root.mkdir()
+    monkeypatch.setattr(session, 'SESSION_ROOT', root)
+    manager = session.RenderSessionManager()
+    monkeypatch.setattr(service, 'session_manager', manager)
+    app = FastAPI();app.include_router(router.router)
+    with TestClient(app) as client:
+        response = client.post('/api/v1/render/sessions', files={
+            'file': ('synthetic.pdf', b'%PDF-1.4\nsynthetic', 'application/pdf')})
+    assert response.status_code == (429 if atomic else 503)
+    assert response.json()['detail']['code'] == ('SESSION_METADATA_BUSY' if atomic else 'SESSION_METADATA_UNAVAILABLE')
+    assert not manager._sessions and not list(root.iterdir())
+    assert 'PREPARED' not in controller.events and 'RUNNING' not in controller.events
+    assert d._registration.blocked is not atomic
