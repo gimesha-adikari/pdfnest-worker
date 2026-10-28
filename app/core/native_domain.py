@@ -164,6 +164,47 @@ DRAIN_SECONDS = 5.0
 HANDOFF_SECONDS = 5.0
 HANDOFF_POLL_SECONDS = 0.05  # Poll callable cancellation while condition-waiting.
 
+# Exact names only: OCR_* and other prefixes can also contain service secrets.
+# The independent controller must still pin runtime paths and reconstruct its
+# own immutable runtime environment. These client hints grant no authority.
+_NATIVE_ENVIRONMENT = frozenset({
+    'TMPDIR', 'TMP', 'TEMP', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TZ',
+    'OPENBLAS_NUM_THREADS', 'OMP_NUM_THREADS', 'OCR_PAGE_WORKERS',
+    'GLOBAL_TESSERACT_CAPACITY', 'TESSDATA_PREFIX', 'PPOCRV6_MODEL_ROOT',
+    'OCR_TEXT_ENGINE', 'SEARCHABLE_PDF_ENGINE', 'DOCUMENT_EXTRACTION_ENGINE',
+    'PDF_TO_MARKDOWN_ENGINE', 'PDF_TO_WORD_OCR_ENGINE', 'OCR_MARKUP_ENGINE',
+    'EDITOR_OCR_ENGINE', 'STUDIO_EDITOR_EXTRACTION_ENGINE',
+    'STUDIO_MARKUP_REGION_OCR_ENGINE', 'LEGACY_EDITOR_OCR_ENGINE',
+    'LEGACY_MARKUP_OCR_ENGINE', 'OCR_AUTO_INITIAL_PROBES', 'OCR_MAX_AUTO_PROBES',
+    'OCR_AUTO_EXPANDED_MAX_PROBES', 'OCR_AUTO_MIN_CONFIDENCE',
+    'OCR_MAX_AUTO_CANDIDATES', 'OCR_V2_MAX_IMAGE_PIXELS', 'OCR_V2_MAX_PAGES',
+    'OCR_V2_STRUCTURED_MAX_BYTES', 'OCR_V2_STRUCTURED_MAX_OUTPUT_BYTES',
+    'OCR_V2_STRUCTURED_MAX_RASTER_PIXELS', 'OCR_V2_STRUCTURED_PAGE_TIMEOUT_SECONDS',
+})
+
+
+def _before_deadline(deadline):
+    # Reject late receipts; this cannot interrupt a hung Python adapter.
+    # Bounded I/O and an independent watchdog remain controller obligations.
+    if time.monotonic() >= deadline:
+        raise DomainUnavailable()
+
+
+def _launch(command, env, timeout, max_output_bytes):
+    if (type(command) not in (list, tuple) or not 0 < len(command) <= 64
+            or any(type(s) is not str or not s or '\x00' in s or len(s) > 4096 for s in command)
+            or type(max_output_bytes) is not int or not 0 < max_output_bytes <= 65536
+            or (env is not None and not isinstance(env, Mapping))):
+        raise DomainUnavailable()
+    selected = {}
+    for name, value in (env or {}).items():
+        if name not in _NATIVE_ENVIRONMENT:
+            continue
+        if type(value) is not str or '\x00' in value or len(value.encode('utf-8')) > 4096:
+            raise DomainUnavailable()
+        selected[name] = value
+    return Launch(tuple(command), MappingProxyType(selected), timeout, max_output_bytes)
+
 
 def _tag(value):
     return type(value) is str and re.fullmatch(r'[A-Za-z0-9_.-]{1,128}', value) is not None
@@ -206,7 +247,12 @@ class Operation:
                 callback_error = exc
                 raise
         try:
-            caps = self.controller.capabilities(time.monotonic() + CONTROL_SECONDS)
+            if type(wait) not in (int, float) or not math.isfinite(wait) or not 0 <= wait <= 300:
+                raise DomainUnavailable()
+            capability_deadline = time.monotonic() + CONTROL_SECONDS
+            caps = self.controller.capabilities(capability_deadline)
+            _before_deadline(capability_deadline)
+            admission_check()
             identity = r.expected
             if (type(identity) is not Identity or not _tag(identity.name) or not _tag(identity.epoch)
                     or re.fullmatch('[0-9a-f]{64}', identity.policy_sha256) is None
@@ -226,7 +272,12 @@ class Operation:
                 r.verified = caps
             operation = uuid.uuid4().hex
             self.operation_id = operation
-            result = self.controller.acquire(operation, time.monotonic() + wait, admission_check)
+            admission_deadline = time.monotonic() + wait
+            result = self.controller.acquire(operation, admission_deadline, admission_check)
+            # Zero admission wait is used by metadata. Allow only the finite
+            # control-I/O budget for delivering its atomic immediate outcome.
+            _before_deadline(admission_deadline + CONTROL_SECONDS)
+            admission_check()
             busy = type(result) is BusyReceipt
             if busy:
                 if (type(result.identity) is not Identity or result.identity != identity
@@ -300,7 +351,9 @@ class Operation:
                     continue
             # A release completed. Revalidate the pinned controller/epoch before
             # claiming, then recheck local ownership/generation under the lock.
-            caps = self.controller.capabilities(min(deadline, time.monotonic() + CONTROL_SECONDS))
+            capability_deadline = min(deadline, time.monotonic() + CONTROL_SECONDS)
+            caps = self.controller.capabilities(capability_deadline)
+            _before_deadline(capability_deadline)
             if type(caps) is not Capabilities or caps != self.caps:
                 raise DomainUnavailable()
             reverified = True
@@ -326,7 +379,8 @@ class Operation:
         if not self.required:
             return legacy_runner(command, timeout=timeout, cancellation_check=cancellation_check,
                                  env=env, max_output_bytes=max_output_bytes, **legacy_options)
-        if self.started or not math.isfinite(timeout) or not 0 < timeout <= self.caps.limits.wall_seconds:
+        if (self.started or type(timeout) not in (int, float) or not math.isfinite(timeout)
+                or not 0 < timeout <= self.caps.limits.wall_seconds):
             raise DomainUnavailable()
         r = self.registration
         callback_error = None
@@ -342,13 +396,12 @@ class Operation:
             except BaseException as exc:
                 callback_error = exc
                 raise
-        launch_env = {k: v for k, v in (env or {}).items()
-                      if k not in ('DBUS_SESSION_BUS_ADDRESS', 'DBUS_SYSTEM_BUS_ADDRESS', 'XDG_RUNTIME_DIR')
-                      and not k.startswith('NATIVE_EXECUTION_DOMAIN_')}
-        launch = Launch(tuple(command), MappingProxyType(launch_env), timeout, max_output_bytes)
         try:
+            launch = _launch(command, env, timeout, max_output_bytes)
             check()
-            member = self.controller.prepare(self.lease, launch, time.monotonic() + CONTROL_SECONDS)
+            prepare_deadline = time.monotonic() + CONTROL_SECONDS
+            member = self.controller.prepare(self.lease, launch, prepare_deadline)
+            _before_deadline(prepare_deadline)
             if (type(member) is not Membership or member.lease != self.lease
                     or member.limits != self.caps.limits or member.native_started is not False
                     or not _tag(member.token)):
@@ -356,7 +409,11 @@ class Operation:
             check()
             self.started = True
             self.state = 'RUNNING'
-            result = self.controller.run(self.lease, member, launch, time.monotonic() + timeout, check)
+            run_deadline = time.monotonic() + timeout
+            result = self.controller.run(self.lease, member, launch, run_deadline, check)
+            check()
+            if time.monotonic() >= run_deadline:
+                raise subprocess.TimeoutExpired(launch.command, timeout)
             if (not isinstance(result, subprocess.CompletedProcess) or type(result.returncode) is not int
                     or type(result.stdout) is not str or type(result.stderr) is not str
                     or any(len(s.encode('utf-8')) > max_output_bytes for s in (result.stdout, result.stderr))):
@@ -375,7 +432,9 @@ class Operation:
         self.drain_attempted = True
         try:
             self.state = 'DRAINING'
-            receipt = self.controller.drain(self.lease, time.monotonic() + DRAIN_SECONDS)
+            drain_deadline = time.monotonic() + DRAIN_SECONDS
+            receipt = self.controller.drain(self.lease, drain_deadline)
+            _before_deadline(drain_deadline)
             if (type(receipt) is not Drain or receipt.lease != self.lease
                     or not all(v is True for v in (receipt.empty, receipt.reaped, receipt.reconciled))):
                 raise DomainUnavailable()

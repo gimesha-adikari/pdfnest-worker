@@ -501,6 +501,85 @@ def test_manager_and_domain_configuration_not_forwarded_to_child(controller):
         domain.drain();domain.cleanup_complete()
 
 
+def test_native_environment_does_not_forward_service_credentials_or_loader_hooks(controller):
+    captured = []
+    def launch(lease, member, spec, deadline, check):
+        captured.append(dict(spec.env))
+        return subprocess.CompletedProcess(spec.command, 0, '', '')
+    controller.run = launch
+    with admission() as domain:
+        domain.run(['synthetic'], timeout=1, env={
+            'TMPDIR': '/synthetic-staging', 'OMP_NUM_THREADS': '1',
+            'OCR_TEXT_ENGINE': 'sdk', 'TESSDATA_PREFIX': '/reviewed/tessdata',
+            'AWS_SECRET_ACCESS_KEY': 'synthetic-secret', 'REDIS_URL': 'synthetic-secret',
+            'WORKER_AUTH_SECRET': 'synthetic-secret', 'PYTHONPATH': '/mutable/runtime',
+            'PYTHONSTARTUP': '/mutable/startup.py', 'LD_PRELOAD': '/mutable/loader.so',
+            'OCR_UNREVIEWED_SECRET': 'synthetic-secret'})
+        domain.drain();domain.cleanup_complete()
+    assert captured == [{'TMPDIR': '/synthetic-staging', 'OMP_NUM_THREADS': '1',
+                         'OCR_TEXT_ENGINE': 'sdk', 'TESSDATA_PREFIX': '/reviewed/tessdata'}]
+
+
+@pytest.mark.parametrize('method', ['capabilities', 'acquire', 'prepare', 'run', 'drain'])
+def test_late_controller_receipt_cannot_advance_or_release(controller, monkeypatch, method):
+    # Deterministic clock, no timing sleeps and no claim of an independent timer.
+    clock = [100.0]
+    monkeypatch.setattr(d.time, 'monotonic', lambda: clock[0])
+    original = getattr(controller, method)
+    def late(*args):
+        response = original(*args)
+        clock[0] = args[-1] + 1 if method in ('capabilities', 'prepare', 'drain') else (
+            args[-2] + 1 if method == 'run' else args[1] + d.CONTROL_SECONDS + 1)
+        return response
+    setattr(controller, method, late)
+    with pytest.raises(subprocess.TimeoutExpired if method == 'run' else d.DomainUnavailable):
+        with admission() as domain:
+            run(domain);domain.drain();domain.cleanup_complete()
+    assert 'FREE' not in controller.events
+    assert d._registration.blocked
+    if method in ('capabilities', 'acquire', 'prepare'):
+        assert 'RUNNING' not in controller.events
+
+
+@pytest.mark.parametrize('method', ['capabilities', 'acquire', 'prepare', 'run'])
+def test_cancellation_after_controller_response_prevents_next_transition(controller, method):
+    class Cancelled(Exception):
+        pass
+    cancelled = False
+    original = getattr(controller, method)
+    def cancel_after(*args):
+        nonlocal cancelled
+        response = original(*args)
+        cancelled = True
+        return response
+    setattr(controller, method, cancel_after)
+    def check():
+        if cancelled:
+            raise Cancelled()
+    with pytest.raises(Cancelled):
+        with d.admit(check, 0, lambda: pytest.fail('Legacy capacity')) as domain:
+            run(domain);domain.drain();domain.cleanup_complete()
+    assert 'FREE' not in controller.events and d._registration.blocked
+    if method in ('capabilities', 'acquire', 'prepare'):
+        assert 'RUNNING' not in controller.events
+
+
+@pytest.mark.parametrize('options', [
+    {'timeout': True}, {'timeout': float('nan')}, {'timeout': '1'},
+    {'max_output_bytes': 0}, {'max_output_bytes': True}, {'max_output_bytes': 65537},
+    {'env': {'TMPDIR': '/bad\x00path'}}, {'command': []},
+    {'command': ['bad\x00command']}, {'command': [object()]},
+])
+def test_invalid_launch_contract_rejected_before_preparation(controller, options):
+    launch = dict(command=['synthetic'], timeout=1, max_output_bytes=1024, env={})
+    launch.update(options)
+    with pytest.raises(d.DomainUnavailable):
+        with admission() as domain:
+            domain.run(**launch)
+    assert 'PREPARED' not in controller.events and 'RUNNING' not in controller.events
+    assert 'FREE' not in controller.events and d._registration.blocked
+
+
 def test_release_failure_never_publishes_staged_output(file_result, monkeypatch, tmp_path):
     from app.core import native_isolation as boundary
     from app.core.ocr_v2.errors import EngineUnavailableError
