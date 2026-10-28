@@ -29,7 +29,7 @@ from dramatiq import Message
 from dramatiq.brokers.redis import RedisBroker
 
 WORKER = Path(__file__).resolve().parents[1]
-BACKEND_SHA = "6713d7c26d95cdaadbebe6629aab0c43c35671c7"
+BACKEND_SHA = "40dfe66886e7c7c5bc3f522e4ca5fcd55e669a02"
 
 
 def until(probe, *, seconds=45):

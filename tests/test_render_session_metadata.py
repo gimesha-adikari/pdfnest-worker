@@ -6,6 +6,7 @@ from pathlib import Path
 import subprocess
 import sys
 import threading
+import time
 
 import pymupdf as fitz
 import pytest
@@ -59,7 +60,18 @@ def assert_clean(manager, tmp_path):
 
 def assert_dead(pid):
     path = Path(f"/proc/{pid}/stat")
-    assert not path.exists() or path.read_text().split()[2] == "Z"
+    # SIGKILL delivery is asynchronous. Wait for the same exit predicate rather
+    # than treating the signal syscall's return as acknowledgment of death.
+    deadline = time.monotonic() + 2
+    while True:
+        try:
+            state = path.read_text().split()[2]
+        except FileNotFoundError:
+            return
+        if state == "Z":
+            return
+        assert time.monotonic() < deadline, f"fixture descendant {pid} remains live ({state})"
+        time.sleep(.01)
 
 
 async def wait_for_marker(path):

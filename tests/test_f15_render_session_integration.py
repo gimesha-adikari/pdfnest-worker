@@ -13,12 +13,14 @@ from PIL import Image
 import pytest
 
 from app.core import security
+from app.core import native_domain
 from app.main import app
 from app.api.tools.render import session, session_metadata as metadata
 from tests.test_security import generate_headers
 from tests.test_render_session_metadata import (
     manager, child_probe, small_pdf, assert_clean, assert_probe_reaped,
 )
+from tests.test_native_execution_domain import FakeController
 
 SECRET = "f15-render-synthetic-secret"
 CREATE = "/api/v1/render/sessions"
@@ -64,6 +66,50 @@ def client():
     # The complete application middleware stack and actual router are used;
     # lifespan is intentionally omitted so no background/shared services start.
     return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1")
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("state,status", [("missing", 503), ("busy", 429), ("quarantined", 503)])
+async def test_strict_multipart_cannot_bypass_required_controller(manager, monkeypatch, state, status):
+    """Synthetic control receipts prove refusal ordering, never kernel isolation."""
+    controller = FakeController()
+    controller.busy = state == "busy"
+    controller.dirty = state == "quarantined"
+    registration = None if state == "missing" else native_domain.Registration(
+        controller, controller.identity, controller.limits, ("slot-1",),
+    )
+    monkeypatch.setenv("NATIVE_EXECUTION_DOMAIN_MODE", "required-nonproduction")
+    monkeypatch.setattr(native_domain, "_registration", registration)
+    async with client() as http:
+        outgoing, _ = await signed_request(http, data=small_pdf())
+        response = await http.send(outgoing)
+        assert response.status_code == status, response.text
+        assert "synthetic-controller" not in response.text
+        assert "epoch-1" not in response.text
+    assert "RUNNING" not in controller.events
+    assert not manager._sessions and not list(session.SESSION_ROOT.iterdir())
+
+
+@pytest.mark.anyio
+async def test_invalid_body_rejected_before_required_controller(manager, monkeypatch):
+    controller = FakeController()
+
+    def forbidden(deadline):
+        raise AssertionError("Unauthenticated request reached controller admission")
+
+    controller.capabilities = forbidden
+    monkeypatch.setenv("NATIVE_EXECUTION_DOMAIN_MODE", "required-nonproduction")
+    monkeypatch.setattr(native_domain, "_registration", native_domain.Registration(
+        controller, controller.identity, controller.limits, ("slot-1",),
+    ))
+    async with client() as http:
+        outgoing, body = await signed_request(http, data=small_pdf())
+        outgoing = http.build_request("POST", CREATE, content=body + b"x", headers={
+            key: value for key, value in outgoing.headers.items() if key != "content-length"
+        })
+        assert (await http.send(outgoing)).status_code == 401
+    assert not controller.events
+    assert not manager._sessions and not list(session.SESSION_ROOT.iterdir())
 
 
 @pytest.mark.anyio
