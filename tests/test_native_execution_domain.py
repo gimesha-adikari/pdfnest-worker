@@ -1,6 +1,7 @@
 """Source-contract tests; the fake controller is NOT kernel enforcement."""
 from dataclasses import replace
 import subprocess
+from typing import Optional
 import pytest
 
 from app.core import native_domain as d
@@ -15,7 +16,7 @@ class FakeController:
         self.generation = 0
         self.busy = False
         self.dirty = False
-        self.fail: BaseException | None = None
+        self.fail: Optional[BaseException] = None
         self.limits = d.Limits(256 << 20, 0, 16, 50000, 100000, 300.0)
 
     def capabilities(self, deadline):
