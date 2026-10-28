@@ -56,7 +56,7 @@ def generate_auth_headers(method: str, path: str, body: bytes = b"") -> dict[str
     timestamp_str = str(time.time())
     method_str = method.upper()
 
-    body_hash = hashlib.sha256(body).hexdigest() if body else ""
+    body_hash = hashlib.sha256(body).hexdigest()
 
     if body_hash:
         string_to_sign = f"{method_str}\n{path}\n{timestamp_str}\n{nonce}\n{body_hash}"
@@ -101,6 +101,20 @@ def assert_queue_strict_invariants(pool: PersistentRenderWorkerPool):
     finally:
         for w in items:
             pool.available_workers.put_nowait(w)
+
+
+async def signed_post(client, path, *, headers, **kwargs):
+    outgoing = client.build_request("POST", path, headers=headers, **kwargs)
+    await outgoing.aread()
+    outgoing.headers.update(generate_auth_headers("POST", path, outgoing.content))
+    return await client.send(outgoing)
+
+
+def signed_post_sync(client, path, *, headers, **kwargs):
+    outgoing = client.build_request("POST", path, headers=headers, **kwargs)
+    outgoing.read()
+    outgoing.headers.update(generate_auth_headers("POST", path, outgoing.content))
+    return client.send(outgoing)
 
 
 # 1. CRITICAL: Production Worker Provenance
@@ -295,7 +309,7 @@ async def test_production_environment_ignores_simulation_headers(sample_pdf_byte
             files = {"file": ("sample.pdf", sample_pdf_bytes, "application/pdf")}
             data = {"page": "1", "dpi": "144"}
 
-            resp = await client.post("/api/v1/render/page", headers=headers_crash, files=files, data=data)
+            resp = await signed_post(client, "/api/v1/render/page", headers=headers_crash, files=files, data=data)
             assert resp.status_code == 200
             assert resp.headers["content-type"] == "image/jpeg"
             # Normal RSS/render-limit recycling may replace a healthy process.
@@ -308,7 +322,7 @@ async def test_production_environment_ignores_simulation_headers(sample_pdf_byte
             headers_hang = generate_auth_headers("POST", "/api/v1/render/page")
             headers_hang["X-Test-Simulate-Hang"] = "true"
 
-            resp2 = await client.post("/api/v1/render/page", headers=headers_hang, files=files, data=data)
+            resp2 = await signed_post(client, "/api/v1/render/page", headers=headers_hang, files=files, data=data)
             assert resp2.status_code == 200
             assert resp2.headers["content-type"] == "image/jpeg"
             # Normal RSS/render-limit recycling may replace a healthy process.
@@ -354,7 +368,7 @@ async def test_real_http_endpoint_actual_worker_crash_and_fallback(sample_pdf_by
                 data = {"page": "1", "dpi": "144"}
 
                 # Real HTTP call -> real worker crash -> real subprocess fallback
-                resp = await client.post("/api/v1/render/page", headers=headers, files=files, data=data)
+                resp = await signed_post(client, "/api/v1/render/page", headers=headers, files=files, data=data)
                 assert resp.status_code == 200
                 assert resp.headers["content-type"] == "image/jpeg"
                 assert len(resp.content) > 0
@@ -375,7 +389,7 @@ async def test_real_http_endpoint_actual_worker_crash_and_fallback(sample_pdf_by
 
                 # Subsequent normal HTTP render succeeds without triggering fallback
                 normal_headers = generate_auth_headers("POST", "/api/v1/render/page")
-                resp2 = await client.post("/api/v1/render/page", headers=normal_headers, files=files, data=data)
+                resp2 = await signed_post(client, "/api/v1/render/page", headers=normal_headers, files=files, data=data)
                 assert resp2.status_code == 200
                 assert pool.total_fallbacks == initial_fallbacks + 1
 
@@ -416,7 +430,7 @@ async def test_real_http_endpoint_actual_worker_hang_timeout_and_fallback(sample
                 data = {"page": "1", "dpi": "144"}
 
                 # Real HTTP call -> real worker hang -> timeout -> subprocess fallback
-                resp = await client.post("/api/v1/render/page", headers=headers, files=files, data=data)
+                resp = await signed_post(client, "/api/v1/render/page", headers=headers, files=files, data=data)
                 assert resp.status_code == 200
                 assert resp.headers["content-type"] == "image/jpeg"
                 assert len(resp.content) > 0
@@ -456,7 +470,7 @@ async def test_http_endpoint_fallback_with_mocked_pool_failure(sample_pdf_bytes:
             files = {"file": ("sample.pdf", sample_pdf_bytes, "application/pdf")}
             data = {"page": "1", "dpi": "144"}
 
-            resp = await client.post("/api/v1/render/page", headers=headers, files=files, data=data)
+            resp = await signed_post(client, "/api/v1/render/page", headers=headers, files=files, data=data)
             assert resp.status_code == 200
             assert resp.headers["content-type"] == "image/jpeg"
             assert len(resp.content) > 0
@@ -690,7 +704,7 @@ def test_http_endpoint_page_rendering_integration(sample_pdf_bytes: bytes):
         headers = generate_auth_headers("POST", "/api/v1/render/page")
         files = {"file": ("sample.pdf", sample_pdf_bytes, "application/pdf")}
         data = {"page": 1, "dpi": 144}
-        resp = client.post("/api/v1/render/page", headers=headers, files=files, data=data)
+        resp = signed_post_sync(client, "/api/v1/render/page", headers=headers, files=files, data=data)
         assert resp.status_code == 200
         assert resp.headers["content-type"] == "image/jpeg"
         assert "x-queue-wait-ms" in resp.headers

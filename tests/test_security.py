@@ -19,7 +19,7 @@ def generate_headers(
     secret: str = SECRET,
     timestamp: float | None = None,
     nonce: str | None = None,
-    body_hash: str | None = None,
+    body_hash: str | None = hashlib.sha256(b"").hexdigest(),
 ) -> dict[str, str]:
     if timestamp is None:
         timestamp = time.time()
@@ -49,6 +49,21 @@ def generate_headers(
         headers["X-Worker-Body-Hash"] = body_hash
 
     return headers
+
+
+def signed_post(client, path, **kwargs):
+    # Small synthetic fixtures only: serialize once, sign, and send those bytes.
+    outgoing = client.build_request("POST", path, **kwargs)
+    body = outgoing.read()
+    outgoing.headers.update(generate_headers("POST", path, body_hash=hashlib.sha256(body).hexdigest()))
+    return client.send(outgoing)
+
+
+async def signed_post_async(client, path, **kwargs):
+    outgoing = client.build_request("POST", path, **kwargs)
+    body = await outgoing.aread()
+    outgoing.headers.update(generate_headers("POST", path, body_hash=hashlib.sha256(body).hexdigest()))
+    return await client.send(outgoing)
 
 
 def test_public_routes_bypass_auth():
