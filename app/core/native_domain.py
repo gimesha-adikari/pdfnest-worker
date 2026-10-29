@@ -1,4 +1,4 @@
-"""Dormant execution-domain contract. No production/runtime adapter is shipped.
+"""Dormant execution-domain contract; operator adapter candidate is unactivated.
 
 Only trusted startup code may supply a Registration after independently verifying
 its adapter/control plane. Environment/request data never selects an adapter.
@@ -156,8 +156,9 @@ class Registration:
         self.condition = threading.Condition(self.lock)
 
 
-# Deliberately no manager socket, plugin loader, fake-controller flag or runtime
-# registration API. Tests replace this private value; deployment wiring is absent.
+# Environment/request data cannot install an adapter. Reviewed operator startup
+# may explicitly supply app.controller.adapter.trusted_registration; no application
+# startup invokes it. Tests replace this private value. Legacy remains default.
 _registration: Registration | None = None
 CONTROL_SECONDS = 5.0
 DRAIN_SECONDS = 5.0
