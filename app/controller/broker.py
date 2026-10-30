@@ -16,6 +16,38 @@ from app.core.native_domain import (BusyReceipt, Capabilities, DomainUnavailable
                                     Drain, Identity, Lease, Membership, domain_identity)
 
 
+def _journal_parent(path):
+    """Every pathname/sidecar open must remain inside independent authority.
+
+    A root-owned sticky ancestor is safe only when its next component is a
+    private broker-owned directory: other UIDs cannot replace that entry.
+    All other ancestors must be owned by root/the broker and not writable by
+    any other UID. Symlink aliases are never accepted.
+    """
+    owner = os.geteuid()
+    try:
+        if not path.is_absolute() or path.resolve() != path:
+            raise DomainUnavailable()
+        parent = path.parent
+        private = parent.lstat()
+        if (not stat.S_ISDIR(private.st_mode) or private.st_uid != owner
+                or private.st_mode & 0o077):
+            raise DomainUnavailable()
+        child = parent
+        for ancestor in (parent, *parent.parents):
+            info = ancestor.lstat()
+            if not stat.S_ISDIR(info.st_mode) or info.st_uid not in (0, owner):
+                raise DomainUnavailable()
+            if info.st_mode & 0o022:
+                child_info = child.lstat()
+                if (ancestor == child or info.st_uid != 0 or not info.st_mode & stat.S_ISVTX
+                        or child_info.st_uid != owner or child_info.st_mode & 0o077):
+                    raise DomainUnavailable()
+            child = ancestor
+    except OSError as exc:
+        raise DomainUnavailable() from exc
+
+
 class Journal:
     """One live broker owns the private database; flock prevents split authority.
 
@@ -33,9 +65,15 @@ class Journal:
                 or len(set(slots)) != len(slots)
                 or any(re.fullmatch(r'[A-Za-z0-9_.-]{1,128}', s) is None for s in slots)):
             raise DomainUnavailable()
-        info = self.path.parent.lstat()
-        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
-            raise DomainUnavailable()
+        _journal_parent(self.path)
+        for suffix in ('-journal', '-wal', '-shm'):
+            try:
+                sidecar = self.path.with_name(self.path.name + suffix).lstat()
+            except FileNotFoundError:
+                continue
+            if (not stat.S_ISREG(sidecar.st_mode) or sidecar.st_uid != os.geteuid()
+                    or sidecar.st_nlink != 1 or sidecar.st_mode & 0o077):
+                raise DomainUnavailable()
         # Protected directory makes sqlite's own pathname/sidecar opens safe.
         try:
             fd = os.open(self.path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
@@ -51,6 +89,13 @@ class Journal:
             raise DomainUnavailable() from exc
         try:
             self.db = sqlite3.connect(self.path, timeout=1, isolation_level=None, check_same_thread=False)
+            # Bind SQLite's independent pathname open to the locked inode before
+            # it creates sidecars or performs any authoritative state writes.
+            _journal_parent(self.path)
+            current = self.path.lstat()
+            if ((current.st_dev, current.st_ino) != (entry.st_dev, entry.st_ino)
+                    or not stat.S_ISREG(current.st_mode) or current.st_nlink != 1):
+                raise DomainUnavailable()
             self.db.row_factory = sqlite3.Row
             self.db.execute('PRAGMA journal_mode=DELETE')
             self.db.execute('PRAGMA synchronous=FULL')

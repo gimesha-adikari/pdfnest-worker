@@ -1,5 +1,6 @@
 """Synthetic manager tests: durable authority semantics, NOT kernel qualification."""
 from dataclasses import replace
+import os
 import time
 import pytest
 from app.core.native_domain import Identity, Limits, BusyReceipt, DomainUnavailable
@@ -78,6 +79,43 @@ def test_policy_drift_and_symlink_journal_refused(tmp_path):
     link.symlink_to(path)
     with pytest.raises(DomainUnavailable):
         Journal(link, identity(), ('one',), 4)
+
+
+def test_journal_rejects_replaceable_or_symlinked_ancestor(tmp_path):
+    Journal, _ = api()
+    unsafe = tmp_path / 'unsafe'
+    unsafe.mkdir(mode=0o700)
+    private = unsafe / 'private'
+    private.mkdir(mode=0o700)
+    unsafe.chmod(0o777)
+    try:
+        with pytest.raises(DomainUnavailable):
+            Journal(private / 'state.sqlite', identity(), ('one',), 4)
+    finally:
+        unsafe.chmod(0o700)
+    alias = tmp_path / 'alias'
+    alias.symlink_to(unsafe, target_is_directory=True)
+    with pytest.raises(DomainUnavailable):
+        Journal(alias / 'private' / 'state.sqlite', identity(), ('one',), 4)
+
+
+def test_journal_rejects_database_inode_substitution(tmp_path, monkeypatch):
+    import sqlite3
+    Journal, _ = api()
+    path = tmp_path / 'state.sqlite'
+    connect = sqlite3.connect
+
+    def substitute(database, *args, **kwargs):
+        # Replace the path after Journal's protected open/flock, but before
+        # SQLite independently opens it. It must never split its authority.
+        path.unlink()
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+        os.close(fd)
+        return connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, 'connect', substitute)
+    with pytest.raises(DomainUnavailable):
+        Journal(path, identity(), ('one',), 4)
 
 class SyntheticManager:
     """No kernel or authority assertions; deterministic broker dependency."""
