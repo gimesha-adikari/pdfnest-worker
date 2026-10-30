@@ -116,18 +116,3 @@ def test_declared_source_contains_no_automatic_startup_activation():
     m = module()
     assert d._registration is None
     assert hasattr(m, 'trusted_registration')
-
-
-
-@pytest.mark.parametrize('operation', tuple(__import__('app.core.native_operations', fromlist=['OPERATIONS']).OPERATIONS))
-def test_every_registry_operation_is_explicitly_unavailable_until_schema_exists(tmp_path, operation):
-    """Denied coverage is not native execution compatibility qualification."""
-    m = module()
-    import json
-    root = tmp_path / 'job'
-    root.mkdir(mode=0o700)
-    (root / 'request.json').write_text(json.dumps({'operation': operation}))
-    request = d.Launch((sys.executable, '-m', 'app.core.native_supervisor', str(root), str(os.getpid())),
-                       {}, 300, 65536)
-    with pytest.raises(d.DomainUnavailable):
-        m.translate(request)

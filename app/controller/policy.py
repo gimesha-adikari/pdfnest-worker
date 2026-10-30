@@ -53,7 +53,7 @@ class Policy:
         # Pins include source-fixed schema/profile version; identity never grants authority.
         fields = asdict(self)
         fields['identity'].pop('policy_sha256')
-        fields['schema'] = 'metadata-v1'
+        fields['schema'] = 'native-operations-v1'
         fields['profile'] = 'system-manager-monitor-v1'
         encoded = json.dumps(fields, default=str, sort_keys=True, separators=(',', ':')).encode()
         if hashlib.sha256(encoded).hexdigest() != self.identity.policy_sha256:

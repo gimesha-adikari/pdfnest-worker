@@ -88,3 +88,13 @@ def test_unaccounted_staging_is_inventory_uncertainty_not_a_clean_restart(tmp_pa
     manager = m.SystemManager(policy)
     monkeypatch.setattr(manager, '_command', lambda *args: '')
     assert manager.inventory(), 'retained staging must prevent a fresh-journal readiness claim'
+
+
+@pytest.mark.parametrize('value,expected',[('35s',35000000),('5min 5s',305000000),('1.5s',1500000),('35000000us',35000000)])
+def test_independent_runtime_deadline_readback_is_finite_and_exact(value,expected):
+    assert module().runtime_usec(value)==expected
+
+
+@pytest.mark.parametrize('value',['infinity','max','0','306s','5min5s','NaNs',None])
+def test_missing_or_unbounded_independent_deadline_refused(value):
+    with pytest.raises(DomainUnavailable):module().runtime_usec(value)

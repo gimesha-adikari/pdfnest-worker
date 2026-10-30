@@ -21,7 +21,7 @@ import time
 from app.controller.linux import pidfd_open, pidfd_signal, require_child
 
 
-def capture(child, deadline, limit):
+def capture(child, deadline, limit, tick=lambda: None):
     streams = {child.stdout: bytearray(), child.stderr: bytearray()}
     selector = selectors.DefaultSelector()
     try:
@@ -29,6 +29,7 @@ def capture(child, deadline, limit):
             os.set_blocking(stream.fileno(), False)
             selector.register(stream, selectors.EVENT_READ)
         while selector.get_map():
+            tick()
             if time.monotonic() >= deadline:
                 raise RuntimeError('NATIVE_DEADLINE')
             for key, _ in selector.select(min(.05, max(0, deadline - time.monotonic()))):
@@ -91,17 +92,69 @@ def _protected_json(path):
         return json.loads(stream.read(8193))
 
 
+def _native_directory(uid):
+    fd=os.open('/work/job',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+    info=os.fstat(fd)
+    if info.st_uid != uid or info.st_mode & 0o077:
+        os.close(fd)
+        raise RuntimeError('NATIVE_DIRECTORY_REJECTED')
+    return fd
+
+
+def read_native(name, uid, limit):
+    directory=_native_directory(uid)
+    try:
+        fd=os.open(name,os.O_RDONLY|os.O_NONBLOCK|os.O_NOFOLLOW,dir_fd=directory)
+        with os.fdopen(fd,'rb') as stream:
+            before=os.fstat(stream.fileno())
+            if not stat.S_ISREG(before.st_mode) or before.st_uid != uid or before.st_nlink != 1 or before.st_size > limit:
+                raise RuntimeError('NATIVE_FILE_REJECTED')
+            data=stream.read(limit+1)
+            after=os.fstat(stream.fileno())
+            if len(data) > limit or len(data) != before.st_size or any(getattr(before,k) != getattr(after,k) for k in ('st_dev','st_ino','st_size','st_mtime_ns','st_ctime_ns')):
+                raise RuntimeError('NATIVE_FILE_CHANGED')
+            return data
+    finally: os.close(directory)
+
+
+def safe_unlink_native(name, uid):
+    fd=_native_directory(uid)
+    try: os.unlink(name,dir_fd=fd)
+    finally: os.close(fd)
+
+
+def _protected_json_ack(path):
+    fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW)
+    with os.fdopen(fd,'rb') as stream:
+        info=os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_nlink != 1 or info.st_mode & 0o077:
+            raise RuntimeError('ACK_REJECTED')
+        return stream.read(32)
+
+
+def _publish(path,data):
+    temporary=path.with_suffix('.pending')
+    fd=os.open(temporary,os.O_CREAT|os.O_EXCL|os.O_WRONLY|os.O_NOFOLLOW,0o600)
+    with os.fdopen(fd,'wb') as stream:
+        stream.write(data)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary,path)
+
+
 def main(path=Path('/control/spec.json')):
     if os.geteuid() != 0:
         raise RuntimeError('AUTHORITY_UNAVAILABLE')
     spec = _protected_json(path)
-    if (set(spec) != {'domain', 'token', 'uid', 'gid', 'wall_seconds', 'output_limit', 'input_sha256'}
+    if (set(spec) != {'domain', 'token', 'uid', 'gid', 'wall_seconds', 'output_limit', 'input_sha256', 'kind', 'profile'}
             or re.fullmatch('native-[0-9a-f]{64}', spec['domain']) is None
             or re.fullmatch('[0-9a-f]{64}', spec['token']) is None
             or type(spec['uid']) is not int or spec['uid'] <= 0
             or type(spec['gid']) is not int or spec['gid'] <= 0
-            or type(spec['wall_seconds']) not in (int, float) or not 0 < spec['wall_seconds'] <= 30
-            or spec['output_limit'] != 1024):
+            or type(spec['wall_seconds']) not in (int, float) or not 0 < spec['wall_seconds'] <= 300
+            or spec['kind'] not in ('render_metadata','native_operation')
+            or spec['profile'] != 'native-operations-v1'
+            or spec['output_limit'] != (1024 if spec['kind'] == 'render_metadata' else 65536)):
         raise RuntimeError('SPEC_REJECTED')
     libc = ctypes.CDLL(None, use_errno=True)
     if libc.prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER.
@@ -144,15 +197,51 @@ def main(path=Path('/control/spec.json')):
         # The monitor is the guardian's actual parent in the same PID namespace.
         command = ['/usr/bin/python3', '-I', '-m', 'app.api.tools.render.session_metadata',
                    '/input.pdf', str(os.getpid())]
+        if spec['kind'] == 'native_operation':
+            command = ['/usr/bin/python3','-I','-m','app.controller.dispatcher']
         child = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                  stderr=subprocess.PIPE, close_fds=True, start_new_session=True,
                                  preexec_fn=drop, cwd='/work', env={
                                      'LANG': 'C.UTF-8', 'PATH': '/usr/bin:/bin', 'TMPDIR': '/work',
                                      'TMP': '/work', 'TEMP': '/work',
                                      'OPENBLAS_NUM_THREADS': '1', 'OMP_NUM_THREADS': '1'})
-        code, out, err = capture(child, time.monotonic() + spec['wall_seconds'], spec['output_limit'])
+        sequence = 0
+        pending = None
+        event_bytes = 0
+        def tick():
+            nonlocal sequence, pending, event_bytes
+            if spec['kind'] != 'native_operation': return
+            if pending is not None:
+                ack = directory / ('ack-' + str(pending))
+                if ack.exists():
+                    if _protected_json_ack(ack) != str(pending).encode(): raise RuntimeError('ACK_REJECTED')
+                    safe_unlink_native('event.json', spec['uid'])
+                    ack.unlink()
+                    sequence = pending
+                    pending = None
+                return
+            try: data = read_native('event.json', spec['uid'], 1024*1024)
+            except FileNotFoundError: return
+            from app.controller.events import validate_event
+            event = json.loads(data)
+            validate_event(event,sequence+1)
+            event_bytes += len(data)
+            if event_bytes > 16*1024*1024: raise RuntimeError('EVENT_LIMIT')
+            _publish(directory / 'event.json',data)
+            pending = event['sequence']
+        code, out, err = capture(child, time.monotonic() + spec['wall_seconds'], spec['output_limit'],tick)
         reap(time.monotonic() + 2)
-        payload = json.dumps({'returncode': code, 'stdout': out, 'stderr': err, 'reaped': True}).encode()
+        result = {'returncode': code, 'stdout': out, 'stderr': err, 'reaped': True}
+        if spec['kind'] == 'native_operation':
+            from app.controller.profiles import MAX_ARTIFACT_BYTES, validate_result
+            artifacts = {'result.json':read_native('result.json',spec['uid'],MAX_ARTIFACT_BYTES)}
+            for name in ('output.pdf','output.txt','output.docx'):
+                try: artifacts[name]=read_native(name,spec['uid'],MAX_ARTIFACT_BYTES)
+                except FileNotFoundError: pass
+            result['artifacts']=artifacts
+            validate_result(result)
+        from app.controller.transport import pack
+        payload = json.dumps(pack(result),allow_nan=False,separators=(',',':')).encode()
         temporary = directory / 'complete.pending'
         fd = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
         with os.fdopen(fd, 'wb') as stream:

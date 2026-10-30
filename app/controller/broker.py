@@ -292,11 +292,10 @@ class Broker:
     def prepare(self, lease, session, manifest, deadline):
         with self.mutex:
             row = self._own(lease, session)
-            if row['state'] != 'LEASED' or set(manifest) != {'kind', 'input'}:
+            if row['state'] != 'LEASED':
                 raise DomainUnavailable()
-            if (manifest['kind'] != 'render_metadata' or type(manifest['input']) is not bytes
-                    or not 0 < len(manifest['input']) <= 16 * 1024 * 1024):
-                raise DomainUnavailable()
+            from app.controller.profiles import validate_manifest
+            validate_manifest(manifest)
         try:
             receipt = self.manager.prepare(lease, manifest, deadline)
             member = Membership(lease, self.limits, receipt['token'], False)
@@ -329,6 +328,12 @@ class Broker:
             raise DomainUnavailable()
         return self.manager.poll(lease, deadline)
 
+    def ack(self, lease, session, sequence, deadline):
+        self._own(lease, session)
+        if self.journal.status(lease)['state'] != 'RUNNING':
+            raise DomainUnavailable()
+        return self.manager.ack(lease, sequence, deadline)
+
     def drain(self, lease, session, deadline):
         self._own(lease, session)
         row = self.journal.status(lease)
@@ -338,12 +343,9 @@ class Broker:
         self.journal.transition(lease, row['state'], 'DRAINING')
         try:
             result = self.manager.drain(lease, deadline)
-            if (type(result) is not dict or set(result) != {'returncode', 'stdout', 'stderr', 'reaped'}
-                    or result['reaped'] is not True or type(result['returncode']) is not int
-                    or any(type(result[k]) is not str or len(result[k].encode()) > 1024 for k in ('stdout', 'stderr'))):
-                raise DomainUnavailable()
-            import hashlib
-            digest = hashlib.sha256(json.dumps(result, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+            from app.controller.profiles import validate_result, result_digest
+            validate_result(result)
+            digest = result_digest(result)
             self.journal.drained(lease, digest)
             self.results[lease.operation] = result, digest
             return Drain(lease, True, True, True), result, digest

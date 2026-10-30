@@ -237,7 +237,7 @@ def broker_handler(broker):
         signatures = {
             'capabilities': (), 'acquire': ('operation', 'wait'),
             'prepare': ('lease', 'manifest'), 'run': ('lease', 'token'),
-            'poll': ('lease',), 'drain': ('lease',),
+            'poll': ('lease',), 'drain': ('lease',), 'ack': ('lease','sequence'),
             'release': ('lease', 'digest'), 'quarantine': ('operation',),
         }
         if method not in signatures or set(args) != set(signatures[method]):
@@ -256,6 +256,8 @@ def broker_handler(broker):
             return broker.prepare(lease, session, args['manifest'], deadline)
         if method == 'run':
             return broker.run(lease, session, args['token'], deadline)
+        if method == 'ack':
+            return broker.ack(lease, session, args['sequence'], deadline)
         if method == 'release':
             return broker.release(lease, session, args['digest'], deadline)
         return getattr(broker, method)(lease, session, deadline)
@@ -265,7 +267,7 @@ def broker_handler(broker):
 def manager_handler(manager):
     def handler(method, args, pid, session):
         signatures = {'preflight': (), 'inventory': (), 'prepare': ('lease', 'manifest'),
-                      'grant': ('lease', 'token'), 'poll': ('lease',), 'drain': ('lease',),
+                      'grant': ('lease', 'token'), 'poll': ('lease',), 'drain': ('lease',), 'ack': ('lease','sequence'),
                       'cleanup': ('lease',), 'abort': ('lease',)}
         if method not in signatures or set(args) != set(signatures[method]):
             raise d.DomainUnavailable()
@@ -296,6 +298,9 @@ class ManagerClient:
 
     def poll(self, lease, deadline):
         return self.client.request('poll', deadline, lease=lease)
+
+    def ack(self, lease, sequence, deadline):
+        return self.client.request('ack', deadline, lease=lease, sequence=sequence)
 
     def drain(self, lease, deadline):
         return self.client.request('drain', deadline, lease=lease)

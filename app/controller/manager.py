@@ -23,6 +23,22 @@ from app.controller.policy import Policy, protected_directory, runtime_digest
 from app.controller.monitor import capture
 
 
+def runtime_usec(value):
+    """Parse systemctl's finite duration readback, never accept infinity/max."""
+    if type(value) is not str:
+        raise DomainUnavailable()
+    # systemctl show renders microsecond duration properties in human units.
+    parts=re.findall(r'(\d+(?:\.\d+)?)(min|ms|us|s)',value)
+    if not parts or ' '.join(number+unit for number,unit in parts) != value:
+        raise DomainUnavailable()
+    from decimal import Decimal
+    factors={'min':60000000,'s':1000000,'ms':1000,'us':1}
+    result=sum(Decimal(number)*factors[unit] for number,unit in parts)
+    if result != int(result) or not 0 < result <= 305000000:
+        raise DomainUnavailable()
+    return int(result)
+
+
 class KernelObserver:
     """Synthetic roots are useful in tests; real bridge fixes both to the host."""
     def __init__(self, cgroup_root=Path('/sys/fs/cgroup'), proc_root=Path('/proc')):
@@ -118,7 +134,7 @@ class SystemManager:
         if not self.runtime_verified:
             if runtime_digest(p.runtime_root, time.monotonic() + 5) != p.runtime_sha256:
                 raise DomainUnavailable()
-            for destination in ('usr/bin/python3', 'control', 'work', 'input.pdf'):
+            for destination in ('usr/bin/python3', 'control', 'work', 'input.pdf', 'native-input'):
                 if not (p.runtime_root / destination).exists():
                     raise DomainUnavailable()
             self.runtime_verified = True
@@ -186,6 +202,7 @@ class SystemManager:
             'SystemCallFilter=~@mount @reboot @swap @module @raw-io @debug',
             'InaccessiblePaths=/dev/shm /tmp /var/tmp /run /sys', 'ReadOnlyPaths=/dev',
             f'BindPaths={directory}:/control', f'BindReadOnlyPaths={directory / "input.pdf"}:/input.pdf',
+            f'BindReadOnlyPaths={directory / "native-input"}:/native-input',
             f'TemporaryFileSystem=/work:rw,nosuid,nodev,noexec,size={p.work_bytes},nr_inodes={p.work_inodes},mode=1777',
             'ReadWritePaths=/control /work', 'WorkingDirectory=/work', 'StandardOutput=null', 'StandardError=null', 'UMask=0077',
             'Environment=LANG=C.UTF-8 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 TMPDIR=/work',
@@ -197,18 +214,29 @@ class SystemManager:
     def prepare(self, lease, manifest, deadline):
         self.preflight()
         self._lease(lease)
-        if lease.domain in self.records or manifest['kind'] != 'render_metadata':
+        if lease.domain in self.records:
             raise DomainUnavailable()
-        data = manifest['input']
-        if type(data) is not bytes or not 0 < len(data) <= self.policy.input_limit:
+        from app.controller.profiles import validate_manifest, VERSION
+        validate_manifest(manifest)
+        input_bytes = len(manifest['input']) if manifest['kind'] == 'render_metadata' else len(manifest['request']) + sum(map(len,manifest['files'].values()))
+        if input_bytes > self.policy.input_limit:
             raise DomainUnavailable()
         directory = self.policy.staging_root / lease.domain
         directory.mkdir(mode=0o700)
+        native = directory / 'native-input'
+        native.mkdir(mode=0o755)
         token = secrets.token_hex(32)
         uid = self.policy.native_uids[self.policy.slots.index(lease.slot)]
+        data = manifest.get('input', b'placeholder')
         spec = {'domain': lease.domain, 'token': token, 'uid': uid, 'gid': pwd.getpwuid(uid).pw_gid,
-                'wall_seconds': min(30, self.policy.limits.wall_seconds), 'output_limit': 1024,
-                'input_sha256': hashlib.sha256(data).hexdigest()}
+                'wall_seconds': min(300, self.policy.limits.wall_seconds),
+                'output_limit': 1024 if manifest['kind'] == 'render_metadata' else 65536,
+                'input_sha256': hashlib.sha256(data).hexdigest(), 'kind':manifest['kind'],
+                'profile':VERSION}
+        if manifest['kind'] == 'native_operation':
+            self._write(native / 'request.json',manifest['request'],0o444)
+            for name, content in manifest['files'].items():
+                self._write(native / name, content, 0o444)
         self._write(directory / 'input.pdf', data, 0o444)
         self._write(directory / 'spec.json', json.dumps(spec).encode(), 0o600)
         self._command(self.launch_command(lease, directory), deadline)
@@ -218,12 +246,13 @@ class SystemManager:
             if pid > 0 and state.get('ActiveState') == 'active':
                 if (not re.fullmatch('[0-9a-f]{32}', state.get('InvocationID', ''))
                         or state.get('RootDirectory') != str(self.policy.runtime_root)
+                        or runtime_usec(state.get('RuntimeMaxUSec')) != round((self.policy.limits.wall_seconds + 5) * 1000000)
                         or any(state.get(key) != value for key, value in (
                             ('PrivateNetwork', 'yes'), ('PrivatePIDs', 'yes'),
                             ('NoNewPrivileges', 'yes'), ('KillMode', 'control-group')))):
                     raise DomainUnavailable()
                 member = self.observer.member(state['ControlGroup'], pid, self.policy.limits)
-                member.update(invocation=state['InvocationID'], token=token, lease=lease)
+                member.update(invocation=state['InvocationID'], token=token, lease=lease, sequence=0, event_bytes=0)
                 self.records[lease.domain] = member
                 return {key: value for key, value in member.items() if key != 'lease'}
             time.sleep(.02)
@@ -253,22 +282,47 @@ class SystemManager:
         self._lease(lease)
         directory = self.policy.staging_root / lease.domain
         path = directory / 'complete.json'
+        event_path = directory / 'event.json'
+        if event_path.exists():
+            from app.controller.events import validate_event
+            event = self._read_json(event_path, 1024 * 1024)
+            record = self.records[lease.domain]
+            validate_event(event,record['sequence']+1)
+            return {'event':event}
         if not path.exists():
             return None
         return self._read_result(path)
 
+    def ack(self, lease, sequence, deadline):
+        self._lease(lease)
+        from app.controller.events import validate_event
+        record = self.records[lease.domain]
+        directory = self.policy.staging_root / lease.domain
+        event = self._read_json(directory / 'event.json', 1024*1024)
+        validate_event(event,record['sequence']+1)
+        if type(sequence) is not int or sequence != event['sequence']:
+            raise DomainUnavailable()
+        record['event_bytes'] += len(json.dumps(event).encode())
+        if record['event_bytes'] > 16*1024*1024: raise DomainUnavailable()
+        self._write(directory / ('ack-' + str(sequence)),str(sequence).encode(),0o600)
+        (directory / 'event.json').unlink()
+        record['sequence'] = sequence
+
     @staticmethod
-    def _read_result(path):
+    def _read_json(path, limit):
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
         with os.fdopen(fd, 'rb') as stream:
             info = os.fstat(stream.fileno())
-            if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_nlink != 1 or info.st_size > 8192:
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_nlink != 1 or info.st_size > limit:
                 raise DomainUnavailable()
-            result = json.loads(stream.read(8193))
-        if (set(result) != {'returncode', 'stdout', 'stderr', 'reaped'}
-                or result['reaped'] is not True or type(result['returncode']) is not int
-                or any(type(result[k]) is not str or len(result[k].encode()) > 1024 for k in ('stdout', 'stderr'))):
-            raise DomainUnavailable()
+            return json.loads(stream.read(limit+1))
+
+    @staticmethod
+    def _read_result(path):
+        from app.controller.transport import unpack
+        from app.controller.profiles import validate_result
+        result = unpack(SystemManager._read_json(path,24*1024*1024))
+        validate_result(result)
         return result
 
     def drain(self, lease, deadline):

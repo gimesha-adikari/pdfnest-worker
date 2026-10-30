@@ -246,6 +246,8 @@ def execute(operation, *args, **kwargs):
                         if events > MAX_EVENTS or total_event_bytes > 64 * 1024 * 1024:
                             raise ValueError('Native callback budget exceeded')
                         event = read_frame(event_path)
+                        from app.controller.events import validate_event
+                        validate_event(event, events)
                         callback = callbacks[event['name']]
                         if event['name'] == 'cancellation_check':
                             raise ValueError('Invalid native callback')

@@ -1,7 +1,6 @@
 """Worker contract adapter. Explicit trusted startup only; legacy stays default.
 
-Only session metadata currently has a complete fixed schema. Registry/OCR
-launches are refused; adding them requires explicit argument and output maps.
+Session metadata and all registry operations use source-fixed bounded schemas.
 No incoming command/environment is forwarded across the protected boundary.
 """
 from __future__ import annotations
@@ -20,6 +19,16 @@ from app.controller.policy import MAX_INPUT, METADATA_MODULE
 
 def translate(launch):
     command = launch.command
+    if (type(launch) is d.Launch and len(command) == 5
+            and command[:3] == (sys.executable, '-m', 'app.core.native_supervisor')
+            and command[4] == str(os.getpid())
+            and type(launch.timeout) in (int,float) and math.isfinite(launch.timeout)
+            and 0 < launch.timeout <= 300 and launch.max_output_bytes == 65536):
+        from app.controller.profiles import translate_request
+        try:
+            return translate_request(command[3])
+        except (OSError,ValueError,TypeError,KeyError,RecursionError) as exc:
+            raise d.DomainUnavailable() from exc
     if (type(launch) is not d.Launch or len(command) != 5
             or command[:3] != (sys.executable, '-m', METADATA_MODULE)
             or command[4] != str(os.getpid())
@@ -57,6 +66,8 @@ class WorkerController:
     def __init__(self, client):
         self.client = client
         self.digests = {}
+        self.roots = {}
+        self.results = {}
 
     def capabilities(self, deadline):
         return self.client.request('capabilities', deadline)
@@ -72,7 +83,10 @@ class WorkerController:
 
     def prepare(self, lease, launch, deadline):
         manifest = translate(launch)
-        return self.client.request('prepare', deadline, lease=lease, manifest=manifest)
+        result = self.client.request('prepare', deadline, lease=lease, manifest=manifest)
+        if manifest['kind'] == 'native_operation':
+            self.roots[lease.operation] = Path(launch.command[3])
+        return result
 
     def run(self, lease, member, launch, deadline, check):
         check()
@@ -81,19 +95,44 @@ class WorkerController:
             check()
             result = self.client.request('poll', min(deadline, time.monotonic() + 5), lease=lease)
             if result is not None:
-                if (type(result) is not dict or set(result) != {'returncode', 'stdout', 'stderr', 'reaped'}
-                        or result['reaped'] is not True):
-                    raise d.DomainUnavailable()
+                if type(result) is dict and set(result) == {'event'}:
+                    from app.controller.events import validate_event
+                    event = result['event']
+                    expected = getattr(self, '_sequences', {}).get(lease.operation, 0) + 1
+                    validate_event(event, expected)
+                    root = self.roots[lease.operation]
+                    from app.core.native_isolation import write_frame
+                    write_frame(root / 'event.json', event)
+                    check()  # Existing callback authority validates and removes event.
+                    if (root / 'event.json').exists():
+                        raise d.DomainUnavailable()
+                    self.client.request('ack', min(deadline,time.monotonic()+5), lease=lease, sequence=expected)
+                    if not hasattr(self, '_sequences'): self._sequences = {}
+                    self._sequences[lease.operation] = expected
+                    continue
+                from app.controller.profiles import validate_result
+                validate_result(result)
+                self.results[lease.operation] = result
                 return subprocess.CompletedProcess(launch.command, result['returncode'], result['stdout'], result['stderr'])
             time.sleep(min(.02, max(0, deadline - time.monotonic())))
         raise subprocess.TimeoutExpired(launch.command, launch.timeout)
 
     def drain(self, lease, deadline):
         receipt, result, digest = self.client.request('drain', deadline, lease=lease)
-        import json
-        observed = hashlib.sha256(json.dumps(result, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+        from app.controller.profiles import result_digest, validate_result
+        validate_result(result)
+        observed = result_digest(result)
         if observed != digest or type(receipt) is not d.Drain or receipt.lease != lease:
             raise d.DomainUnavailable()
+        if lease.operation in self.results and result != self.results[lease.operation]:
+            raise d.DomainUnavailable()
+        if 'artifacts' in result:
+            root = self.roots[lease.operation]
+            for name, data in result['artifacts'].items():
+                target = root / 'result.json' if name == 'result.json' else root / 'tmp' / name
+                fd = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+                with os.fdopen(fd, 'wb') as stream:
+                    stream.write(data)
         self.digests[lease.operation] = digest
         return receipt
 
@@ -103,6 +142,9 @@ class WorkerController:
         if response is not None:
             raise d.DomainUnavailable()
         self.digests.pop(lease.operation)
+        self.results.pop(lease.operation, None)
+        self.roots.pop(lease.operation, None)
+        getattr(self, '_sequences', {}).pop(lease.operation,None)
 
     def quarantine(self, operation, deadline):
         return self.client.request('quarantine', deadline, operation=operation)
