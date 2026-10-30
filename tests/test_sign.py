@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 from app.main import app
-from tests.test_security import generate_headers
+from tests.test_security import generate_headers, signed_post
 
 
 client = TestClient(app)
@@ -30,7 +30,7 @@ def create_signature_png() -> bytes:
 
 
 def test_sign_inserts_owned_signature_at_worker_coordinates():
-    response = client.post(
+    response = signed_post(client,
         "/api/v1/sign",
         files={
             "file": ("input.pdf", io.BytesIO(create_blank_pdf()), "application/pdf"),
@@ -56,7 +56,7 @@ def test_sign_inserts_owned_signature_at_worker_coordinates():
 
 
 def test_sign_ignores_stamps_outside_document_pages():
-    response = client.post(
+    response = signed_post(client,
         "/api/v1/sign",
         files={
             "file": ("input.pdf", io.BytesIO(create_blank_pdf()), "application/pdf"),
