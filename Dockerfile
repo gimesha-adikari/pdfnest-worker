@@ -9,9 +9,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PATH="/opt/venv/bin:${PATH}" \
     TESSDATA_PREFIX=/usr/share/tesseract-ocr/5/tessdata
 
-RUN --mount=type=cache,id=platen-bookworm-lists,target=/var/lib/apt/lists,sharing=locked \
-    --mount=type=cache,id=platen-bookworm-archives,target=/var/cache/apt,sharing=locked \
-    rm -f /etc/apt/apt.conf.d/docker-clean && \
+RUN rm -f /etc/apt/apt.conf.d/docker-clean && \
     apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update && \
     apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 install -y --no-install-recommends \
     build-essential \
@@ -37,12 +35,10 @@ RUN --mount=type=cache,id=platen-bookworm-lists,target=/var/lib/apt/lists,sharin
 
 WORKDIR /app
 
-RUN --mount=type=cache,id=platen-pip,target=/root/.cache/pip \
-    pip install --timeout 30 --retries 3 uv==0.11.28
+RUN pip install --timeout 30 --retries 3 uv==0.11.28
 
 COPY pyproject.toml uv.lock ./
-RUN --mount=type=cache,id=platen-uv,target=/root/.cache/uv \
-    UV_LINK_MODE=copy uv sync --frozen --no-dev --no-install-project && \
+RUN UV_LINK_MODE=copy uv sync --frozen --no-dev --no-install-project && \
     chown -R 10001:10001 /opt/venv
 
 COPY --chown=10001:10001 . .
