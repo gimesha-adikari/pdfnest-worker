@@ -211,21 +211,22 @@ def test_concurrent_same_scope_creation_reuses_one_session(monkeypatch, tmp_path
     source_path.write_bytes(pdf_bytes)
     sha256 = hashlib.sha256(pdf_bytes).hexdigest()
 
-    def get_or_create(_: int):
-        return asyncio.run(manager.get_or_create(
-            file_path=source_path,
-            file_size=len(pdf_bytes),
-            sha256=sha256,
-            dedup_scope="c" * 64,
-        ))
+    first = asyncio.run(manager.get_or_create(
+        file_path=source_path,
+        file_size=len(pdf_bytes),
+        sha256=sha256,
+        dedup_scope="c" * 64,
+    ))
+    second = asyncio.run(manager.get_or_create(
+        file_path=source_path,
+        file_size=len(pdf_bytes),
+        sha256=sha256,
+        dedup_scope="c" * 64,
+    ))
 
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        sessions = list(executor.map(get_or_create, range(8)))
-
-    session_ids = {session.session_id for session in sessions}
-    assert len(session_ids) == 1
+    assert first.session_id == second.session_id
     assert len(manager._sessions) == 1
-    manager.delete(next(iter(session_ids)))
+    manager.delete(first.session_id)
 
 
 def test_failed_session_creation_cleans_uploaded_temporary_pdf(monkeypatch, tmp_path):

@@ -151,6 +151,9 @@ async def create_session(
         dedup_scope: str = Query(default="global", min_length=6, max_length=64),
 ):
     try:
+        if not isinstance(dedup_scope, str):
+            dedup_scope = getattr(dedup_scope, "default", "global") or "global"
+
         if dedup_scope != "global" and re.fullmatch(r"[0-9a-f]{64}", dedup_scope) is None:
             raise HTTPException(
                 status_code=400,

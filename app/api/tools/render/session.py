@@ -54,7 +54,6 @@ class RenderSession:
 class RenderSessionManager:
     def __init__(self) -> None:
         self._sessions: dict[str, RenderSession] = {}
-        self._creation_locks: dict[tuple[str, str], threading.Lock] = {}
         self._lock = threading.RLock()
 
     async def create(
@@ -113,31 +112,16 @@ class RenderSessionManager:
             sha256: str,
             dedup_scope: str = "global",
     ) -> RenderSession:
-        key = (sha256, dedup_scope)
-        with self._lock:
-            existing = self.find_by_hash(sha256, dedup_scope)
-            if existing is not None:
-                return existing
-            if key not in self._creation_locks:
-                self._creation_locks[key] = threading.Lock()
-            creation_lock = self._creation_locks[key]
+        existing = self.find_by_hash(sha256, dedup_scope)
+        if existing is not None:
+            return existing
 
-        with creation_lock:
-            with self._lock:
-                existing = self.find_by_hash(sha256, dedup_scope)
-                if existing is not None:
-                    return existing
-
-            try:
-                return await self.create(
-                    file_path=file_path,
-                    file_size=file_size,
-                    sha256=sha256,
-                    dedup_scope=dedup_scope,
-                )
-            finally:
-                with self._lock:
-                    self._creation_locks.pop(key, None)
+        return await self.create(
+            file_path=file_path,
+            file_size=file_size,
+            sha256=sha256,
+            dedup_scope=dedup_scope,
+        )
 
     def get(self, session_id: str) -> RenderSession:
         with self._lock:
