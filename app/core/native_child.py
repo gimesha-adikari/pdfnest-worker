@@ -34,6 +34,7 @@ def main():
         module, function, _ = OPERATIONS[request['operation']]
         target = getattr(importlib.import_module(module), function)
         options = boundary.decode(request['kwargs'])
+        sequence = 0
         for name in request['callbacks']:
             if name == 'cancellation_check':
                 if name not in inspect.signature(target).parameters:
@@ -41,7 +42,11 @@ def main():
                 options[name] = lambda: None  # Parent polls the authoritative cancellation source.
             else:
                 def callback(*args, _name=name):
-                    boundary.write_frame(root / 'event.json', {'name': _name, 'args': boundary.encode(args)})
+                    nonlocal sequence
+                    sequence += 1
+                    if sequence > boundary.MAX_EVENTS:
+                        raise ValueError('Native callback budget exceeded')
+                    boundary.write_frame(root / 'event.json', {'sequence': sequence, 'name': _name, 'args': boundary.encode(args)})
                     while (root / 'event.json').exists():
                         time.sleep(.01)
                 options[name] = callback

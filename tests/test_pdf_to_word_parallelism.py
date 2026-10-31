@@ -142,7 +142,7 @@ def test_multipage_preflight_passes_page_scoped_dpis_to_one_extraction(monkeypat
 
 def test_invalid_embedded_image_metadata_uses_bounded_budget_fallback():
     page = SimpleNamespace(
-        rect=SimpleNamespace(width=1200, height=1800),
+        rect=fitz.Rect(0, 0, 1200, 1800),
         get_images=lambda full: [(7, 0, 0, 1800, 8, "DeviceRGB", "", "", "FlateDecode")],
     )
 

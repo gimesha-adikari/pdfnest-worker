@@ -68,21 +68,35 @@ def _inspect(path: Path, cancelled: threading.Event) -> int:
         if cancelled.is_set():
             raise _MetadataCancelled()
 
+    from app.core.native_domain import admit, staged_directory, DomainBusy, DomainUnavailable
     check()
     try:
         # Reuse the existing local native slot, without accumulating waiting
         # threads behind an unrelated OCR job. API admission is bounded too.
-        with _capacity(check, 0), tempfile.TemporaryDirectory(prefix="pdfnest-session-metadata-") as scratch:
-            env = os.environ.copy()
-            env.update(TMPDIR=scratch, TMP=scratch, TEMP=scratch,
-                       OPENBLAS_NUM_THREADS="1", OMP_NUM_THREADS="1")
-            env["PYTHONPATH"] = str(Path(__file__).resolve().parents[4])
-            result = run_hardened_subprocess(
-                [sys.executable, "-m", _MODULE, str(path), str(os.getpid())],
-                timeout=METADATA_TIMEOUT_SECONDS,
-                cancellation_check=check, env=env,
-                max_output_bytes=1024, cleanup_group_on_exit=True,
-            )
+        with admit(check, 0, lambda: _capacity(check, 0)) as domain:
+            with staged_directory(domain, prefix="pdfnest-session-metadata-") as scratch:
+                env = os.environ.copy()
+                env.update(TMPDIR=scratch, TMP=scratch, TEMP=scratch,
+                           OPENBLAS_NUM_THREADS="1", OMP_NUM_THREADS="1")
+                env["PYTHONPATH"] = str(Path(__file__).resolve().parents[4])
+                result = domain.run(
+                    [sys.executable, "-m", _MODULE, str(path), str(os.getpid())],
+                    timeout=METADATA_TIMEOUT_SECONDS,
+                    cancellation_check=check, env=env,
+                    max_output_bytes=1024, cleanup_group_on_exit=True,
+                    legacy_runner=run_hardened_subprocess,
+                )
+                domain.drain()
+            if domain.required:
+                count = _verified_count(result, check)
+                domain.cleanup_complete()
+        if domain.required:
+            check()
+            return count
+    except DomainBusy as exc:
+        raise MetadataBusy() from exc
+    except DomainUnavailable as exc:
+        raise MetadataUnavailable() from exc
     except OCRTimeoutError as exc:
         raise MetadataBusy() from exc
     except subprocess.TimeoutExpired as exc:
@@ -91,6 +105,11 @@ def _inspect(path: Path, cancelled: threading.Event) -> int:
         raise MetadataUnavailable() from exc
     except RuntimeError as exc:
         raise MetadataFailed() from exc
+
+    return _verified_count(result, check)
+
+
+def _verified_count(result, check):
     if result.returncode != 0:
         raise MetadataFailed()
     try:
@@ -110,6 +129,7 @@ def _inspect(path: Path, cancelled: threading.Event) -> int:
         raise MetadataFailed()
     check()
     return count
+
 
 
 async def inspect_page_count(path: Path) -> int:

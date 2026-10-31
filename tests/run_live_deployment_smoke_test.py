@@ -26,7 +26,7 @@ def generate_auth_headers(secret: str, method: str, path: str, body: bytes = b""
     timestamp_str = str(time.time())
     method_str = method.upper()
 
-    body_hash = hashlib.sha256(body).hexdigest() if body else ""
+    body_hash = hashlib.sha256(body).hexdigest()
 
     if body_hash:
         string_to_sign = f"{method_str}\n{path}\n{timestamp_str}\n{nonce}\n{body_hash}"
@@ -48,6 +48,15 @@ def generate_auth_headers(secret: str, method: str, path: str, body: bytes = b""
         headers["X-Worker-Body-Hash"] = body_hash
 
     return headers
+
+
+def signed_post(client, secret, path, *, headers, **kwargs):
+    # Materialize only these small synthetic smoke fixtures, preserving the
+    # exact multipart boundary that was hashed. This runner is not an uploader.
+    outgoing = client.build_request("POST", path, headers=headers, **kwargs)
+    body = outgoing.read()
+    outgoing.headers.update(generate_auth_headers(secret, "POST", path, body))
+    return client.send(outgoing)
 
 
 def make_sample_pdf(title: str = "Live Smoke Test Document") -> bytes:
@@ -171,7 +180,7 @@ def main():
     print("\n5. Executing Authenticated Page Render (/api/v1/render/page)...")
     render_pdf = make_sample_pdf("Live Render Test")
     r_headers = generate_auth_headers(secret, "POST", "/api/v1/render/page")
-    render_resp = client.post(
+    render_resp = signed_post(client, secret,
         "/api/v1/render/page",
         headers=r_headers,
         files={"file": ("live_test.pdf", render_pdf, "application/pdf")},
@@ -195,7 +204,7 @@ def main():
     sim_headers["X-Test-Simulate-Crash"] = "true"
     sim_headers["X-Test-Simulate-Hang"] = "true"
 
-    sim_resp = client.post(
+    sim_resp = signed_post(client, secret,
         "/api/v1/render/page",
         headers=sim_headers,
         files={"file": ("sim_test.pdf", render_pdf, "application/pdf")},

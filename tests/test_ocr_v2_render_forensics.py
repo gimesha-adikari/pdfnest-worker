@@ -190,14 +190,18 @@ def test_valid_pdf_exists_before_validator_failure(tmp_path: Path, monkeypatch: 
     _, source, result = _searchable_fixture(tmp_path)
     output = tmp_path / "rendered-before-validation.pdf"
 
-    def fail_validation(*args: object, **kwargs: object) -> None:
+    staged_bytes = b""
+    def fail_validation(source_path, target_path, *args: object, **kwargs: object) -> None:
+        nonlocal staged_bytes
+        staged_bytes = Path(target_path).read_bytes()
         raise RenderingNotEligibleError("forced forensic validation failure", substage="PDF_VALIDATE_VISUAL_RASTER", reason_code="VISIBLE_RASTER_MISMATCH")
 
     monkeypatch.setattr("app.core.ocr_v2.renderers.searchable_pdf.validate_searchable_pdf_artifact", fail_validation)
     with pytest.raises(RenderingNotEligibleError):
         SearchablePdfRenderer().render(source, result, output)
-    assert output.read_bytes()[:5] == b"%PDF-"
-    with fitz.open(output) as document:
+    assert not output.exists()
+    assert staged_bytes[:5] == b"%PDF-"
+    with fitz.open(stream=staged_bytes, filetype="pdf") as document:
         assert len(document) == 1
         assert document[0].get_images(full=True)
 

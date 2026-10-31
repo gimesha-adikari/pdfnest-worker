@@ -46,7 +46,7 @@ def generate_auth_headers(method: str, path: str, body: bytes = b"") -> dict[str
     timestamp_str = str(time.time())
     method_str = method.upper()
 
-    body_hash = hashlib.sha256(body).hexdigest() if body else ""
+    body_hash = hashlib.sha256(body).hexdigest()
 
     if body_hash:
         string_to_sign = f"{method_str}\n{path}\n{timestamp_str}\n{nonce}\n{body_hash}"
@@ -68,6 +68,20 @@ def generate_auth_headers(method: str, path: str, body: bytes = b"") -> dict[str
         headers["X-Worker-Body-Hash"] = body_hash
 
     return headers
+
+
+async def signed_post(client, path, *, headers, **kwargs):
+    outgoing = client.build_request("POST", path, headers=headers, **kwargs)
+    await outgoing.aread()
+    outgoing.headers.update(generate_auth_headers("POST", path, outgoing.content))
+    return await client.send(outgoing)
+
+
+def signed_post_sync(client, path, *, headers, **kwargs):
+    outgoing = client.build_request("POST", path, headers=headers, **kwargs)
+    outgoing.read()
+    outgoing.headers.update(generate_auth_headers("POST", path, outgoing.content))
+    return client.send(outgoing)
 
 
 # 1. Health Endpoints
@@ -106,7 +120,7 @@ async def test_production_authenticated_render_page(smoke_pdf_bytes: bytes):
         files = {"file": ("smoke.pdf", smoke_pdf_bytes, "application/pdf")}
         data = {"page": "1", "dpi": "144"}
 
-        resp = await client.post("/api/v1/render/page", headers=headers, files=files, data=data)
+        resp = await signed_post(client, "/api/v1/render/page", headers=headers, files=files, data=data)
         assert resp.status_code == 200
         assert resp.headers["content-type"] == "image/jpeg"
         assert len(resp.content) > 0
@@ -161,6 +175,6 @@ async def test_production_simulation_headers_strictly_ignored(smoke_pdf_bytes: b
         files = {"file": ("smoke.pdf", smoke_pdf_bytes, "application/pdf")}
         data = {"page": "1", "dpi": "144"}
 
-        resp = await client.post("/api/v1/render/page", headers=headers, files=files, data=data)
+        resp = await signed_post(client, "/api/v1/render/page", headers=headers, files=files, data=data)
         assert resp.status_code == 200
         assert resp.headers["content-type"] == "image/jpeg"

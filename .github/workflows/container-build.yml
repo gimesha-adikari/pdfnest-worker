@@ -48,6 +48,13 @@ jobs:
           uv sync --frozen --no-install-project
           uv pip check --python "$UV_PROJECT_ENVIRONMENT/bin/python"
 
+      - name: Verify strict Worker body integrity and multipart replay
+        env:
+          APP_ENV: test
+          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/f11-sdk019-venv
+        run: |
+          timeout 120s "$UV_PROJECT_ENVIRONMENT/bin/python" -m pytest -q --tb=short -p anyio.pytest_plugin -p no:cacheprovider tests/test_f15_render_session_integration.py tests/test_security.py tests/test_security_body.py tests/test_ocr_v2_api.py tests/test_gateway_protocol.py tests/test_gateway_forwarding.py tests/test_sign.py tests/test_redact.py
+
       - name: Qualify installed SDK and F-11 security boundaries
         env:
           APP_ENV: test
@@ -126,6 +133,15 @@ jobs:
               raise SystemExit("Mandatory security tests skipped: " + ", ".join(gate.skipped))
           raise SystemExit(result)
           PY
+
+      - name: Qualify dormant native execution-domain contract (fake controller only)
+        env:
+          APP_ENV: test
+          STORAGE_MODE: local
+          WORKER_SHARED_SECRET: synthetic-domain-ci-secret
+          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/f11-sdk019-venv
+        run: |
+          timeout 90s prlimit --as=1073741824 --cpu=70 -- "$UV_PROJECT_ENVIRONMENT/bin/python" -m pytest -q --tb=short -p no:cacheprovider tests/test_native_execution_domain.py
 
       - name: Qualify native OCR process isolation
         env:

@@ -7,10 +7,13 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     UV_PROJECT_ENVIRONMENT=/opt/venv \
     PATH="/opt/venv/bin:${PATH}" \
-    PORT=8000 \
     TESSDATA_PREFIX=/usr/share/tesseract-ocr/5/tessdata
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN --mount=type=cache,id=platen-bookworm-lists,target=/var/lib/apt/lists,sharing=locked \
+    --mount=type=cache,id=platen-bookworm-archives,target=/var/cache/apt,sharing=locked \
+    rm -f /etc/apt/apt.conf.d/docker-clean && \
+    apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update && \
+    apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 install -y --no-install-recommends \
     build-essential \
     ca-certificates \
     curl \
@@ -30,24 +33,28 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libx11-6 \
     libxext6 \
     libxrender1 \
-    libfontconfig1 \
-    && rm -rf /var/lib/apt/lists/*
+    libfontconfig1
 
 WORKDIR /app
 
-RUN pip install --no-cache-dir uv
+RUN --mount=type=cache,id=platen-pip,target=/root/.cache/pip \
+    pip install --timeout 30 --retries 3 uv==0.11.28
 
 COPY pyproject.toml uv.lock ./
-RUN uv sync --frozen --no-dev --no-install-project
+RUN --mount=type=cache,id=platen-uv,target=/root/.cache/uv \
+    UV_LINK_MODE=copy uv sync --frozen --no-dev --no-install-project && \
+    chown -R 10001:10001 /opt/venv
 
-COPY . .
+COPY --chown=10001:10001 . .
 
-COPY tesseract/tessdata/ ${TESSDATA_PREFIX}/
+COPY --chown=10001:10001 tesseract/tessdata/ ${TESSDATA_PREFIX}/
 
 RUN useradd --system --uid 10001 --create-home appuser && \
-    chown -R appuser:appuser /app /opt/venv /usr/share/tesseract-ocr/5/tessdata
+    chown appuser:appuser /app
 
 USER appuser
+
+ENV PORT=8000
 
 EXPOSE 8000
 

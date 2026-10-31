@@ -26,7 +26,12 @@ def _post(path: str, **kwargs: object) -> httpx.Response:
     async def request() -> httpx.Response:
         transport = httpx.ASGITransport(app=app_under_test)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as async_client:
-            return await async_client.post(path, **kwargs)
+            headers = kwargs.pop("headers", None)
+            outgoing = async_client.build_request("POST", path, **kwargs)
+            await outgoing.aread()
+            if headers is not None:
+                outgoing.headers.update(headers(outgoing.content))
+            return await async_client.send(outgoing)
 
     return asyncio.run(request())
 
@@ -35,17 +40,26 @@ def _get(path: str, **kwargs: object) -> httpx.Response:
     async def request() -> httpx.Response:
         transport = httpx.ASGITransport(app=app_under_test)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as async_client:
-            return await async_client.get(path, **kwargs)
+            headers = kwargs.pop("headers", None)
+            outgoing = async_client.build_request("GET", path, **kwargs)
+            if headers is not None:
+                outgoing.headers.update(headers(b""))
+            return await async_client.send(outgoing)
 
     return asyncio.run(request())
 
 
-def _headers(method: str, path: str, *, timestamp: int | None = None, nonce: str | None = None, secret: str | None = None) -> dict[str, str]:
+def _headers(method: str, path: str, *, timestamp: int | None = None, nonce: str | None = None, secret: str | None = None):
     ts = str(timestamp if timestamp is not None else int(time.time()))
     nonce_value = nonce or f"phase3b-{uuid.uuid4().hex}"
-    signed = f"{method}\n{path}\n{ts}\n{nonce_value}"
-    signature = hmac.new((secret or settings.worker_shared_secret).encode(), signed.encode(), hashlib.sha256).hexdigest()
-    return {"X-Worker-Signature": signature, "X-Worker-Timestamp": ts, "X-Worker-Nonce": nonce_value}
+    def sign(body: bytes) -> dict[str, str]:
+        digest = hashlib.sha256(body).hexdigest()
+        signed = f"{method}\n{path}\n{ts}\n{nonce_value}\n{digest}"
+        signature = hmac.new((secret or settings.worker_shared_secret).encode(), signed.encode(), hashlib.sha256).hexdigest()
+        return {"X-Worker-Signature": signature, "X-Worker-Timestamp": ts,
+                "X-Worker-Nonce": nonce_value, "X-Worker-Body-Hash": digest}
+    return sign
+
 
 
 def _native_pdf() -> bytes:
