@@ -1,6 +1,7 @@
 import asyncio
+import re
 
-from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import Response
 
 from app.core.config import settings
@@ -147,9 +148,19 @@ async def render_page(
 async def create_session(
         request: Request,
         file: UploadFile = File(...),
+        dedup_scope: str = Query(default="global", min_length=6, max_length=64),
 ):
     try:
-        session = await render_until_disconnect(request, create_render_session(file))
+        if dedup_scope != "global" and re.fullmatch(r"[0-9a-f]{64}", dedup_scope) is None:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "INVALID_DEDUP_SCOPE",
+                    "message": "Invalid preview-session deduplication scope",
+                },
+            )
+
+        session = await render_until_disconnect(request, create_render_session(file, dedup_scope))
 
         return {
             "session_id": session.session_id,

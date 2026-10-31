@@ -200,9 +200,10 @@ async def render_page_to_jpeg_bytes(
 
 async def create_render_session(
         file: UploadFile,
+        dedup_scope: str = "global",
 ) -> RenderSession:
     from .limiter import render_limiter
-    operation = _create_render_session(file)
+    operation = _create_render_session(file, dedup_scope)
     try:
         return await render_limiter.run(operation)
     finally:
@@ -210,7 +211,10 @@ async def create_render_session(
         operation.close()
 
 
-async def _create_render_session(file: UploadFile) -> RenderSession:
+async def _create_render_session(
+        file: UploadFile,
+        dedup_scope: str = "global",
+) -> RenderSession:
     temp_file = tempfile.NamedTemporaryFile(
         prefix="pdfnest-session-upload-",
         suffix=".pdf",
@@ -238,15 +242,11 @@ async def _create_render_session(file: UploadFile) -> RenderSession:
 
         sha256 = await session_file_io(sha256_file, temp_path)
 
-        existing = session_manager.find_by_hash(sha256)
-
-        if existing is not None:
-            return existing
-
-        return await session_manager.create(
+        return await session_manager.get_or_create(
             file_path=temp_path,
             file_size=file_size,
             sha256=sha256,
+            dedup_scope=dedup_scope,
         )
 
     finally:

@@ -46,6 +46,7 @@ class RenderSession:
     page_count: int
     created_at: float
     last_accessed_at: float
+    dedup_scope: str = "global"
     document: PdfRenderDocument | None = None
     lock: threading.RLock = field(default_factory=threading.RLock)
 
@@ -53,6 +54,7 @@ class RenderSession:
 class RenderSessionManager:
     def __init__(self) -> None:
         self._sessions: dict[str, RenderSession] = {}
+        self._creation_locks: dict[tuple[str, str], threading.Lock] = {}
         self._lock = threading.RLock()
 
     async def create(
@@ -60,6 +62,7 @@ class RenderSessionManager:
             file_path: Path,
             file_size: int,
             sha256: str,
+            dedup_scope: str = "global",
     ) -> RenderSession:
         session_id = uuid.uuid4().hex
         session_dir = SESSION_ROOT / session_id
@@ -77,7 +80,7 @@ class RenderSessionManager:
                 # Recheck after native work: simultaneous submissions may
                 # have published or deleted a matching session in the meantime.
                 for existing in self._sessions.values():
-                    if existing.sha256 == sha256:
+                    if existing.sha256 == sha256 and existing.dedup_scope == dedup_scope:
                         existing.last_accessed_at = time.time()
                         return existing
                 if len(self._sessions) >= MAX_SESSIONS:
@@ -91,6 +94,7 @@ class RenderSessionManager:
                     page_count=page_count,
                     created_at=now,
                     last_accessed_at=now,
+                    dedup_scope=dedup_scope,
                     document=None,
                 )
                 # No await between publication and return. A cancelled create
@@ -101,6 +105,39 @@ class RenderSessionManager:
         finally:
             if not published:
                 shutil.rmtree(session_dir, ignore_errors=True)
+
+    async def get_or_create(
+            self,
+            file_path: Path,
+            file_size: int,
+            sha256: str,
+            dedup_scope: str = "global",
+    ) -> RenderSession:
+        key = (sha256, dedup_scope)
+        with self._lock:
+            existing = self.find_by_hash(sha256, dedup_scope)
+            if existing is not None:
+                return existing
+            if key not in self._creation_locks:
+                self._creation_locks[key] = threading.Lock()
+            creation_lock = self._creation_locks[key]
+
+        with creation_lock:
+            with self._lock:
+                existing = self.find_by_hash(sha256, dedup_scope)
+                if existing is not None:
+                    return existing
+
+            try:
+                return await self.create(
+                    file_path=file_path,
+                    file_size=file_size,
+                    sha256=sha256,
+                    dedup_scope=dedup_scope,
+                )
+            finally:
+                with self._lock:
+                    self._creation_locks.pop(key, None)
 
     def get(self, session_id: str) -> RenderSession:
         with self._lock:
@@ -141,12 +178,12 @@ class RenderSessionManager:
         except Exception:
             pass
 
-    def find_by_hash(self, sha256: str) -> RenderSession | None:
+    def find_by_hash(self, sha256: str, dedup_scope: str = "global") -> RenderSession | None:
         with self._lock:
             self._cleanup_expired_locked()
 
             for session in self._sessions.values():
-                if session.sha256 == sha256:
+                if session.sha256 == sha256 and session.dedup_scope == dedup_scope:
                     session.last_accessed_at = time.time()
                     return session
 
