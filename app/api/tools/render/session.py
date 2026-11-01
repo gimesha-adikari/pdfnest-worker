@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import os
 import shutil
@@ -51,10 +52,19 @@ class RenderSession:
     lock: threading.RLock = field(default_factory=threading.RLock)
 
 
+@dataclass
+class _InFlightCreation:
+    event: asyncio.Event = field(default_factory=asyncio.Event)
+    session: RenderSession | None = None
+    error: BaseException | None = None
+    waiters: int = 0
+
+
 class RenderSessionManager:
     def __init__(self) -> None:
         self._sessions: dict[str, RenderSession] = {}
         self._lock = threading.RLock()
+        self._inflight: dict[tuple[str, str], _InFlightCreation] = {}
 
     async def create(
             self,
@@ -112,16 +122,67 @@ class RenderSessionManager:
             sha256: str,
             dedup_scope: str = "global",
     ) -> RenderSession:
-        existing = self.find_by_hash(sha256, dedup_scope)
-        if existing is not None:
-            return existing
+        key = (sha256, dedup_scope)
+        max_waiters = 16
+        wait_timeout = 25.0
 
-        return await self.create(
-            file_path=file_path,
-            file_size=file_size,
-            sha256=sha256,
-            dedup_scope=dedup_scope,
-        )
+        while True:
+            is_leader = False
+            inflight: _InFlightCreation | None = None
+
+            with self._lock:
+                self._cleanup_expired_locked()
+                for existing in self._sessions.values():
+                    if existing.sha256 == sha256 and existing.dedup_scope == dedup_scope:
+                        existing.last_accessed_at = time.time()
+                        return existing
+
+                inflight = self._inflight.get(key)
+                if inflight is None:
+                    inflight = _InFlightCreation()
+                    self._inflight[key] = inflight
+                    is_leader = True
+                else:
+                    if inflight.waiters >= max_waiters:
+                        from .session_metadata import MetadataBusy
+                        raise MetadataBusy()
+                    inflight.waiters += 1
+
+            if is_leader:
+                created_session: RenderSession | None = None
+                creation_error: BaseException | None = None
+                try:
+                    created_session = await self.create(
+                        file_path=file_path,
+                        file_size=file_size,
+                        sha256=sha256,
+                        dedup_scope=dedup_scope,
+                    )
+                    return created_session
+                except BaseException as exc:
+                    creation_error = exc
+                    raise
+                finally:
+                    with self._lock:
+                        inflight.session = created_session
+                        inflight.error = creation_error
+                        self._inflight.pop(key, None)
+                        inflight.event.set()
+            else:
+                try:
+                    await asyncio.wait_for(inflight.event.wait(), timeout=wait_timeout)
+                except asyncio.TimeoutError as exc:
+                    from .session_metadata import MetadataTimeout
+                    raise MetadataTimeout() from exc
+                finally:
+                    with self._lock:
+                        inflight.waiters -= 1
+
+                if inflight.session is not None:
+                    return inflight.session
+
+                if inflight.error is not None and not isinstance(inflight.error, asyncio.CancelledError):
+                    raise inflight.error
 
     def get(self, session_id: str) -> RenderSession:
         with self._lock:

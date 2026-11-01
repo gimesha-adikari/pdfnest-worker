@@ -213,12 +213,17 @@ def test_concurrent_same_scope_creation_reuses_one_session(monkeypatch, tmp_path
     sha256 = hashlib.sha256(pdf_bytes).hexdigest()
     scope = "c" * 64
 
-    # 1. Overlapping coroutines at manager level: simulate overlapping native inspection
-    async def mock_inspect(path):
-        await asyncio.sleep(0.02)
-        return 1
+    # 1. Overlapping coroutines: assert exactly ONE native inspection is admitted
+    actual_inspections = 0
+    orig_inspect = render_session.inspect_page_count
 
-    monkeypatch.setattr(render_session, "inspect_page_count", mock_inspect)
+    async def counting_inspect(path):
+        nonlocal actual_inspections
+        actual_inspections += 1
+        await asyncio.sleep(0.05)
+        return await orig_inspect(path)
+
+    monkeypatch.setattr(render_session, "inspect_page_count", counting_inspect)
 
     async def run_overlapping_manager():
         tasks = [
@@ -228,40 +233,236 @@ def test_concurrent_same_scope_creation_reuses_one_session(monkeypatch, tmp_path
                 sha256=sha256,
                 dedup_scope=scope,
             )
-            for _ in range(4)
+            for _ in range(5)
         ]
         return await asyncio.gather(*tasks)
 
     results = asyncio.run(run_overlapping_manager())
+    assert actual_inspections == 1, f"expected exactly 1 native inspection, got {actual_inspections}"
     session_ids = {s.session_id for s in results}
     assert len(session_ids) == 1, "all concurrent get_or_create calls must resolve to identical session"
     assert len(manager._sessions) == 1
+    assert len(manager._inflight) == 0, "no in-flight admission entries may remain"
     assert len(list(session_root.iterdir())) == 1, "no temporary candidate directories may be leaked"
     manager.delete(results[0].session_id)
     assert not list(session_root.iterdir())
 
-    # 2. Overlapping signed HTTP requests via httpx.AsyncClient
+
+def test_distinct_owners_and_scopes_remain_independent(monkeypatch, tmp_path):
+    session_root = tmp_path / "sessions"
+    session_root.mkdir()
+    manager = render_session.RenderSessionManager()
+    monkeypatch.setattr(render_session, "SESSION_ROOT", session_root)
+
+    pdf_bytes = _create_sample_pdf_bytes(1)
+    source_path = tmp_path / "source.pdf"
+    source_path.write_bytes(pdf_bytes)
+    sha256 = hashlib.sha256(pdf_bytes).hexdigest()
+    scope_a = "a" * 64
+    scope_b = "b" * 64
+
+    actual_inspections = 0
+    async def fast_inspect(path):
+        nonlocal actual_inspections
+        actual_inspections += 1
+        await asyncio.sleep(0.02)
+        return 1
+
+    monkeypatch.setattr(render_session, "inspect_page_count", fast_inspect)
+
+    async def run_distinct_scopes():
+        task_a = manager.get_or_create(source_path, len(pdf_bytes), sha256, scope_a)
+        task_b = manager.get_or_create(source_path, len(pdf_bytes), sha256, scope_b)
+        return await asyncio.gather(task_a, task_b)
+
+    session_a, session_b = asyncio.run(run_distinct_scopes())
+    assert actual_inspections == 2, "distinct scopes must each be inspected independently"
+    assert session_a.session_id != session_b.session_id
+    assert session_a.dedup_scope == scope_a
+    assert session_b.dedup_scope == scope_b
+    assert len(manager._inflight) == 0
+    assert len(manager._sessions) == 2
+
+    manager.delete(session_a.session_id)
+    assert manager.get_optional(session_a.session_id) is None
+    assert manager.get_optional(session_b.session_id) is not None
+    manager.delete(session_b.session_id)
+    assert not list(session_root.iterdir())
+
+
+def test_leader_cancellation_allows_follower_takeover(monkeypatch, tmp_path):
+    session_root = tmp_path / "sessions"
+    session_root.mkdir()
+    manager = render_session.RenderSessionManager()
+    monkeypatch.setattr(render_session, "SESSION_ROOT", session_root)
+
+    pdf_bytes = _create_sample_pdf_bytes(1)
+    source_path = tmp_path / "source.pdf"
+    source_path.write_bytes(pdf_bytes)
+    sha256 = hashlib.sha256(pdf_bytes).hexdigest()
+    scope = "1" * 64
+
+    entered_leader = asyncio.Event()
+    inspections = 0
+
+    async def inspect_with_pause(path):
+        nonlocal inspections
+        inspections += 1
+        if inspections == 1:
+            entered_leader.set()
+            await asyncio.sleep(10.0)  # leader will be cancelled during this sleep
+        return 1
+
+    monkeypatch.setattr(render_session, "inspect_page_count", inspect_with_pause)
+
+    async def scenario():
+        t1 = asyncio.create_task(manager.get_or_create(source_path, len(pdf_bytes), sha256, scope))
+        await entered_leader.wait()
+        # Follower arrives while leader is in-flight
+        t2 = asyncio.create_task(manager.get_or_create(source_path, len(pdf_bytes), sha256, scope))
+        await asyncio.sleep(0.01)
+
+        # Cancel leader
+        t1.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await t1
+
+        # Follower should take over seamlessly and succeed
+        res2 = await asyncio.wait_for(t2, timeout=5.0)
+        assert res2 is not None
+        assert res2.page_count == 1
+        return res2
+
+    session = asyncio.run(scenario())
+    assert inspections == 2, "follower should have taken over and executed inspection after leader cancellation"
+    assert len(manager._inflight) == 0
+    assert len(manager._sessions) == 1
+    manager.delete(session.session_id)
+    assert not list(session_root.iterdir())
+
+
+def test_follower_cancellation_does_not_affect_leader(monkeypatch, tmp_path):
+    session_root = tmp_path / "sessions"
+    session_root.mkdir()
+    manager = render_session.RenderSessionManager()
+    monkeypatch.setattr(render_session, "SESSION_ROOT", session_root)
+
+    pdf_bytes = _create_sample_pdf_bytes(1)
+    source_path = tmp_path / "source.pdf"
+    source_path.write_bytes(pdf_bytes)
+    sha256 = hashlib.sha256(pdf_bytes).hexdigest()
+    scope = "f" * 64
+
+    entered_leader = asyncio.Event()
+
+    async def inspect_with_pause(path):
+        entered_leader.set()
+        await asyncio.sleep(0.1)
+        return 1
+
+    monkeypatch.setattr(render_session, "inspect_page_count", inspect_with_pause)
+
+    async def scenario():
+        t1 = asyncio.create_task(manager.get_or_create(source_path, len(pdf_bytes), sha256, scope))
+        await entered_leader.wait()
+        t2 = asyncio.create_task(manager.get_or_create(source_path, len(pdf_bytes), sha256, scope))
+        await asyncio.sleep(0.01)
+
+        # Cancel follower
+        t2.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await t2
+
+        # Leader finishes successfully
+        res1 = await t1
+        assert res1 is not None
+        return res1
+
+    session = asyncio.run(scenario())
+    assert len(manager._inflight) == 0
+    assert len(manager._sessions) == 1
+    manager.delete(session.session_id)
+    assert not list(session_root.iterdir())
+
+
+def test_failed_inspection_propagates_and_cleans_up(monkeypatch, tmp_path):
+    session_root = tmp_path / "sessions"
+    session_root.mkdir()
+    manager = render_session.RenderSessionManager()
+    monkeypatch.setattr(render_session, "SESSION_ROOT", session_root)
+
+    pdf_bytes = _create_sample_pdf_bytes(1)
+    source_path = tmp_path / "source.pdf"
+    source_path.write_bytes(pdf_bytes)
+    sha256 = hashlib.sha256(pdf_bytes).hexdigest()
+    scope = "e" * 64
+
+    async def failing_inspect(path):
+        await asyncio.sleep(0.02)
+        raise ValueError("Corrupted PDF structure")
+
+    monkeypatch.setattr(render_session, "inspect_page_count", failing_inspect)
+
+    async def run_failing():
+        tasks = [
+            manager.get_or_create(source_path, len(pdf_bytes), sha256, scope)
+            for _ in range(3)
+        ]
+        return await asyncio.gather(*tasks, return_exceptions=True)
+
+    results = asyncio.run(run_failing())
+    assert len(results) == 3
+    for r in results:
+        assert isinstance(r, ValueError)
+        assert str(r) == "Corrupted PDF structure"
+
+    assert len(manager._inflight) == 0
+    assert len(manager._sessions) == 0
+    assert not list(session_root.iterdir())
+
+    # Retry with clean inspection succeeds normally
+    async def clean_inspect(path):
+        return 1
+    monkeypatch.setattr(render_session, "inspect_page_count", clean_inspect)
+    retried = asyncio.run(manager.get_or_create(source_path, len(pdf_bytes), sha256, scope))
+    assert retried.page_count == 1
+    assert len(manager._sessions) == 1
+    manager.delete(retried.session_id)
+    assert not list(session_root.iterdir())
+
+
+def test_genuine_http_level_concurrent_admission_unmocked(monkeypatch, tmp_path):
+    session_root = tmp_path / "sessions"
+    session_root.mkdir()
+    manager = render_session.RenderSessionManager()
+    monkeypatch.setattr(render_session, "SESSION_ROOT", session_root)
+    monkeypatch.setattr(render_service, "session_manager", manager)
+
+    pdf_bytes = _create_sample_pdf_bytes(1)
+    scope = "2" * 64
     import httpx
 
+    # Genuine unmocked HTTP test: uses the real native inspection under single-slot _capacity(check, 0)
     async def run_http_overlapping():
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as ac:
-            async def post_one():
+            async def post_one(idx):
                 path = f"/api/v1/render/sessions?dedup_scope={scope}"
-                outgoing = ac.build_request("POST", path, files={"file": ("overlap.pdf", pdf_bytes, "application/pdf")})
+                outgoing = ac.build_request("POST", path, files={"file": (f"real_{idx}.pdf", pdf_bytes, "application/pdf")})
                 body = await outgoing.aread()
                 outgoing.headers.update(generate_headers("POST", path, body_hash=hashlib.sha256(body).hexdigest()))
                 return await ac.send(outgoing)
 
-            return await asyncio.gather(*[post_one() for _ in range(3)])
+            return await asyncio.gather(*[post_one(i) for i in range(2)])
 
-    http_responses = asyncio.run(run_http_overlapping())
-    assert all(r.status_code == 200 for r in http_responses), "all concurrent HTTP requests must succeed"
-    http_session_ids = {r.json()["session_id"] for r in http_responses}
-    assert len(http_session_ids) == 1, "all concurrent HTTP requests must receive the same session_id"
+    responses = asyncio.run(run_http_overlapping())
+    assert all(r.status_code == 200 for r in responses), f"both concurrent requests must succeed with 200 OK, got {[r.status_code for r in responses]}"
+    session_ids = {r.json()["session_id"] for r in responses}
+    assert len(session_ids) == 1, "both concurrent requests must resolve to identical session"
     assert len(manager._sessions) == 1
-    assert len(list(session_root.iterdir())) == 1, "only one physical session directory must exist"
+    assert len(manager._inflight) == 0
+    assert len(list(session_root.iterdir())) == 1
 
-    final_session_id = http_responses[0].json()["session_id"]
+    final_session_id = next(iter(session_ids))
     manager.delete(final_session_id)
     assert not list(session_root.iterdir())
 
