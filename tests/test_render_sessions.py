@@ -205,28 +205,65 @@ def test_concurrent_same_scope_creation_reuses_one_session(monkeypatch, tmp_path
     session_root.mkdir()
     manager = render_session.RenderSessionManager()
     monkeypatch.setattr(render_session, "SESSION_ROOT", session_root)
+    monkeypatch.setattr(render_service, "session_manager", manager)
 
     pdf_bytes = _create_sample_pdf_bytes(1)
     source_path = tmp_path / "source.pdf"
     source_path.write_bytes(pdf_bytes)
     sha256 = hashlib.sha256(pdf_bytes).hexdigest()
+    scope = "c" * 64
 
-    first = asyncio.run(manager.get_or_create(
-        file_path=source_path,
-        file_size=len(pdf_bytes),
-        sha256=sha256,
-        dedup_scope="c" * 64,
-    ))
-    second = asyncio.run(manager.get_or_create(
-        file_path=source_path,
-        file_size=len(pdf_bytes),
-        sha256=sha256,
-        dedup_scope="c" * 64,
-    ))
+    # 1. Overlapping coroutines at manager level: simulate overlapping native inspection
+    async def mock_inspect(path):
+        await asyncio.sleep(0.02)
+        return 1
 
-    assert first.session_id == second.session_id
+    monkeypatch.setattr(render_session, "inspect_page_count", mock_inspect)
+
+    async def run_overlapping_manager():
+        tasks = [
+            manager.get_or_create(
+                file_path=source_path,
+                file_size=len(pdf_bytes),
+                sha256=sha256,
+                dedup_scope=scope,
+            )
+            for _ in range(4)
+        ]
+        return await asyncio.gather(*tasks)
+
+    results = asyncio.run(run_overlapping_manager())
+    session_ids = {s.session_id for s in results}
+    assert len(session_ids) == 1, "all concurrent get_or_create calls must resolve to identical session"
     assert len(manager._sessions) == 1
-    manager.delete(first.session_id)
+    assert len(list(session_root.iterdir())) == 1, "no temporary candidate directories may be leaked"
+    manager.delete(results[0].session_id)
+    assert not list(session_root.iterdir())
+
+    # 2. Overlapping signed HTTP requests via httpx.AsyncClient
+    import httpx
+
+    async def run_http_overlapping():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as ac:
+            async def post_one():
+                path = f"/api/v1/render/sessions?dedup_scope={scope}"
+                outgoing = ac.build_request("POST", path, files={"file": ("overlap.pdf", pdf_bytes, "application/pdf")})
+                body = await outgoing.aread()
+                outgoing.headers.update(generate_headers("POST", path, body_hash=hashlib.sha256(body).hexdigest()))
+                return await ac.send(outgoing)
+
+            return await asyncio.gather(*[post_one() for _ in range(3)])
+
+    http_responses = asyncio.run(run_http_overlapping())
+    assert all(r.status_code == 200 for r in http_responses), "all concurrent HTTP requests must succeed"
+    http_session_ids = {r.json()["session_id"] for r in http_responses}
+    assert len(http_session_ids) == 1, "all concurrent HTTP requests must receive the same session_id"
+    assert len(manager._sessions) == 1
+    assert len(list(session_root.iterdir())) == 1, "only one physical session directory must exist"
+
+    final_session_id = http_responses[0].json()["session_id"]
+    manager.delete(final_session_id)
+    assert not list(session_root.iterdir())
 
 
 def test_failed_session_creation_cleans_uploaded_temporary_pdf(monkeypatch, tmp_path):
