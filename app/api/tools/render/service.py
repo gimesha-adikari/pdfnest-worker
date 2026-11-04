@@ -306,14 +306,11 @@ async def _create_render_session(
             if temp_file is not None:
                 temp_file.close()
         finally:
-            try:
-                if temp_path is not None:
-                    try:
-                        temp_path.unlink(missing_ok=True)
-                    except OSError:
-                        pass
-            finally:
-                reservation.release()
+            session_manager.cleanup_upload_staging(
+                temp_path,
+                reservation,
+                scope=dedup_scope,
+            )
 
 
 async def get_render_session_page(

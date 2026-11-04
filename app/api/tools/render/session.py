@@ -42,6 +42,29 @@ MAX_SESSION_OWNER_BYTES = _bounded_positive_env("PDFNEST_RENDER_MAX_OWNER_BYTES"
 MAX_SESSION_TOTAL_BYTES = _bounded_positive_env("PDFNEST_RENDER_MAX_TOTAL_BYTES", 256 * 1024 * 1024, 256 * 1024 * 1024)
 
 
+def _remove_managed_path(path: Path) -> None:
+    """Remove one owned path without following symlinks, and verify it is gone."""
+    try:
+        mode = path.lstat().st_mode
+    except FileNotFoundError:
+        return
+
+    try:
+        if stat.S_ISDIR(mode):
+            shutil.rmtree(path)
+        else:
+            # This also removes a symlink itself; it never follows the target.
+            path.unlink()
+    except FileNotFoundError:
+        pass
+
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return
+    raise OSError(f"render storage path remains after cleanup: {path.name}")
+
+
 def _claim_session_root(root: Path):
     """Own one session root and remove only known stale session artifacts.
 
@@ -79,13 +102,13 @@ def _claim_session_root(root: Path):
             if re.fullmatch(r"[0-9a-f]{32}", entry.name):
                 if not stat.S_ISDIR(entry.lstat().st_mode):
                     raise RuntimeError("unexpected render session artifact type")
-                shutil.rmtree(entry)
+                _remove_managed_path(entry)
                 continue
             if re.fullmatch(r"pdfnest-session-upload-[^/]+\.pdf", entry.name):
                 mode = entry.lstat().st_mode
                 if not (stat.S_ISREG(mode) or stat.S_ISLNK(mode)):
                     raise RuntimeError("unexpected render upload staging artifact type")
-                entry.unlink()
+                _remove_managed_path(entry)
                 continue
             raise RuntimeError("unexpected file in dedicated render session root")
         return lock_file
@@ -119,6 +142,14 @@ class _InFlightCreation:
     waiters: int = 0
 
 
+@dataclass
+class _PendingStorageDeletion:
+    path: Path
+    bytes_reserved: int
+    scope: str
+    session: RenderSession | None = None
+
+
 class SessionStorageLimitError(RuntimeError):
     """A render upload would exceed a hard in-process storage budget."""
 
@@ -146,6 +177,10 @@ class RenderSessionManager:
         self._committed_by_scope: dict[str, int] = {}
         self._reserved_bytes = 0
         self._reserved_by_scope: dict[str, int] = {}
+        # Pending paths remain included in committed accounting until their
+        # physical removal is verified. Paths are exact manager-owned session
+        # directories or upload staging files; cleanup never sweeps by owner.
+        self._pending_deletions: dict[Path, _PendingStorageDeletion] = {}
 
     @property
     def used_bytes(self) -> int:
@@ -153,7 +188,9 @@ class RenderSessionManager:
             return self._committed_bytes + self._reserved_bytes
 
     def reserve_storage(self, scope: str) -> SessionStorageReservation:
-        return SessionStorageReservation(self, scope)
+        with self._lock:
+            self._retry_pending_deletions_locked()
+            return SessionStorageReservation(self, scope)
 
     def _extend_reservation(self, reservation: SessionStorageReservation, amount: int) -> None:
         if type(amount) is not int or amount < 0:
@@ -207,13 +244,192 @@ class RenderSessionManager:
         reservation.bytes_reserved = 0
         reservation.active = False
 
-    def _release_session_storage_locked(self, session: RenderSession) -> None:
-        self._committed_bytes = max(0, self._committed_bytes - session.file_size)
-        scope_bytes = self._committed_by_scope.get(session.dedup_scope, 0) - session.file_size
+    def _release_committed_storage_locked(self, scope: str, amount: int) -> None:
+        self._committed_bytes -= amount
+        scope_bytes = self._committed_by_scope.get(scope, 0) - amount
         if scope_bytes > 0:
-            self._committed_by_scope[session.dedup_scope] = scope_bytes
+            self._committed_by_scope[scope] = scope_bytes
         else:
-            self._committed_by_scope.pop(session.dedup_scope, None)
+            self._committed_by_scope.pop(scope, None)
+
+    def _commit_reservation_as_pending_locked(
+            self,
+            reservation: SessionStorageReservation,
+            path: Path,
+            minimum_bytes: int = 0,
+    ) -> None:
+        if not reservation.active:
+            return
+        reserved_bytes = reservation.bytes_reserved
+        amount = max(reserved_bytes, minimum_bytes)
+        self._reserved_bytes -= reserved_bytes
+        reserved_scope = self._reserved_by_scope.get(reservation.scope, 0) - reserved_bytes
+        if reserved_scope > 0:
+            self._reserved_by_scope[reservation.scope] = reserved_scope
+        else:
+            self._reserved_by_scope.pop(reservation.scope, None)
+        self._committed_bytes += amount
+        self._committed_by_scope[reservation.scope] = (
+            self._committed_by_scope.get(reservation.scope, 0) + amount
+        )
+        self._pending_deletions[path] = _PendingStorageDeletion(
+            path=path,
+            bytes_reserved=amount,
+            scope=reservation.scope,
+        )
+        reservation.bytes_reserved = 0
+        reservation.active = False
+
+    def _record_unreserved_pending_locked(self, path: Path, amount: int, scope: str) -> None:
+        if path in self._pending_deletions:
+            return
+        self._committed_bytes += amount
+        self._committed_by_scope[scope] = self._committed_by_scope.get(scope, 0) + amount
+        self._pending_deletions[path] = _PendingStorageDeletion(
+            path=path,
+            bytes_reserved=amount,
+            scope=scope,
+        )
+
+    def _cleanup_unpublished_path(
+            self,
+            path: Path,
+            reservation: SessionStorageReservation,
+            *,
+            release_on_success: bool = True,
+            retain_reservation_on_failure: bool = False,
+            minimum_bytes_on_failure: int = 0,
+    ) -> None:
+        with self._lock:
+            if path in self._pending_deletions:
+                self._retry_pending_deletions_locked({path})
+                reservation.release()
+                return
+        try:
+            _remove_managed_path(path)
+        except OSError:
+            # The reservation remains live during the attempt, then becomes a
+            # committed liability if the bytes could not be physically removed.
+            with self._lock:
+                if retain_reservation_on_failure:
+                    # Source bytes still belong to their upload staging path.
+                    # Track this exact candidate directory separately so an
+                    # empty or partially-created orphan is retried as well.
+                    candidate_bytes = 0
+                    candidate_file = path / "source.pdf"
+                    try:
+                        info = candidate_file.lstat()
+                        if stat.S_ISREG(info.st_mode):
+                            candidate_bytes = info.st_size
+                    except FileNotFoundError:
+                        pass
+                    except OSError:
+                        candidate_bytes = minimum_bytes_on_failure
+                    self._record_unreserved_pending_locked(
+                        path,
+                        candidate_bytes,
+                        reservation.scope,
+                    )
+                else:
+                    self._commit_reservation_as_pending_locked(
+                        reservation,
+                        path,
+                        minimum_bytes=minimum_bytes_on_failure,
+                    )
+        else:
+            if release_on_success:
+                reservation.release()
+
+    def _cleanup_unreserved_upload(self, path: Path, scope: str, size_hint: int) -> None:
+        # Low-level callers may supply a staging path without a reservation.
+        # Serialize the removal attempt with admissions; if it fails, convert
+        # the extant file into committed liability before releasing the lock.
+        with self._lock:
+            if path in self._pending_deletions:
+                self._retry_pending_deletions_locked({path})
+                return
+            try:
+                _remove_managed_path(path)
+            except OSError:
+                try:
+                    amount = path.lstat().st_size
+                except OSError:
+                    amount = size_hint
+                self._record_unreserved_pending_locked(path, amount, scope)
+
+    def cleanup_upload_staging(
+            self,
+            path: Path | None,
+            reservation: SessionStorageReservation | None,
+            scope: str = "global",
+            size_hint: int = 0,
+    ) -> None:
+        """Remove this request's upload file or retain its reserved liability."""
+        if path is None:
+            if reservation is not None:
+                reservation.release()
+            return
+        # Upload paths are created directly under the claimed root. Use the
+        # lexical parent and generated-name contract so a resolution error can
+        # never turn an owned file into an unaccounted external path.
+        owned = (
+            path.parent == SESSION_ROOT
+            and re.fullmatch(r"pdfnest-session-upload-[^/]+\.pdf", path.name) is not None
+        )
+        if owned:
+            if reservation is None:
+                self._cleanup_unreserved_upload(path, scope, size_hint)
+            else:
+                try:
+                    path_info = path.lstat()
+                    if stat.S_ISREG(path_info.st_mode):
+                        size_hint = max(size_hint, path_info.st_size)
+                except OSError:
+                    pass
+                self._cleanup_unpublished_path(
+                    path,
+                    reservation,
+                    minimum_bytes_on_failure=size_hint,
+                )
+        else:
+            # Lower-level callers may pass external paths, which remain owned by
+            # their caller and must not be deleted here.
+            if reservation is not None:
+                reservation.release()
+
+    def _schedule_session_deletion_locked(self, session: RenderSession) -> Path:
+        path = session.file_path.parent
+        self._sessions.pop(session.session_id, None)
+        self._pending_deletions[path] = _PendingStorageDeletion(
+            path=path,
+            bytes_reserved=session.file_size,
+            scope=session.dedup_scope,
+            session=session,
+        )
+        return path
+
+    def _retry_pending_deletions_locked(self, paths: set[Path] | None = None) -> None:
+        for path, pending in tuple(self._pending_deletions.items()):
+            if paths is not None and path not in paths:
+                continue
+            if pending.session is not None:
+                with pending.session.lock:
+                    document = pending.session.document
+                    if document is not None:
+                        try:
+                            document.close()
+                        except Exception:
+                            # Keep the path and accounting until close and
+                            # physical cleanup can both be retried.
+                            continue
+                        pending.session.document = None
+            try:
+                _remove_managed_path(path)
+            except OSError:
+                continue
+            current = self._pending_deletions.pop(path, None)
+            if current is pending:
+                self._release_committed_storage_locked(pending.scope, pending.bytes_reserved)
 
     async def create(
             self,
@@ -223,29 +439,42 @@ class RenderSessionManager:
             dedup_scope: str = "global",
             reservation: SessionStorageReservation | None = None,
     ) -> RenderSession:
+        supplied_reservation = reservation is not None
         if reservation is None:
             reservation = self.reserve_storage(dedup_scope)
             try:
                 reservation.extend(file_size)
             except BaseException:
-                reservation.release()
+                self.cleanup_upload_staging(
+                    file_path,
+                    reservation,
+                    scope=dedup_scope,
+                    size_hint=file_size,
+                )
                 raise
         elif reservation.scope != dedup_scope:
             raise SessionStorageLimitError("render-session reservation scope does not match")
         elif reservation.bytes_reserved < file_size:
             reservation.extend(file_size - reservation.bytes_reserved)
+        elif reservation.bytes_reserved > file_size:
+            raise SessionStorageLimitError("render-session reservation exceeds the file size")
 
         session_id = uuid.uuid4().hex
         session_dir = SESSION_ROOT / session_id
         target_path = session_dir / "source.pdf"
         published = False
+        owns_session_dir = False
+        source_inside_session_root = False
         try:
+            source_inside_session_root = file_path.parent == SESSION_ROOT
+            if not source_inside_session_root:
+                source_inside_session_root = file_path.resolve().is_relative_to(SESSION_ROOT.resolve())
             session_dir.mkdir(mode=0o700, parents=True)
+            owns_session_dir = True
             # Uploads are staged under SESSION_ROOT and atomically moved so
             # accounting never ignores a second full-sized copy.
             if file_path.stat().st_size != file_size:
                 raise SessionStorageLimitError("render-session file size changed during admission")
-            source_inside_session_root = file_path.resolve().is_relative_to(SESSION_ROOT.resolve())
             if source_inside_session_root:
                 if file_path.stat().st_dev != SESSION_ROOT.stat().st_dev:
                     raise SessionStorageLimitError("render-session staging must use the bounded session filesystem")
@@ -281,13 +510,34 @@ class RenderSessionManager:
                 )
                 # No await between publication, accounting and return.
                 self._sessions[session_id] = session
-                self._commit_reservation(reservation, session)
+                try:
+                    self._commit_reservation(reservation, session)
+                except BaseException:
+                    self._sessions.pop(session_id, None)
+                    raise
                 published = True
                 return session
         finally:
             if not published:
-                shutil.rmtree(session_dir, ignore_errors=True)
-            reservation.release()
+                if owns_session_dir:
+                    source_still_staged = source_inside_session_root and os.path.lexists(file_path)
+                    self._cleanup_unpublished_path(
+                        session_dir,
+                        reservation,
+                        release_on_success=not source_still_staged,
+                        retain_reservation_on_failure=source_still_staged,
+                    )
+                if not supplied_reservation and source_inside_session_root:
+                    self.cleanup_upload_staging(
+                        file_path,
+                        reservation,
+                        scope=dedup_scope,
+                        size_hint=file_size,
+                    )
+                elif not supplied_reservation or not source_inside_session_root:
+                    reservation.release()
+            else:
+                reservation.release()
 
     async def get_or_create(
             self,
@@ -310,8 +560,12 @@ class RenderSessionManager:
                 for existing in self._sessions.values():
                     if existing.sha256 == sha256 and existing.dedup_scope == dedup_scope:
                         existing.last_accessed_at = time.time()
-                        if reservation is not None:
-                            reservation.release()
+                        self.cleanup_upload_staging(
+                            file_path,
+                            reservation,
+                            scope=dedup_scope,
+                            size_hint=file_size,
+                        )
                         return existing
 
                 inflight = self._inflight.get(key)
@@ -350,14 +604,12 @@ class RenderSessionManager:
                 # A matching leader owns verification. Only delete request
                 # staging files that this manager owns; callers may provide a
                 # shared external path to the lower-level manager API.
-                try:
-                    resolved_root = SESSION_ROOT.resolve()
-                    resolved_file = file_path.resolve()
-                    if resolved_file != resolved_root and resolved_root in resolved_file.parents:
-                        file_path.unlink(missing_ok=True)
-                finally:
-                    if reservation is not None:
-                        reservation.release()
+                self.cleanup_upload_staging(
+                    file_path,
+                    reservation,
+                    scope=dedup_scope,
+                    size_hint=file_size,
+                )
                 try:
                     await asyncio.wait_for(inflight.event.wait(), timeout=wait_timeout)
                 except asyncio.TimeoutError as exc:
@@ -397,22 +649,19 @@ class RenderSessionManager:
 
     def delete(self, session_id: str) -> None:
         with self._lock:
-            session = self._sessions.pop(session_id, None)
+            session = self._sessions.get(session_id)
             if session is not None:
-                self._release_session_storage_locked(session)
+                path = self._schedule_session_deletion_locked(session)
+                self._retry_pending_deletions_locked({path})
+                return
 
-        if session is None:
-            return
-
-        with session.lock:
-            if session.document is not None:
-                session.document.close()
-                session.document = None
-
-        try:
-            shutil.rmtree(session.file_path.parent, ignore_errors=True)
-        except Exception:
-            pass
+            pending_path = next((
+                path
+                for path, pending in self._pending_deletions.items()
+                if pending.session is not None and pending.session.session_id == session_id
+            ), None)
+            if pending_path is not None:
+                self._retry_pending_deletions_locked({pending_path})
 
     def find_by_hash(self, sha256: str, dedup_scope: str = "global") -> RenderSession | None:
         with self._lock:
@@ -434,23 +683,8 @@ class RenderSessionManager:
             key=lambda item: item.last_accessed_at,
         )
 
-        self._sessions.pop(oldest.session_id, None)
-        self._release_session_storage_locked(oldest)
-
-        try:
-            if oldest.document is not None:
-                oldest.document.close()
-                oldest.document = None
-        except Exception:
-            pass
-
-        try:
-            shutil.rmtree(
-                oldest.file_path.parent,
-                ignore_errors=True,
-            )
-        except Exception:
-            pass
+        path = self._schedule_session_deletion_locked(oldest)
+        self._retry_pending_deletions_locked({path})
 
     def _cleanup_expired_locked(self) -> None:
         now = time.time()
@@ -462,25 +696,11 @@ class RenderSessionManager:
         ]
 
         for session_id in expired:
-            session = self._sessions.pop(session_id, None)
+            session = self._sessions.get(session_id)
             if session is None:
                 continue
-            self._release_session_storage_locked(session)
-
-            try:
-                if session.document is not None:
-                    session.document.close()
-                    session.document = None
-            except Exception:
-                pass
-
-            try:
-                shutil.rmtree(
-                    session.file_path.parent,
-                    ignore_errors=True,
-                )
-            except Exception:
-                pass
+            self._schedule_session_deletion_locked(session)
+        self._retry_pending_deletions_locked()
 
 
 session_manager = RenderSessionManager()
