@@ -6,6 +6,8 @@ import fitz
 from pptx import Presentation
 from pptx.util import Pt
 
+from app.core.ocr_v2.geometry import render_page_pixmap
+
 
 def convert_to_powerpoint(pdf_path: str, output_path: str) -> None:
     prs = Presentation()
@@ -25,11 +27,14 @@ def convert_to_powerpoint(pdf_path: str, output_path: str) -> None:
 
             slide = prs.slides.add_slide(prs.slide_layouts[6])
 
-            zoom = 2
-            mat = fitz.Matrix(zoom, zoom)
-            pix = page.get_pixmap(matrix=mat)
-
-            img_bytes = pix.tobytes("png")
+            # 2x at 72 points/inch is 144 DPI. Use the shared admission
+            # boundary so the page geometry is rejected before MuPDF allocates
+            # a native raster, then validate the resulting pixmap dimensions.
+            pix = render_page_pixmap(page, dpi=144)
+            try:
+                img_bytes = pix.tobytes("png")
+            finally:
+                del pix
             image_stream = BytesIO(img_bytes)
 
             slide.shapes.add_picture(
