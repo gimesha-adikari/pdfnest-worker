@@ -1,5 +1,6 @@
 """Synthetic render-session metadata boundary regressions; no external services."""
 import asyncio
+import hashlib
 import io
 import os
 from pathlib import Path
@@ -388,7 +389,7 @@ async def test_native_capacity_busy_is_distinct(manager, tmp_path):
 
 
 @pytest.mark.anyio
-async def test_duplicate_publication_is_atomic(manager, monkeypatch):
+async def test_duplicate_publication_is_atomic(manager, monkeypatch, tmp_path):
     entered, release = asyncio.Event(), asyncio.Event()
     count = 0
     async def inspect(path):
@@ -400,7 +401,15 @@ async def test_duplicate_publication_is_atomic(manager, monkeypatch):
         return 1
     monkeypatch.setattr(session, "inspect_page_count", inspect)
     data = small_pdf()
-    tasks = [asyncio.create_task(create(data)) for _ in range(2)]
+    path1 = tmp_path / "cand1.pdf"
+    path1.write_bytes(data)
+    path2 = tmp_path / "cand2.pdf"
+    path2.write_bytes(data)
+    sha = hashlib.sha256(data).hexdigest()
+    tasks = [
+        asyncio.create_task(manager.create(path1, len(data), sha, "global")),
+        asyncio.create_task(manager.create(path2, len(data), sha, "global")),
+    ]
     try:
         await asyncio.wait_for(entered.wait(), 5)
         assert not manager._sessions
