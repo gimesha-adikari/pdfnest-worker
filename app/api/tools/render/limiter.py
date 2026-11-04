@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import time
 from contextlib import asynccontextmanager
@@ -9,6 +10,10 @@ from typing import Any, AsyncGenerator, Awaitable, Dict, TypeVar
 from fastapi import HTTPException
 
 T = TypeVar("T")
+
+HARD_MAX_RENDER_CONCURRENCY = 2
+HARD_MAX_RENDER_TIMEOUT_SECONDS = 30.0
+HARD_MAX_RENDER_QUEUE = 64
 
 
 def get_effective_memory_limit_bytes() -> int:
@@ -59,14 +64,15 @@ def get_effective_memory_limit_bytes() -> int:
 def get_default_concurrency_limit() -> int:
     """
     Computes safe default concurrency limit inspected from CPU cores and system/container RAM.
-    Can be explicitly overridden via the RENDER_CONCURRENCY_LIMIT environment variable.
+    A configuration override may reduce capacity but cannot exceed the hard
+    process-count ceiling selected for the 2 GB Worker deployment.
     """
     env_val = os.getenv("RENDER_CONCURRENCY_LIMIT")
     if env_val:
         try:
-            return max(1, int(env_val))
+            return min(max(1, int(env_val)), HARD_MAX_RENDER_CONCURRENCY)
         except ValueError:
-            pass
+            return 1
 
     cpu_count = os.cpu_count() or 2
     mem_bytes = get_effective_memory_limit_bytes()
@@ -75,7 +81,7 @@ def get_default_concurrency_limit() -> int:
     ram_concurrency = max(1, int(mem_mb // 512))
 
     # Authoritative calculation: bounded by CPU and RAM, minimum 1, maximum 8
-    return min(max(1, cpu_count), max(1, ram_concurrency), 8)
+    return min(max(1, cpu_count), max(1, ram_concurrency), HARD_MAX_RENDER_CONCURRENCY)
 
 
 class RenderConcurrencyLimiter:
@@ -94,22 +100,18 @@ class RenderConcurrencyLimiter:
         render_timeout: float | None = None,
         queue_timeout: float | None = None,
     ):
-        self.max_concurrency = max_concurrency or get_default_concurrency_limit()
-        self.max_queue = (
-            max_queue
-            if max_queue is not None
-            else int(os.getenv("RENDER_QUEUE_LIMIT", "16"))
-        )
-        self.render_timeout = (
-            render_timeout
-            if render_timeout is not None
-            else float(os.getenv("RENDER_TIMEOUT_SECONDS", "30.0"))
-        )
-        self.queue_timeout = (
-            queue_timeout
-            if queue_timeout is not None
-            else float(os.getenv("RENDER_QUEUE_TIMEOUT_SECONDS", "10.0"))
-        )
+        requested_concurrency = get_default_concurrency_limit() if max_concurrency is None else max_concurrency
+        self.max_concurrency = min(max(1, int(requested_concurrency)), HARD_MAX_RENDER_CONCURRENCY)
+        if max_queue is None:
+            try:
+                max_queue = int(os.getenv("RENDER_QUEUE_LIMIT", "16"))
+            except ValueError:
+                max_queue = 16
+        self.max_queue = min(max(0, int(max_queue)), HARD_MAX_RENDER_QUEUE)
+        configured_timeout = render_timeout if render_timeout is not None else float(os.getenv("RENDER_TIMEOUT_SECONDS", "30.0"))
+        self.render_timeout = min(max(0.1, configured_timeout), HARD_MAX_RENDER_TIMEOUT_SECONDS) if math.isfinite(configured_timeout) else HARD_MAX_RENDER_TIMEOUT_SECONDS
+        configured_queue_timeout = queue_timeout if queue_timeout is not None else float(os.getenv("RENDER_QUEUE_TIMEOUT_SECONDS", "10.0"))
+        self.queue_timeout = min(max(0.1, configured_queue_timeout), 60.0) if math.isfinite(configured_queue_timeout) else 60.0
 
         self._semaphore: asyncio.Semaphore | None = None
         self._lock = asyncio.Lock()
