@@ -43,11 +43,7 @@ def is_public_path(path: str) -> bool:
     normalized = path.rstrip("/")
     if not normalized:
         normalized = "/"
-    if normalized in PUBLIC_PATHS:
-        return True
-    if normalized.startswith("/health"):
-        return True
-    return False
+    return normalized in PUBLIC_PATHS
 
 
 # 100 MiB file budget plus bounded multipart/generated-document headroom.

@@ -8,6 +8,8 @@ from typing import Any
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from starlette.concurrency import run_in_threadpool
 
 from app.core.broker import broker  # noqa: F401
 from app.jobs.router import router as jobs_router
@@ -95,11 +97,10 @@ async def root() -> dict[str, Any]:
     }
 
 
-from fastapi.responses import JSONResponse
 import shutil
 import redis
 
-from app.core.storage import get_local_storage_dir, get_r2_client
+from app.core.storage import get_local_storage_dir, get_r2_readiness_client
 
 logger = logging.getLogger(__name__)
 
@@ -115,12 +116,24 @@ async def live() -> dict[str, str]:
 
 @app.get("/health/ready")
 async def ready() -> JSONResponse:
+    status_code, _ = await run_in_threadpool(_worker_readiness_snapshot)
+    status = "ready" if status_code == 200 else "not_ready"
+    return JSONResponse(status_code=status_code, content={"status": status})
+
+
+@app.get("/internal/health/ready")
+async def internal_ready() -> JSONResponse:
+    status_code, content = await run_in_threadpool(_worker_readiness_snapshot)
+    return JSONResponse(status_code=status_code, content=content)
+
+
+def _worker_readiness_snapshot() -> tuple[int, dict[str, Any]]:
     redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
     redis_healthy = False
     actor_healthy = True
     r2_healthy = True
     try:
-        r = redis.Redis.from_url(redis_url, socket_connect_timeout=2, socket_timeout=2)
+        r = redis.Redis.from_url(redis_url, socket_connect_timeout=0.75, socket_timeout=0.75)
         redis_healthy = bool(r.ping())
         if settings.actor_heartbeat_required:
             heartbeat = r.get(settings.actor_heartbeat_key)
@@ -132,7 +145,7 @@ async def ready() -> JSONResponse:
     remote_required = remote_storage_enabled()
     if remote_required:
         try:
-            get_r2_client().head_bucket(Bucket=settings.r2_bucket)
+            get_r2_readiness_client().head_bucket(Bucket=settings.r2_bucket)
         except Exception as exc:
             r2_healthy = False
             logger.warning("[WORKER READINESS] R2 bucket metadata check failed: %s", exc)
@@ -146,35 +159,25 @@ async def ready() -> JSONResponse:
         ),
     }
 
+    dependencies_healthy = redis_healthy and actor_healthy and (not remote_required or r2_healthy)
     engines_healthy = all(binaries.values())
-    if not redis_healthy or not actor_healthy or not engines_healthy or (remote_required and not r2_healthy):
+    ready = dependencies_healthy and engines_healthy
+    capabilities = {
+        "document_processing": dependencies_healthy,
+        "ocr": dependencies_healthy and binaries["tesseract"],
+        "office_to_pdf": dependencies_healthy and binaries["libreoffice"],
+        "pdf_to_office": dependencies_healthy,
+    }
+    if not ready:
         if not redis_healthy:
             logger.warning("[WORKER READINESS] Redis is not ready")
         if not actor_healthy:
             logger.warning("[WORKER READINESS] actor heartbeat missing or stale")
         if not engines_healthy:
             logger.warning("[WORKER READINESS] required document engines are not ready: %s", binaries)
-        return JSONResponse(
-            status_code=503,
-            content={
-                "status": "not_ready",
-                "redis": redis_healthy,
-                "binaries": binaries,
-                "r2": r2_healthy,
-                "actor": actor_healthy,
-                "reason": "Worker dependency is unreachable",
-            },
-        )
-
-    return JSONResponse(
-        status_code=200,
-        content={
-            "status": "ready",
-            "redis": True,
-            "r2": r2_healthy,
-            "actor": actor_healthy,
-            "binaries": binaries,
-        },
+    return (
+        (200 if ready else 503),
+        {"status": "ready" if ready else "not_ready", "capabilities": capabilities},
     )
 
 

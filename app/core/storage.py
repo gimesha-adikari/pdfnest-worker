@@ -114,6 +114,34 @@ def get_r2_client():
         ),
     )
 
+
+@lru_cache(maxsize=1)
+def get_r2_readiness_client():
+    """Return a metadata-only R2 client with short, non-retrying probe bounds."""
+    if not settings.r2_bucket:
+        raise R2StorageError("R2_BUCKET is missing.")
+    if not settings.r2_access_key:
+        raise R2StorageError("R2_ACCESS_KEY is missing.")
+    if not settings.r2_secret_key:
+        raise R2StorageError("R2_SECRET_KEY is missing.")
+    if not settings.r2_endpoint:
+        raise R2StorageError("R2_ENDPOINT is missing.")
+
+    return boto3.client(
+        "s3",
+        endpoint_url=settings.r2_endpoint,
+        aws_access_key_id=settings.r2_access_key,
+        aws_secret_access_key=settings.r2_secret_key,
+        region_name="auto",
+        config=Config(
+            signature_version="s3v4",
+            s3={"addressing_style": "path"},
+            connect_timeout=0.75,
+            read_timeout=0.75,
+            retries={"mode": "standard", "max_attempts": 0},
+        ),
+    )
+
 def build_key(prefix: str, *, suffix: str = "") -> str:
     clean_prefix = prefix.strip("/ ")
     clean_suffix = suffix.strip()
