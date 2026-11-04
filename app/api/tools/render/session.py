@@ -347,10 +347,14 @@ class RenderSessionManager:
                         self._inflight.pop(key, None)
                         inflight.event.set()
             else:
-                # A matching leader owns verification; discard this duplicate
-                # upload immediately and free its reservation while it waits.
+                # A matching leader owns verification. Only delete request
+                # staging files that this manager owns; callers may provide a
+                # shared external path to the lower-level manager API.
                 try:
-                    file_path.unlink(missing_ok=True)
+                    resolved_root = SESSION_ROOT.resolve()
+                    resolved_file = file_path.resolve()
+                    if resolved_file != resolved_root and resolved_root in resolved_file.parents:
+                        file_path.unlink(missing_ok=True)
                 finally:
                     if reservation is not None:
                         reservation.release()
@@ -366,7 +370,7 @@ class RenderSessionManager:
                 if inflight.session is not None:
                     return inflight.session
 
-                if inflight.error is not None:
+                if inflight.error is not None and not isinstance(inflight.error, asyncio.CancelledError):
                     raise inflight.error
 
     def get(self, session_id: str) -> RenderSession:

@@ -302,14 +302,18 @@ async def _create_render_session(
         )
 
     finally:
-        if temp_file is not None:
-            temp_file.close()
-        if temp_path is not None:
+        try:
+            if temp_file is not None:
+                temp_file.close()
+        finally:
             try:
-                temp_path.unlink(missing_ok=True)
-            except OSError:
-                pass
-        reservation.release()
+                if temp_path is not None:
+                    try:
+                        temp_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+            finally:
+                reservation.release()
 
 
 async def get_render_session_page(
