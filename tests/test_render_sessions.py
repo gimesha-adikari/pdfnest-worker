@@ -185,7 +185,8 @@ def test_render_session_capacity_and_expiration_remain_bounded(monkeypatch, tmp_
             file_path=source_path,
             file_size=len(pdf_bytes),
             sha256=hashlib.sha256(pdf_bytes).hexdigest(),
-            dedup_scope=f"scope-{pages}",
+            # Capacity eviction is scoped to the same owner.
+            dedup_scope="scope-a",
         )))
 
     evicted, active, expiring = sessions
@@ -196,7 +197,7 @@ def test_render_session_capacity_and_expiration_remain_bounded(monkeypatch, tmp_
     assert manager.get_optional(expiring.session_id) is None
     assert not (session_root / expiring.session_id).exists()
 
-    assert manager.get(active.session_id).dedup_scope == "scope-2"
+    assert manager.get(active.session_id).dedup_scope == "scope-a"
     manager.delete(active.session_id)
 
 
