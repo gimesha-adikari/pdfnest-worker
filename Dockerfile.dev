@@ -10,6 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     ca-certificates \
     curl \
+    git \
     libjpeg62-turbo \
     libopenjp2-7 \
     zlib1g \

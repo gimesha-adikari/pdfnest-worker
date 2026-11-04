@@ -39,7 +39,7 @@ jobs:
 
       - name: Install locked security-qualification dependencies
         env:
-          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/f11-sdk019-venv
+          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/platen-sdk-candidate-venv
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-eng tesseract-ocr-sin tesseract-ocr-tam qpdf fonts-dejavu-core redis-server
@@ -51,15 +51,15 @@ jobs:
       - name: Verify strict Worker body integrity and multipart replay
         env:
           APP_ENV: test
-          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/f11-sdk019-venv
+          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/platen-sdk-candidate-venv
         run: |
           timeout 120s "$UV_PROJECT_ENVIRONMENT/bin/python" -m pytest -q --tb=short -p anyio.pytest_plugin -p no:cacheprovider tests/test_f15_render_session_integration.py tests/test_security.py tests/test_security_body.py tests/test_ocr_v2_api.py tests/test_gateway_protocol.py tests/test_gateway_forwarding.py tests/test_sign.py tests/test_redact.py
 
       - name: Qualify installed SDK and F-11 security boundaries
         env:
           APP_ENV: test
-          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/f11-sdk019-venv
-          F11_INSTALLED_ENV_ROOT: ${{ runner.temp }}/f11-sdk019-venv
+          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/platen-sdk-candidate-venv
+          F11_INSTALLED_ENV_ROOT: ${{ runner.temp }}/platen-sdk-candidate-venv
         run: |
           unset PYTHONPATH F11_SDK_CANDIDATE_ROOT
           timeout 120s prlimit --as=1073741824 --cpu=90 -- "$UV_PROJECT_ENVIRONMENT/bin/python" - <<'PY'
@@ -75,15 +75,16 @@ jobs:
 
           assert sys.version_info[:2] == (3, 12)
           assert Path(sys.prefix).resolve() == Path(os.environ["F11_INSTALLED_ENV_ROOT"]).resolve()
-          assert importlib.metadata.version("platen-document") == "0.1.9"
+          sdk_version = "0.1.10rc1"
+          sdk_commit = "83132f538cd296ad292cb4b9627cb0ebf2d6237a"
+          assert importlib.metadata.version("platen-document") == sdk_version
           expected = Path(sysconfig.get_path("purelib")) / "platen_document/__init__.py"
           assert Path(platen_document.__file__).resolve() == expected.resolve()
           assert expected.resolve().is_relative_to(Path(sys.prefix).resolve())
           lock = tomllib.loads(Path("uv.lock").read_text())
           sdk = next(package for package in lock["package"] if package["name"] == "platen-document")
-          assert sdk["version"] == "0.1.9"
-          assert sdk["sdist"]["hash"] == "sha256:74634f3e23dda9ed1740e1a840e263db47ab255a6a431ade8fe7bdff5d2f90f1"
-          assert [wheel["hash"] for wheel in sdk["wheels"]] == ["sha256:70919a01664643b7b5e95d38d893b61b326b9e57bb0a0ddadf79d135c214e21b"]
+          assert sdk["version"] == sdk_version
+          assert sdk["source"]["git"] == f"https://github.com/gimesha-adikari/platen-document.git?rev={sdk_commit}#{sdk_commit}"
           print("Installed SDK:", importlib.metadata.version("platen-document"), platen_document.__file__)
 
           class NoMandatorySkips:
@@ -102,6 +103,7 @@ jobs:
           # designated small native fixtures follow; no load/stress suites.
           files = [
               "tests/test_raster_sdk_boundary.py",
+              "tests/test_pdf_to_powerpoint_raster_admission.py",
               "tests/test_raster_admission.py",
               "tests/test_gateway_protocol.py",
               "tests/test_gateway_forwarding.py",
@@ -139,7 +141,7 @@ jobs:
           APP_ENV: test
           STORAGE_MODE: local
           WORKER_SHARED_SECRET: synthetic-domain-ci-secret
-          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/f11-sdk019-venv
+          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/platen-sdk-candidate-venv
         run: |
           timeout 90s prlimit --as=1073741824 --cpu=70 -- "$UV_PROJECT_ENVIRONMENT/bin/python" -m pytest -q --tb=short -p no:cacheprovider tests/test_native_execution_domain.py
 
@@ -148,7 +150,7 @@ jobs:
           APP_ENV: test
           STORAGE_MODE: local
           WORKER_SHARED_SECRET: synthetic-f11-ci-secret
-          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/f11-sdk019-venv
+          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/platen-sdk-candidate-venv
         run: |
           timeout 240s "$UV_PROJECT_ENVIRONMENT/bin/python" -m pytest -q -p anyio.pytest_plugin tests/test_native_isolation.py tests/test_subprocess_runner.py tests/test_ocr_v2_api.py tests/test_ocr_markup_preview.py
 
@@ -157,16 +159,16 @@ jobs:
           APP_ENV: test
           STORAGE_MODE: local
           WORKER_SHARED_SECRET: synthetic-f12-ci-secret
-          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/f11-sdk019-venv
+          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/platen-sdk-candidate-venv
         run: |
-          timeout 90s "$UV_PROJECT_ENVIRONMENT/bin/python" -m pytest -q -p anyio.pytest_plugin tests/test_render_resource_safety.py tests/test_render_sessions.py tests/test_render_capacity.py tests/test_render_session_metadata.py
+          timeout 90s "$UV_PROJECT_ENVIRONMENT/bin/python" -m pytest -q -p anyio.pytest_plugin tests/test_render_resource_safety.py tests/test_render_sessions.py tests/test_render_capacity.py tests/test_render_session_metadata.py tests/test_render_session_storage_budget.py
 
       - name: Qualify Markdown execution admission
         env:
           APP_ENV: test
           STORAGE_MODE: local
           WORKER_SHARED_SECRET: synthetic-f14-ci-secret
-          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/f11-sdk019-venv
+          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/platen-sdk-candidate-venv
         run: |
           timeout 90s "$UV_PROJECT_ENVIRONMENT/bin/python" -m pytest -q tests/test_markdown_admission.py tests/test_limiter.py tests/test_pdf_to_markdown.py
 
@@ -175,7 +177,7 @@ jobs:
           APP_ENV: test
           STORAGE_MODE: local
           WORKER_SHARED_SECRET: synthetic-f16-ci-secret
-          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/f11-sdk019-venv
+          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/platen-sdk-candidate-venv
         run: |
           timeout 90s "$UV_PROJECT_ENVIRONMENT/bin/python" -m pytest -q \
             tests/test_editor_text_fidelity.py tests/test_editor.py \

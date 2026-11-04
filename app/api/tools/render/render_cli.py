@@ -4,7 +4,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from .renderer import render_pdf_page_to_jpeg
+from .child_limits import MAX_RENDER_CHILD_FILE_BYTES, apply_render_child_limits
 
 
 def main() -> None:
@@ -27,9 +27,10 @@ def main() -> None:
         sys.stderr.write(f"Input file not found: {args.input}\n")
         sys.exit(1)
 
-    pdf_bytes = input_path.read_bytes()
-
     try:
+        apply_render_child_limits()
+        from .renderer import render_pdf_page_to_jpeg
+        pdf_bytes = input_path.read_bytes()
         jpeg_bytes = render_pdf_page_to_jpeg(
             pdf_bytes=pdf_bytes,
             page_number=args.page,
@@ -39,6 +40,8 @@ def main() -> None:
             clip_x1=args.clip_x1,
             clip_y1=args.clip_y1,
         )
+        if len(jpeg_bytes) > MAX_RENDER_CHILD_FILE_BYTES:
+            raise ValueError("Rendered output exceeds the child file-size limit")
         output_path.write_bytes(jpeg_bytes)
         
         # Telemetry: output kernel rusage & schedstat of child render process to stdout

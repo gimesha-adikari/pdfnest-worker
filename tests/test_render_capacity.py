@@ -323,7 +323,7 @@ def test_cgroup_memory_detection_max_fallback(monkeypatch):
     monkeypatch.setattr("builtins.open", m)
     
     limit = limiter.get_default_concurrency_limit()
-    assert 1 <= limit <= 8
+    assert 1 <= limit <= limiter.HARD_MAX_RENDER_CONCURRENCY
 
 
 def test_cgroup_memory_detection_v1(monkeypatch):

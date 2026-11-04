@@ -19,6 +19,24 @@ from .session import RenderSession, session_manager, sha256_file
 from .session_metadata import session_file_io
 
 
+MAX_RENDER_CHILD_CAPTURE_BYTES = 64 * 1024
+
+
+async def _read_bounded(stream, limit: int = MAX_RENDER_CHILD_CAPTURE_BYTES) -> tuple[bytes, bool]:
+    """Drain a child pipe continuously while retaining only a bounded prefix."""
+    output = bytearray()
+    truncated = False
+    while True:
+        chunk = await stream.read(8192)
+        if not chunk:
+            return bytes(output), truncated
+        available = limit - len(output)
+        if available > 0:
+            output.extend(chunk[:available])
+        if len(chunk) > available:
+            truncated = True
+
+
 async def render_page_to_jpeg_bytes_subprocess(
         pdf_bytes: bytes,
         page: int,
@@ -38,6 +56,7 @@ async def render_page_to_jpeg_bytes_subprocess(
 
     in_path = Path(temp_in.name)
     out_path = Path(temp_out.name)
+    proc = None
 
     try:
         validate_preview_dpi(dpi)
@@ -69,30 +88,46 @@ async def render_page_to_jpeg_bytes_subprocess(
         if clip_y1 is not None:
             cmd.extend(["--clip-y1", str(clip_y1)])
 
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            start_new_session=True,
-        )
-
+        stdout_task = None
+        stderr_task = None
         try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
+            )
+            stdout_task = asyncio.create_task(_read_bounded(proc.stdout))
+            stderr_task = asyncio.create_task(_read_bounded(proc.stderr))
+            wait_task = asyncio.create_task(proc.wait())
+            collect_task = asyncio.gather(stdout_task, stderr_task, wait_task)
             from .limiter import render_limiter
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), render_limiter.render_timeout)
+            (stdout, stdout_truncated), (stderr, stderr_truncated), _ = await asyncio.wait_for(
+                asyncio.shield(collect_task), render_limiter.render_timeout
+            )
         except BaseException:
-            if proc.returncode is None:
+            # The leader may have exited while a descendant keeps the inherited
+            # pipe open. Kill the whole process group even when returncode is set.
+            if proc is not None:
                 try:
                     os.killpg(proc.pid, signal.SIGKILL)
                 except (ProcessLookupError, OSError):
                     pass
+            if proc is not None and proc.returncode is None:
                 try:
                     await proc.wait()
                 except Exception:
                     pass
+            await asyncio.gather(*(task for task in (stdout_task, stderr_task) if task is not None), return_exceptions=True)
             raise
+
+        if proc is None:
+            raise RuntimeError("Render process did not start")
 
         if proc.returncode != 0:
             err_msg = stderr.decode(errors="replace").strip()
+            if stderr_truncated:
+                err_msg += " [child stderr truncated]"
             if proc.returncode == 3 or "Invalid page" in err_msg or "Page number must be" in err_msg or "DPI must be" in err_msg or "Empty file" in err_msg or "PDF contains no pages" in err_msg:
                 raise ValueError(err_msg)
             raise RuntimeError(f"Render process failed with code {proc.returncode}: {err_msg}")
@@ -101,7 +136,7 @@ async def render_page_to_jpeg_bytes_subprocess(
             raise RuntimeError("Render process did not generate output JPEG")
 
         child_metrics = {}
-        if stdout:
+        if stdout and not stdout_truncated:
             import json
             try:
                 child_metrics = json.loads(stdout.decode().strip())
@@ -111,6 +146,14 @@ async def render_page_to_jpeg_bytes_subprocess(
         return out_path.read_bytes(), child_metrics
 
     finally:
+        if proc is not None:
+            # A successful child can leave descendants running after closing
+            # inherited pipes. The PID namespace is not part of this renderer,
+            # so terminate the owned process group on success as well as error.
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                pass
         in_path.unlink(missing_ok=True)
         out_path.unlink(missing_ok=True)
 
@@ -215,21 +258,29 @@ async def _create_render_session(
         file: UploadFile,
         dedup_scope: str = "global",
 ) -> RenderSession:
-    temp_file = tempfile.NamedTemporaryFile(
-        prefix="pdfnest-session-upload-",
-        suffix=".pdf",
-        delete=False,
-    )
-
-    temp_path = Path(temp_file.name)
+    from .session import SESSION_ROOT
+    reservation = session_manager.reserve_storage(dedup_scope)
+    temp_file = None
+    temp_path: Path | None = None
 
     try:
+        SESSION_ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
+        temp_file = tempfile.NamedTemporaryFile(
+            prefix="pdfnest-session-upload-",
+            suffix=".pdf",
+            dir=SESSION_ROOT,
+            delete=False,
+        )
+        temp_path = Path(temp_file.name)
         while True:
             chunk = await file.read(1024 * 1024)
 
             if not chunk:
                 break
 
+            # Reserve before writing so concurrent uploads cannot collectively
+            # exceed the aggregate or owner byte budget.
+            reservation.extend(len(chunk))
             await session_file_io(temp_file.write, chunk)
 
         temp_file.flush()
@@ -247,16 +298,19 @@ async def _create_render_session(
             file_size=file_size,
             sha256=sha256,
             dedup_scope=dedup_scope,
+            reservation=reservation,
         )
 
     finally:
         try:
-            temp_file.close()
+            if temp_file is not None:
+                temp_file.close()
         finally:
-            try:
-                temp_path.unlink(missing_ok=True)
-            except OSError:
-                pass
+            session_manager.cleanup_upload_staging(
+                temp_path,
+                reservation,
+                scope=dedup_scope,
+            )
 
 
 async def get_render_session_page(

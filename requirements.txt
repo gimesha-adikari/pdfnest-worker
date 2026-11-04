@@ -15,4 +15,4 @@ starlette
 uvicorn
 redis
 fastapi
-platen-document==0.1.9
+platen-document @ git+https://github.com/gimesha-adikari/platen-document.git@83132f538cd296ad292cb4b9627cb0ebf2d6237a

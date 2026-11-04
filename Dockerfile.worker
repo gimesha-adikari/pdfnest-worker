@@ -15,6 +15,7 @@ RUN rm -f /etc/apt/apt.conf.d/docker-clean && \
     build-essential \
     ca-certificates \
     curl \
+    git \
     tesseract-ocr \
     ghostscript \
     poppler-utils \
@@ -39,7 +40,8 @@ RUN pip install --timeout 30 --retries 3 uv==0.11.28
 
 COPY pyproject.toml uv.lock ./
 RUN UV_LINK_MODE=copy uv sync --frozen --no-dev --no-install-project && \
-    chown -R 10001:10001 /opt/venv
+    chown -R 10001:10001 /opt/venv && \
+    apt-get purge -y --auto-remove git
 
 COPY --chown=10001:10001 . .
 

@@ -26,7 +26,7 @@ dependencies = [
   "requests>=2.34.2",
   "cryptography>=49.0.0",
   "openpyxl>=3.1.5",
-  "platen-document==0.1.9",
+  "platen-document @ git+https://github.com/gimesha-adikari/platen-document.git@83132f538cd296ad292cb4b9627cb0ebf2d6237a",
 ]
 
 [dependency-groups]

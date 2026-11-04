@@ -281,19 +281,19 @@ async def test_native_wait_does_not_hold_manager_lock_or_event_loop(manager, chi
 
 
 @pytest.mark.anyio
-async def test_cancelled_copy_is_joined_before_removing_candidate(manager, monkeypatch, tmp_path):
+async def test_cancelled_move_is_joined_before_removing_candidate(manager, monkeypatch, tmp_path):
     entered, release = threading.Event(), threading.Event()
-    actual_copy = session.shutil.copyfile
+    actual_replace = session.os.replace
     inspected = False
-    def blocked_copy(*args):
+    def blocked_replace(*args):
         entered.set()
         assert release.wait(10)
-        return actual_copy(*args)
+        return actual_replace(*args)
     async def inspect(path):
         nonlocal inspected
         inspected = True
         return 1
-    monkeypatch.setattr(session.shutil, "copyfile", blocked_copy)
+    monkeypatch.setattr(session.os, "replace", blocked_replace)
     monkeypatch.setattr(session, "inspect_page_count", inspect)
     task = asyncio.create_task(create(small_pdf()))
     try:
@@ -464,10 +464,14 @@ async def test_deletion_or_eviction_cannot_remove_unpublished_candidate(manager,
 async def test_copy_failure_and_read_cancellation_close_staging(manager, monkeypatch, tmp_path):
     def fail_copy(*args):
         raise OSError("synthetic private path failure")
+    source = tmp_path / "external-source.pdf"
+    data = small_pdf()
+    source.write_bytes(data)
     with monkeypatch.context() as patch:
         patch.setattr(session.shutil, "copyfile", fail_copy)
         with pytest.raises(OSError):
-            await create(small_pdf())
+            await manager.create(source, len(data), hashlib.sha256(data).hexdigest())
+    assert source.read_bytes() == data
     assert_clean(manager, tmp_path)
     class CancelledUpload:
         async def read(self, size):

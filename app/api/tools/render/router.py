@@ -13,6 +13,7 @@ from .service import (
     get_render_session_page,
     render_page_to_jpeg_bytes,
 )
+from .session import SessionStorageLimitError
 
 router = APIRouter(
     prefix="/api/v1/render",
@@ -197,6 +198,12 @@ async def create_session(
     except MetadataUnavailable as exc:
         raise HTTPException(503, detail={
             "code": "SESSION_METADATA_UNAVAILABLE", "message": "PDF metadata processing is temporarily unavailable.",
+        }) from exc
+
+    except SessionStorageLimitError as exc:
+        raise HTTPException(413, detail={
+            "code": "RENDER_SESSION_STORAGE_LIMIT",
+            "message": "Render-session storage capacity is full or this PDF exceeds the supported size.",
         }) from exc
 
     except ValueError as exc:

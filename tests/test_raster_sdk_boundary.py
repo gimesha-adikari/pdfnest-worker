@@ -79,7 +79,7 @@ def installed_sdk():
     assert sys.prefix != sys.base_prefix, "a disposable virtualenv is required"
     assert Path(os.environ["F11_INSTALLED_ENV_ROOT"]).resolve() == Path(sys.prefix).resolve()
     distribution = importlib.metadata.distribution("platen-document")
-    assert distribution.version == "0.1.9"
+    assert distribution.version == "0.1.10rc1"
     expected = Path(sysconfig.get_path("purelib")) / "platen_document/__init__.py"
     assert Path(platen_document.__file__).resolve() == expected.resolve()
     assert expected.resolve().is_relative_to(Path(sys.prefix).resolve())
@@ -136,7 +136,7 @@ def test_installed_sdk_rejects_editable_metadata(monkeypatch):
     installed_sdk()
     distribution = importlib.metadata.distribution("platen-document")
     monkeypatch.setattr(importlib.metadata, "distribution", lambda name: SimpleNamespace(
-        version="0.1.9", locate_file=distribution.locate_file,
+        version="0.1.10rc1", locate_file=distribution.locate_file,
         read_text=lambda name: '{"dir_info": {"editable": true}}',
     ))
     with pytest.raises(AssertionError, match="source/editable"):

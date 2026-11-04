@@ -12,8 +12,13 @@ def main():
     from app.core.native_child import apply_resource_limits
     from app.core.native_isolation import CHILD_MEMORY, CHILD_CPU
     apply_resource_limits()
-    assert resource.getrlimit(resource.RLIMIT_AS)[0] == CHILD_MEMORY
-    assert resource.getrlimit(resource.RLIMIT_CPU)[0] == CHILD_CPU
+    for kind, ceiling in ((resource.RLIMIT_AS, CHILD_MEMORY), (resource.RLIMIT_CPU, CHILD_CPU)):
+        soft, hard = resource.getrlimit(kind)
+        # An enclosing test runner may impose a tighter inherited hard limit.
+        # The child must preserve that stronger ceiling instead of raising it.
+        assert 0 < soft <= ceiling
+        assert 0 < hard <= ceiling
+        assert soft <= hard
     root, mode = Path(sys.argv[1]), sys.argv[2]
     (root / "child.pid").write_text(str(os.getpid()))
     if mode in {"hang", "crash_tree"}:
