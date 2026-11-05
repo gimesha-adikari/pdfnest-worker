@@ -23,7 +23,7 @@ PROCESSING_POSTS = frozenset({
     '/api/v1/metadata/write', '/api/v1/metadata/preserve', '/api/v1/redact', '/api/v1/sign',
 })
 CONTROL_GETS = frozenset({
-    '/', '/home', '/health', '/health/live', '/health/ready', '/docs', '/docs/oauth2-redirect',
+    '/', '/home', '/health', '/health/live', '/health/ready', '/internal/health/ready', '/docs', '/docs/oauth2-redirect',
     '/openapi.json', '/redoc', '/internal/ocr/v2/capabilities', '/api/v1/ocr/languages',
     '/api/v1/render/metrics', '/api/v1/jobs',
 })
