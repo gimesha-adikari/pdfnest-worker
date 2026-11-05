@@ -23,7 +23,9 @@ from tests.test_render_session_metadata import (
 from tests.test_native_execution_domain import FakeController
 
 SECRET = "f15-render-synthetic-secret"
-CREATE = "/api/v1/render/sessions"
+CREATE_PATH = "/api/v1/render/sessions"
+CREATE_SCOPE = hashlib.sha256(b"synthetic-f15-owner").hexdigest()
+CREATE = f"{CREATE_PATH}?dedup_scope={CREATE_SCOPE}"
 
 
 @pytest.fixture
@@ -126,12 +128,12 @@ async def test_signed_session_lifecycle_and_empty_body_controls(manager, authent
         assert manager.get(identifier).file_path.read_bytes() == data
         duplicate, _ = await signed_request(http, data=data)
         assert (await http.send(duplicate)).json()["session_id"] == identifier
-        outgoing, _ = await signed_request(http, "GET", f"{CREATE}/{identifier}/page/2?dpi=72")
+        outgoing, _ = await signed_request(http, "GET", f"{CREATE_PATH}/{identifier}/page/2?dpi=72")
         rendered = await http.send(outgoing)
         assert rendered.status_code == 200, rendered.text
         image = Image.open(io.BytesIO(rendered.content))
         assert image.format == "JPEG" and image.size == (200, 100)
-        outgoing, _ = await signed_request(http, "DELETE", f"{CREATE}/{identifier}")
+        outgoing, _ = await signed_request(http, "DELETE", f"{CREATE_PATH}/{identifier}")
         assert (await http.send(outgoing)).json() == {"deleted": True}
     assert not manager._sessions and not list(session.SESSION_ROOT.iterdir())
     assert authentication and all(spool.closed for spool in authentication)
@@ -253,7 +255,8 @@ async def test_verified_request_disconnect_or_cancel_reaps_metadata(
 
     scope = {
         "type": "http", "http_version": "1.1", "method": "POST", "scheme": "http",
-        "path": CREATE, "raw_path": CREATE.encode(), "query_string": b"",
+        "path": CREATE_PATH, "raw_path": CREATE_PATH.encode(),
+        "query_string": f"dedup_scope={CREATE_SCOPE}".encode(),
         "server": ("127.0.0.1", 8000), "client": ("127.0.0.1", 1234),
         "headers": [(key.lower(), value) for key, value in outgoing.headers.raw],
     }

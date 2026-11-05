@@ -175,6 +175,7 @@ def test_store_failure_has_no_memory_fallback_or_secret_error():
     ('GET', '/health/ready', RouteKind.CONTROL),
     ('GET', '/health/live', RouteKind.CONTROL),
     ('GET', '/health', RouteKind.CONTROL),
+    ('GET', '/internal/health/ready', RouteKind.CONTROL),
     ('GET', '/', RouteKind.CONTROL),
     ('GET', '/internal/ocr/v2/capabilities', RouteKind.CONTROL),
     ('GET', '/api/v1/ocr/languages', RouteKind.CONTROL),

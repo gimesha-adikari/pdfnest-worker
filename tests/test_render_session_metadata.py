@@ -371,7 +371,7 @@ async def test_disconnect_cancels_real_metadata_child(manager, child_probe, tmp_
     upload = UploadFile(filename="small.pdf", file=io.BytesIO(small_pdf()))
     try:
         with pytest.raises(HTTPException) as error:
-            await router.create_session(Request(), upload)
+            await router.create_session(Request(), upload, dedup_scope="a" * 64)
         assert error.value.status_code == 499
     finally:
         await upload.close()
@@ -517,7 +517,10 @@ async def test_safe_http_errors(manager, monkeypatch, failure, status, code):
     local = FastAPI()
     local.include_router(router.router)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=local), base_url="http://127.0.0.1") as client:
-        response = await client.post("/api/v1/render/sessions", files={"file": ("small.pdf", small_pdf(), "application/pdf")})
+        response = await client.post(
+            "/api/v1/render/sessions?dedup_scope=" + "a" * 64,
+            files={"file": ("small.pdf", small_pdf(), "application/pdf")},
+        )
     assert response.status_code == status
     assert response.json()["detail"]["code"] == code
     assert "/private" not in response.text
@@ -530,7 +533,10 @@ async def test_http_success_shape_unchanged(manager):
     local.include_router(router.router)
     data = small_pdf(2)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=local), base_url="http://127.0.0.1") as client:
-        response = await client.post("/api/v1/render/sessions", files={"file": ("small.pdf", data, "application/pdf")})
+        response = await client.post(
+            "/api/v1/render/sessions?dedup_scope=" + "a" * 64,
+            files={"file": ("small.pdf", data, "application/pdf")},
+        )
     assert response.status_code == 200
     assert set(response.json()) == {"session_id", "page_count", "file_size"}
     assert response.json()["page_count"] == 2

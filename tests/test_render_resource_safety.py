@@ -1,5 +1,6 @@
 import asyncio
 import io
+import time
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -148,8 +149,18 @@ async def test_timeout_kills_descendant_after_child_exits_with_pipe_open(monkeyp
     except ProcessLookupError:
         return
     try:
-        stat = open(f"/proc/{descendant}/stat", encoding="utf-8").read().split()
-        assert stat[2] == "Z", "the process-group descendant must be dead, not running"
+        # SIGKILL delivery is asynchronous. Wait for exit or zombie state
+        # rather than racing the kernel immediately after the render returns.
+        deadline = time.monotonic() + 2
+        while True:
+            try:
+                stat = open(f"/proc/{descendant}/stat", encoding="utf-8").read().split()
+            except FileNotFoundError:
+                break
+            if stat[2] == "Z":
+                break
+            assert time.monotonic() < deadline, "the process-group descendant must be dead, not running"
+            time.sleep(0.01)
     finally:
         try:
             os.kill(descendant, 9)

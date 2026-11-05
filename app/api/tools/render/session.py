@@ -495,7 +495,10 @@ class RenderSessionManager:
                         existing.last_accessed_at = time.time()
                         return existing
                 if len(self._sessions) >= MAX_SESSIONS:
-                    self._evict_oldest_locked()
+                    if not self._evict_oldest_locked(dedup_scope):
+                        raise SessionStorageLimitError(
+                            "render-session count limit is full for this owner"
+                        )
                 now = time.time()
                 session = RenderSession(
                     session_id=session_id,
@@ -674,17 +677,20 @@ class RenderSessionManager:
 
             return None
 
-    def _evict_oldest_locked(self) -> None:
-        if not self._sessions:
-            return
+    def _evict_oldest_locked(self, dedup_scope: str | None = None) -> bool:
+        candidates = [
+            session
+            for session in self._sessions.values()
+            if dedup_scope is None or session.dedup_scope == dedup_scope
+        ]
+        if not candidates:
+            return False
 
-        oldest = min(
-            self._sessions.values(),
-            key=lambda item: item.last_accessed_at,
-        )
+        oldest = min(candidates, key=lambda item: item.last_accessed_at)
 
         path = self._schedule_session_deletion_locked(oldest)
         self._retry_pending_deletions_locked({path})
+        return True
 
     def _cleanup_expired_locked(self) -> None:
         now = time.time()

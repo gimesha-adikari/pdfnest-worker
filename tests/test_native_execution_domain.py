@@ -8,6 +8,8 @@ import pytest
 
 from app.core import native_domain as d
 
+DEDUP_SCOPE = "a" * 64
+
 
 class FakeController:
     """Deterministic trusted test double. Never registered by application code."""
@@ -659,7 +661,7 @@ def test_metadata_http_refusal_is_safe_and_creates_no_session(monkeypatch, tmp_p
     monkeypatch.setattr(session_metadata.tempfile, 'tempdir', str(temporary))
     app = FastAPI();app.include_router(router.router)
     with TestClient(app) as client:
-        response = client.post('/api/v1/render/sessions', files={
+        response = client.post(f'/api/v1/render/sessions?dedup_scope={DEDUP_SCOPE}', files={
             'file': ('synthetic.pdf', b'%PDF-1.4\nsynthetic', 'application/pdf')})
     assert response.status_code == 503
     assert response.json() == {'detail': {
@@ -995,7 +997,7 @@ def test_metadata_http_capacity_mapping_distinguishes_atomic_busy(controller, mo
     monkeypatch.setattr(service, 'session_manager', manager)
     app = FastAPI();app.include_router(router.router)
     with TestClient(app) as client:
-        response = client.post('/api/v1/render/sessions', files={
+        response = client.post(f'/api/v1/render/sessions?dedup_scope={DEDUP_SCOPE}', files={
             'file': ('synthetic.pdf', b'%PDF-1.4\nsynthetic', 'application/pdf')})
     assert response.status_code == (429 if atomic else 503)
     assert response.json()['detail']['code'] == ('SESSION_METADATA_BUSY' if atomic else 'SESSION_METADATA_UNAVAILABLE')
