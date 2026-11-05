@@ -5,12 +5,14 @@ from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import io
 import time
+from types import SimpleNamespace
 from fastapi.testclient import TestClient
 import fitz
 import pytest
 
 from app.main import app
 from app.api.tools.render import service as render_service
+from app.api.tools.render import router as render_router
 from app.api.tools.render import session as render_session
 from tests.test_security import generate_headers, signed_post
 
@@ -29,11 +31,13 @@ def _create_sample_pdf_bytes(num_pages: int = 3) -> bytes:
 
 def test_render_session_lifecycle():
     pdf_bytes = _create_sample_pdf_bytes(3)
+    dedup_scope = "c" * 64
 
     # 1. Create Session
-    headers1 = generate_headers("POST", "/api/v1/render/sessions")
+    create_path = f"/api/v1/render/sessions?dedup_scope={dedup_scope}"
+    headers1 = generate_headers("POST", create_path)
     res_session = signed_post(client,
-        "/api/v1/render/sessions",
+        create_path,
         files={"file": ("test.pdf", pdf_bytes, "application/pdf")},
         headers=headers1,
     )
@@ -44,9 +48,9 @@ def test_render_session_lifecycle():
     session_id = data["session_id"]
 
     # 2. Duplicate Session Creation (SHA256 Deduplication test)
-    headers2 = generate_headers("POST", "/api/v1/render/sessions")
+    headers2 = generate_headers("POST", create_path)
     res_session_dup = signed_post(client,
-        "/api/v1/render/sessions",
+        create_path,
         files={"file": ("test.pdf", pdf_bytes, "application/pdf")},
         headers=headers2,
     )
@@ -168,6 +172,32 @@ def test_render_session_deduplication_is_scoped_and_cleanup_is_independent(monke
     finally:
         manager.delete(different_session.session_id)
         manager.delete(same_content_new_scope.session_id)
+
+
+@pytest.mark.parametrize(
+    ("request_path", "expected_status"),
+    [
+        ("/api/v1/render/sessions", 422),
+        ("/api/v1/render/sessions?dedup_scope=global", 400),
+    ],
+)
+def test_render_session_creation_rejects_missing_or_shared_owner_scope(request_path, expected_status, monkeypatch):
+    called = False
+
+    async def create_without_native_processing(file, dedup_scope):
+        nonlocal called
+        called = True
+        return SimpleNamespace(session_id="synthetic", page_count=1, file_size=32)
+
+    monkeypatch.setattr(render_router, "create_render_session", create_without_native_processing)
+    response = signed_post(
+        client,
+        request_path,
+        files={"file": ("synthetic.pdf", b"%PDF-1.4 synthetic", "application/pdf")},
+    )
+
+    assert response.status_code == expected_status
+    assert called is False
 
 
 def test_render_session_capacity_and_expiration_remain_bounded(monkeypatch, tmp_path):
