@@ -97,8 +97,7 @@ def child_probe(tmp_path, monkeypatch):
 
     def launch(command, **kwargs):
         child = [sys.executable, "-m", "tests.render_metadata_probes", str(root), state["mode"]]
-        guardian = "from app.core.native_supervisor import main;import sys;sys.exit(main(" + repr(child) + "))"
-        return actual([sys.executable, "-c", guardian, command[3], str(os.getpid())], **kwargs)
+        return actual([sys.executable, "-m", "app.api.tools.render.supervisor", str(os.getpid()), *child], **kwargs)
 
     monkeypatch.setattr(subprocess_runner.subprocess, "Popen", popen)
     monkeypatch.setattr(subprocess_runner, "run_hardened_subprocess", launch)
@@ -222,17 +221,17 @@ async def test_failed_child_output_is_bounded_and_clean(manager, child_probe, tm
 
 @pytest.mark.anyio
 async def test_cancel_and_repeat_cancel_join_cleanup(manager, child_probe, tmp_path, monkeypatch):
-    from app.core import subprocess_runner
+    from app.api.tools.render.supervisor import PreviewProcessControl
     child_probe["mode"] = "hang"
     entered, release = threading.Event(), threading.Event()
-    actual = subprocess_runner.kill_process_group
+    actual = PreviewProcessControl.cancel
 
     def stop(*args, **kwargs):
         entered.set()
         assert release.wait(10)
         return actual(*args, **kwargs)
 
-    monkeypatch.setattr(subprocess_runner, "kill_process_group", stop)
+    monkeypatch.setattr(PreviewProcessControl, "cancel", stop)
     task = asyncio.create_task(create(small_pdf()))
     try:
         await wait_for_marker(child_probe["root"] / "ready")

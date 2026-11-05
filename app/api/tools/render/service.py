@@ -1,12 +1,14 @@
 import asyncio
 import os
-import signal
+import functools
+import subprocess
+import threading
 import sys
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
-from fastapi import UploadFile
+from fastapi import HTTPException, UploadFile
 
 from app.core.config import settings
 from .persistent_pool import (
@@ -17,24 +19,26 @@ from .persistent_pool import (
 from .renderer import validate_preview_dpi
 from .session import RenderSession, session_manager, sha256_file
 from .session_metadata import session_file_io
+from .child_limits import MAX_RENDER_CHILD_FILE_BYTES
 
 
 MAX_RENDER_CHILD_CAPTURE_BYTES = 64 * 1024
+MAX_RENDER_INPUT_BYTES = 64 * 1024 * 1024
+MAX_RENDER_OUTPUT_BYTES = MAX_RENDER_CHILD_FILE_BYTES
 
 
-async def _read_bounded(stream, limit: int = MAX_RENDER_CHILD_CAPTURE_BYTES) -> tuple[bytes, bool]:
-    """Drain a child pipe continuously while retaining only a bounded prefix."""
-    output = bytearray()
-    truncated = False
+async def _read_render_upload(file: UploadFile) -> bytes:
+    data = bytearray()
     while True:
-        chunk = await stream.read(8192)
+        chunk = await file.read(min(1024 * 1024, MAX_RENDER_INPUT_BYTES + 1 - len(data)))
         if not chunk:
-            return bytes(output), truncated
-        available = limit - len(output)
-        if available > 0:
-            output.extend(chunk[:available])
-        if len(chunk) > available:
-            truncated = True
+            return bytes(data)
+        if len(data) + len(chunk) > MAX_RENDER_INPUT_BYTES:
+            raise HTTPException(413, detail={
+                "code": "RENDER_INPUT_TOO_LARGE",
+                "message": "PDF exceeds the supported preview size.",
+            })
+        data.extend(chunk)
 
 
 async def render_page_to_jpeg_bytes_subprocess(
@@ -46,25 +50,30 @@ async def render_page_to_jpeg_bytes_subprocess(
         clip_x1: float | None = None,
         clip_y1: float | None = None,
         pdf_path: Path | None = None,
+        storage_scope: str = "global",
 ) -> Tuple[bytes, Dict[str, Any]]:
     """
     Certified Phase 3F/3G isolated subprocess renderer.
     Renders a PDF page in a clean, disposable subprocess.
     """
-    temp_in = tempfile.NamedTemporaryFile(prefix="pdfnest-render-in-", suffix=".pdf", delete=False)
-    temp_out = tempfile.NamedTemporaryFile(prefix="pdfnest-render-out-", suffix=".jpg", delete=False)
-
-    in_path = Path(temp_in.name)
-    out_path = Path(temp_out.name)
-    proc = None
+    from .session import SESSION_ROOT
+    input_reservation = session_manager.reserve_storage(storage_scope)
+    output_reservation = session_manager.reserve_storage(storage_scope)
+    directory = None
+    cancelled = threading.Event()
 
     try:
         validate_preview_dpi(dpi)
+        # Input, output, sessions and failed removals consume the same atomic
+        # budget. Reserve the maximum output before permitting native work.
+        input_reservation.extend(len(pdf_bytes) if pdf_path is None else 0)
+        output_reservation.extend(MAX_RENDER_OUTPUT_BYTES)
+        directory = Path(tempfile.mkdtemp(prefix="pdfnest-render-job-", dir=SESSION_ROOT))
+        in_path = directory / "input.pdf"
+        out_path = directory / "output.jpg"
         if pdf_path is None:
-            temp_in.write(pdf_bytes)
-        temp_in.flush()
-        temp_in.close()
-        temp_out.close()
+            await session_file_io(in_path.write_bytes, pdf_bytes)
+        out_path.touch(mode=0o600)
 
         cmd = [
             sys.executable,
@@ -78,6 +87,8 @@ async def render_page_to_jpeg_bytes_subprocess(
             str(page),
             "--dpi",
             str(dpi),
+            "--owner-pid",
+            str(os.getpid()),
         ]
         if clip_x0 is not None:
             cmd.extend(["--clip-x0", str(clip_x0)])
@@ -88,74 +99,69 @@ async def render_page_to_jpeg_bytes_subprocess(
         if clip_y1 is not None:
             cmd.extend(["--clip-y1", str(clip_y1)])
 
-        stdout_task = None
-        stderr_task = None
+        from app.core.subprocess_runner import run_hardened_subprocess
+        from .session import _SESSION_ROOT_LOCK
+        from .limiter import render_limiter
+
+        def check_cancelled():
+            if cancelled.is_set():
+                raise RuntimeError("preview operation cancelled")
+
+        operation = functools.partial(
+            run_hardened_subprocess, cmd,
+            timeout=render_limiter.render_timeout,
+            cancellation_check=check_cancelled,
+            max_output_bytes=MAX_RENDER_CHILD_CAPTURE_BYTES,
+            truncate_output=True,
+            preview_root_fd=_SESSION_ROOT_LOCK.fileno(),
+            preview_drain_marker=str(directory / "writer.drained"),
+        )
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                start_new_session=True,
-            )
-            stdout_task = asyncio.create_task(_read_bounded(proc.stdout))
-            stderr_task = asyncio.create_task(_read_bounded(proc.stderr))
-            wait_task = asyncio.create_task(proc.wait())
-            collect_task = asyncio.gather(stdout_task, stderr_task, wait_task)
-            from .limiter import render_limiter
-            (stdout, stdout_truncated), (stderr, stderr_truncated), _ = await asyncio.wait_for(
-                asyncio.shield(collect_task), render_limiter.render_timeout
-            )
-        except BaseException:
-            # The leader may have exited while a descendant keeps the inherited
-            # pipe open. Kill the whole process group even when returncode is set.
-            if proc is not None:
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except (ProcessLookupError, OSError):
-                    pass
-            if proc is not None and proc.returncode is None:
-                try:
-                    await proc.wait()
-                except Exception:
-                    pass
-            await asyncio.gather(*(task for task in (stdout_task, stderr_task) if task is not None), return_exceptions=True)
-            raise
+            result = await session_file_io(operation, cancelled=cancelled)
+        except subprocess.TimeoutExpired as exc:
+            raise asyncio.TimeoutError() from exc
 
-        if proc is None:
-            raise RuntimeError("Render process did not start")
-
-        if proc.returncode != 0:
-            err_msg = stderr.decode(errors="replace").strip()
-            if stderr_truncated:
+        truncated = result.capture_truncated
+        if result.returncode != 0:
+            err_msg = result.stderr.strip()
+            if truncated["stderr"]:
                 err_msg += " [child stderr truncated]"
-            if proc.returncode == 3 or "Invalid page" in err_msg or "Page number must be" in err_msg or "DPI must be" in err_msg or "Empty file" in err_msg or "PDF contains no pages" in err_msg:
+            if result.returncode == 3 or any(text in err_msg for text in (
+                "Invalid page", "Page number must be", "DPI must be", "Empty file", "PDF contains no pages",
+            )):
                 raise ValueError(err_msg)
-            raise RuntimeError(f"Render process failed with code {proc.returncode}: {err_msg}")
+            raise RuntimeError(f"Render process failed with code {result.returncode}: {err_msg}")
 
         if not out_path.exists() or out_path.stat().st_size == 0:
             raise RuntimeError("Render process did not generate output JPEG")
 
+        # Check the intermediate file before allocating it in the API. Retain
+        # a bounded read too, so a changing file cannot bypass the stat check.
+        if out_path.stat().st_size > MAX_RENDER_OUTPUT_BYTES:
+            raise RuntimeError("Rendered output exceeds the preview byte limit")
+        with out_path.open("rb") as rendered:
+            image_bytes = rendered.read(MAX_RENDER_OUTPUT_BYTES + 1)
+        if len(image_bytes) > MAX_RENDER_OUTPUT_BYTES:
+            raise RuntimeError("Rendered output exceeds the preview byte limit")
+
         child_metrics = {}
-        if stdout and not stdout_truncated:
+        if result.stdout and not truncated["stdout"]:
             import json
             try:
-                child_metrics = json.loads(stdout.decode().strip())
+                child_metrics = json.loads(result.stdout.strip())
             except Exception:
                 pass
 
-        return out_path.read_bytes(), child_metrics
+        return image_bytes, child_metrics
 
     finally:
-        if proc is not None:
-            # A successful child can leave descendants running after closing
-            # inherited pipes. The PID namespace is not part of this renderer,
-            # so terminate the owned process group on success as well as error.
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except (ProcessLookupError, OSError):
-                pass
-        in_path.unlink(missing_ok=True)
-        out_path.unlink(missing_ok=True)
+        if directory is None:
+            input_reservation.release()
+            output_reservation.release()
+        else:
+            session_manager.cleanup_render_staging(in_path, input_reservation)
+            session_manager.cleanup_render_staging(out_path, output_reservation)
+            session_manager.cleanup_render_directory(directory)
 
 
 async def render_page_to_jpeg_bytes(
@@ -174,7 +180,7 @@ async def render_page_to_jpeg_bytes(
 
     validate_preview_dpi(dpi)
 
-    pdf_bytes = await file.read()
+    pdf_bytes = await _read_render_upload(file)
 
     if not pdf_bytes:
         raise ValueError("Empty file uploaded")
@@ -323,13 +329,13 @@ async def get_render_session_page(
 
     validate_preview_dpi(dpi)
 
-    session = session_manager.get(session_id)
-
-    # No retained image cache or native document use in the API process.
-    # Deletion/expiry may remove the path before the child opens it: fail safely.
-    image_bytes, _ = await render_page_to_jpeg_bytes_subprocess(
-        pdf_bytes=b"", pdf_path=session.file_path, page=page, dpi=dpi,
-    )
+    # Keep source liability until the child is reaped. Logical deletion makes
+    # the session inaccessible immediately; physical cleanup waits for readers.
+    with session_manager.render_source(session_id) as session:
+        image_bytes, _ = await render_page_to_jpeg_bytes_subprocess(
+            pdf_bytes=b"", pdf_path=session.file_path, page=page, dpi=dpi,
+            storage_scope=session.dedup_scope,
+        )
     return image_bytes
 
 

@@ -126,6 +126,12 @@ async def render_page(
     except HTTPException:
         raise
 
+    except SessionStorageLimitError as exc:
+        raise HTTPException(413, detail={
+            "code": "RENDER_SESSION_STORAGE_LIMIT",
+            "message": "Preview storage capacity is full. Retry shortly.",
+        }) from exc
+
     except ValueError as exc:
         raise HTTPException(
             status_code=400,
@@ -250,6 +256,12 @@ async def render_session_page(
 
     except HTTPException:
         raise
+
+    except SessionStorageLimitError as exc:
+        raise HTTPException(413, detail={
+            "code": "RENDER_SESSION_STORAGE_LIMIT",
+            "message": "Preview storage capacity is full. Retry shortly.",
+        }) from exc
 
     except KeyError as exc:
         raise HTTPException(

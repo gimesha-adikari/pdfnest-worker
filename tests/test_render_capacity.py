@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests.render_guardian_probes import patch_render_child
+
 import asyncio
 import io
 import time
@@ -232,18 +234,9 @@ async def test_http_endpoint_underlying_subprocess_termination_on_timeout(monkey
     render_limiter.render_timeout = 0.15
     render_limiter.reset_metrics()
 
-    spawned_pid = None
-    orig_create_subprocess = asyncio.create_subprocess_exec
-
+    children = []
     try:
-        async def slow_create_subprocess(*args, **kwargs):
-            nonlocal spawned_pid
-            slow_cmd = [sys.executable, "-c", "import time; time.sleep(10)"]
-            proc = await orig_create_subprocess(*slow_cmd, **kwargs)
-            spawned_pid = proc.pid
-            return proc
-
-        monkeypatch.setattr(service.asyncio, "create_subprocess_exec", slow_create_subprocess)
+        children = patch_render_child(monkeypatch, lambda command: [sys.executable, "-c", "import time;time.sleep(10)"])
 
         pdf_bytes = _create_sample_pdf_bytes(num_pages=1)
 
@@ -260,9 +253,9 @@ async def test_http_endpoint_underlying_subprocess_termination_on_timeout(monkey
             assert resp.json()["detail"]["code"] == "RENDER_TIMEOUT"
 
             # 3. Verify child process existed and is now TERMINATED (no orphan process)
-            assert spawned_pid is not None, "Child process was never spawned"
+            assert children, "Child process was never spawned"
             with pytest.raises(ProcessLookupError):
-                os.kill(spawned_pid, 0)
+                os.kill(children[0].pid, 0)
 
             # 4. Verify limiter slot was released
             assert render_limiter.active_renders == 0

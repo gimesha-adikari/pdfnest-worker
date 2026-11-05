@@ -17,8 +17,25 @@ def main() -> None:
     parser.add_argument("--clip-y0", type=float, default=None)
     parser.add_argument("--clip-x1", type=float, default=None)
     parser.add_argument("--clip-y1", type=float, default=None)
+    parser.add_argument("--owner-pid", type=int, default=None)
 
     args = parser.parse_args()
+
+    if args.owner_pid is not None:
+        import os
+        from .supervisor import supervise, ROOT_LOCK_FD_ENV, CANCEL_FD_ENV, DRAIN_FD_ENV
+        from .limiter import HARD_MAX_RENDER_TIMEOUT_SECONDS
+        child_args = sys.argv[1:]
+        owner_index = child_args.index("--owner-pid")
+        del child_args[owner_index:owner_index + 2]
+        sys.exit(supervise(
+            [sys.executable, "-m", "app.api.tools.render.render_cli", *child_args],
+            owner_pid=args.owner_pid,
+            root_lock_fd=int(os.environ[ROOT_LOCK_FD_ENV]),
+            cancel_fd=int(os.environ[CANCEL_FD_ENV]),
+            drain_fd=int(os.environ[DRAIN_FD_ENV]),
+            wall_timeout=HARD_MAX_RENDER_TIMEOUT_SECONDS,
+        ))
 
     input_path = Path(args.input)
     output_path = Path(args.output)
@@ -30,7 +47,10 @@ def main() -> None:
     try:
         apply_render_child_limits()
         from .renderer import render_pdf_page_to_jpeg
-        pdf_bytes = input_path.read_bytes()
+        with input_path.open("rb") as source:
+            pdf_bytes = source.read(MAX_RENDER_CHILD_FILE_BYTES + 1)
+        if len(pdf_bytes) > MAX_RENDER_CHILD_FILE_BYTES:
+            raise ValueError("PDF exceeds the preview input-size limit")
         jpeg_bytes = render_pdf_page_to_jpeg(
             pdf_bytes=pdf_bytes,
             page_number=args.page,

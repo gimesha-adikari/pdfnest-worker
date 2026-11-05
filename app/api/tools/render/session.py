@@ -5,11 +5,14 @@ import fcntl
 import hashlib
 import os
 import re
+import shlex
 import shutil
 import stat
+import sys
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -102,6 +105,15 @@ def _claim_session_root(root: Path):
             if re.fullmatch(r"[0-9a-f]{32}", entry.name):
                 if not stat.S_ISDIR(entry.lstat().st_mode):
                     raise RuntimeError("unexpected render session artifact type")
+                if (entry / "writer.active").exists() and not (entry / "writer.drained").exists():
+                    raise RuntimeError("render writer drainage is unverified at restart")
+                _remove_managed_path(entry)
+                continue
+            if re.fullmatch(r"pdfnest-render-job-[a-z0-9_]{8}", entry.name):
+                if not stat.S_ISDIR(entry.lstat().st_mode):
+                    raise RuntimeError("unexpected render intermediate artifact type")
+                if (entry / "writer.active").exists() and not (entry / "writer.drained").exists():
+                    raise RuntimeError("render writer drainage is unverified at restart")
                 _remove_managed_path(entry)
                 continue
             if re.fullmatch(r"pdfnest-session-upload-[^/]+\.pdf", entry.name):
@@ -118,6 +130,64 @@ def _claim_session_root(root: Path):
 
 
 _SESSION_ROOT_LOCK = _claim_session_root(SESSION_ROOT)
+_SESSION_ROOT_OWNER_PID = os.getpid()
+_SESSION_ROOT_QUARANTINED = False
+
+
+def quarantine_render_root() -> None:
+    global _SESSION_ROOT_QUARANTINED
+    _SESSION_ROOT_QUARANTINED = True
+
+
+def assert_render_process_owner() -> None:
+    # A preloaded server can inherit both the flock's open description and the
+    # in-memory accounting. Never let a fork use either before taking a lock.
+    if os.getpid() != _SESSION_ROOT_OWNER_PID:
+        raise RuntimeError("render manager cannot be used by a forked API process")
+    if _SESSION_ROOT_QUARANTINED:
+        raise RuntimeError("render storage is quarantined after unverified writer drainage")
+
+
+def validate_render_topology() -> None:
+    """Fail closed for declared scaling; local budgets have no shared backend.
+
+    The replica declaration is an operator contract, not discovery of remote
+    instances. Independent filesystems cannot be coordinated by the root lock.
+    """
+    from app.core.config import is_managed_environment, settings
+    assert_render_process_owner()
+    for name in ("WEB_CONCURRENCY", "UVICORN_WORKERS", "PDFNEST_RENDER_REPLICAS"):
+        value = os.getenv(name)
+        if value is None:
+            continue
+        try:
+            count = int(value)
+        except ValueError as exc:
+            raise RuntimeError(f"{name} must be 1: render budgets require a single API process and replica") from exc
+        if count != 1:
+            raise RuntimeError(f"{name} must be 1: shared render admission is not implemented")
+    try:
+        server_args = shlex.split(os.getenv("GUNICORN_CMD_ARGS", ""))
+    except ValueError as exc:
+        raise RuntimeError("GUNICORN_CMD_ARGS must declare a single API worker") from exc
+    if Path(sys.argv[0]).name in ("uvicorn", "gunicorn"):
+        server_args += sys.argv[1:]
+    for index, argument in enumerate(server_args):
+        if argument in ("--workers", "-w"):
+            value = server_args[index + 1] if index + 1 < len(server_args) else ""
+        elif argument.startswith("--workers="):
+            value = argument.split("=", 1)[1]
+        elif argument.startswith("-w") and len(argument) > 2:
+            value = argument[2:]
+        else:
+            continue
+        if value != "1":
+            raise RuntimeError("server worker arguments must select 1 process; shared render admission is not implemented")
+    if is_managed_environment() and os.getenv("PDFNEST_RENDER_REPLICAS") is None:
+        raise RuntimeError("PDFNEST_RENDER_REPLICAS=1 is required in managed environments; shared render admission is not implemented")
+    if is_managed_environment():
+        if settings.enable_persistent_render_pool:
+            raise RuntimeError("persistent render pool lacks the required disposable-child resource limits")
 
 
 @dataclass
@@ -131,6 +201,7 @@ class RenderSession:
     last_accessed_at: float
     dedup_scope: str = "global"
     document: PdfRenderDocument | None = None
+    active_renders: int = 0
     lock: threading.RLock = field(default_factory=threading.RLock)
 
 
@@ -184,15 +255,18 @@ class RenderSessionManager:
 
     @property
     def used_bytes(self) -> int:
+        assert_render_process_owner()
         with self._lock:
             return self._committed_bytes + self._reserved_bytes
 
     def reserve_storage(self, scope: str) -> SessionStorageReservation:
+        assert_render_process_owner()
         with self._lock:
             self._retry_pending_deletions_locked()
             return SessionStorageReservation(self, scope)
 
     def _extend_reservation(self, reservation: SessionStorageReservation, amount: int) -> None:
+        assert_render_process_owner()
         if type(amount) is not int or amount < 0:
             raise SessionStorageLimitError("invalid render-session storage reservation")
         if amount == 0:
@@ -218,6 +292,7 @@ class RenderSessionManager:
             self._reserved_by_scope[reservation.scope] = self._reserved_by_scope.get(reservation.scope, 0) + amount
 
     def _release_reservation(self, reservation: SessionStorageReservation) -> None:
+        assert_render_process_owner()
         with self._lock:
             if not reservation.active:
                 return
@@ -301,6 +376,12 @@ class RenderSessionManager:
             minimum_bytes_on_failure: int = 0,
     ) -> None:
         with self._lock:
+            if _SESSION_ROOT_QUARANTINED:
+                if retain_reservation_on_failure:
+                    self._record_unreserved_pending_locked(path, minimum_bytes_on_failure, reservation.scope)
+                else:
+                    self._commit_reservation_as_pending_locked(reservation, path, minimum_bytes_on_failure)
+                return
             if path in self._pending_deletions:
                 self._retry_pending_deletions_locked({path})
                 reservation.release()
@@ -365,6 +446,7 @@ class RenderSessionManager:
             size_hint: int = 0,
     ) -> None:
         """Remove this request's upload file or retain its reserved liability."""
+        assert_render_process_owner()
         if path is None:
             if reservation is not None:
                 reservation.release()
@@ -397,6 +479,21 @@ class RenderSessionManager:
             if reservation is not None:
                 reservation.release()
 
+    def cleanup_render_staging(self, path: Path, reservation: SessionStorageReservation) -> None:
+        """Retain byte liability when removal of a bounded render file fails."""
+        assert_render_process_owner()
+        directory = path.parent
+        if directory.parent != SESSION_ROOT or re.fullmatch(r"pdfnest-render-job-[a-z0-9_]{8}", directory.name) is None:
+            raise RuntimeError("render staging path is outside the managed root")
+        self._cleanup_unpublished_path(path, reservation)
+
+    def cleanup_render_directory(self, path: Path) -> None:
+        assert_render_process_owner()
+        if path.parent != SESSION_ROOT or re.fullmatch(r"pdfnest-render-job-[a-z0-9_]{8}", path.name) is None:
+            raise RuntimeError("render staging directory is outside the managed root")
+        reservation = self.reserve_storage("global")
+        self._cleanup_unpublished_path(path, reservation)
+
     def _schedule_session_deletion_locked(self, session: RenderSession) -> Path:
         path = session.file_path.parent
         self._sessions.pop(session.session_id, None)
@@ -409,10 +506,16 @@ class RenderSessionManager:
         return path
 
     def _retry_pending_deletions_locked(self, paths: set[Path] | None = None) -> None:
+        if _SESSION_ROOT_QUARANTINED:
+            return
         for path, pending in tuple(self._pending_deletions.items()):
             if paths is not None and path not in paths:
                 continue
             if pending.session is not None:
+                # Unlinking an open source would release accounting while a
+                # render child still pins its disk blocks through a descriptor.
+                if pending.session.active_renders:
+                    continue
                 with pending.session.lock:
                     document = pending.session.document
                     if document is not None:
@@ -439,6 +542,7 @@ class RenderSessionManager:
             dedup_scope: str = "global",
             reservation: SessionStorageReservation | None = None,
     ) -> RenderSession:
+        assert_render_process_owner()
         supplied_reservation = reservation is not None
         if reservation is None:
             reservation = self.reserve_storage(dedup_scope)
@@ -550,6 +654,7 @@ class RenderSessionManager:
             dedup_scope: str = "global",
             reservation: SessionStorageReservation | None = None,
     ) -> RenderSession:
+        assert_render_process_owner()
         key = (sha256, dedup_scope)
         max_waiters = 16
         wait_timeout = 25.0
@@ -629,6 +734,7 @@ class RenderSessionManager:
                     raise inflight.error
 
     def get(self, session_id: str) -> RenderSession:
+        assert_render_process_owner()
         with self._lock:
             self._cleanup_expired_locked()
 
@@ -639,7 +745,21 @@ class RenderSessionManager:
             session.last_accessed_at = time.time()
             return session
 
+    @contextmanager
+    def render_source(self, session_id: str):
+        assert_render_process_owner()
+        with self._lock:
+            session = self.get(session_id)
+            session.active_renders += 1
+        try:
+            yield session
+        finally:
+            with self._lock:
+                session.active_renders -= 1
+                self._retry_pending_deletions_locked({session.file_path.parent})
+
     def get_optional(self, session_id: str) -> RenderSession | None:
+        assert_render_process_owner()
         with self._lock:
             self._cleanup_expired_locked()
 
@@ -651,6 +771,7 @@ class RenderSessionManager:
             return session
 
     def delete(self, session_id: str) -> None:
+        assert_render_process_owner()
         with self._lock:
             session = self._sessions.get(session_id)
             if session is not None:
@@ -667,6 +788,7 @@ class RenderSessionManager:
                 self._retry_pending_deletions_locked({pending_path})
 
     def find_by_hash(self, sha256: str, dedup_scope: str = "global") -> RenderSession | None:
+        assert_render_process_owner()
         with self._lock:
             self._cleanup_expired_locked()
 

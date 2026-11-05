@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests.render_guardian_probes import patch_render_child
+
 import asyncio
 import hashlib
 import threading
@@ -577,3 +579,366 @@ async def test_cancelled_upload_releases_reservation_and_removes_partial_file(mo
 
     assert manager.used_bytes == 0
     assert list(root.iterdir()) == []
+
+
+@pytest.mark.parametrize("name", ["WEB_CONCURRENCY", "UVICORN_WORKERS", "PDFNEST_RENDER_REPLICAS"])
+@pytest.mark.parametrize("value", ["2", "0", "invalid"])
+def test_render_topology_rejects_unsafe_or_unknown_counts(monkeypatch, name, value):
+    for key in ("WEB_CONCURRENCY", "UVICORN_WORKERS", "PDFNEST_RENDER_REPLICAS"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv(name, value)
+    with pytest.raises(RuntimeError, match=name):
+        session.validate_render_topology()
+
+
+def test_production_requires_explicit_single_replica_declaration(monkeypatch):
+    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.delenv("PDFNEST_RENDER_REPLICAS", raising=False)
+    with pytest.raises(RuntimeError, match="PDFNEST_RENDER_REPLICAS"):
+        session.validate_render_topology()
+    monkeypatch.setenv("PDFNEST_RENDER_REPLICAS", "1")
+    session.validate_render_topology()
+
+
+def test_forked_manager_rejects_admission_and_access_without_touching_parent(monkeypatch, tmp_path):
+    import os
+    root = tmp_path / "sessions"
+    root.mkdir()
+    monkeypatch.setattr(session, "SESSION_ROOT", root)
+    manager = session.RenderSessionManager()
+    existing = _register_synthetic_session(manager, root, "1" * 32, "owner", b"pdf")
+    pid = os.fork()
+    if pid == 0:
+        try:
+            for operation in (lambda: manager.reserve_storage("owner"),
+                              lambda: manager.get(existing.session_id),
+                              lambda: manager.delete(existing.session_id)):
+                try:
+                    operation()
+                except RuntimeError:
+                    continue
+                os._exit(2)
+            os._exit(0)
+        except BaseException:
+            os._exit(3)
+    _, status = os.waitpid(pid, 0)
+    assert os.waitstatus_to_exitcode(status) == 0
+    assert manager.get(existing.session_id) is existing
+    assert existing.file_path.read_bytes() == b"pdf"
+    assert manager.used_bytes == 3
+
+
+def test_process_lock_rejects_peer_and_restart_reconciles_killed_owner(tmp_path):
+    import os
+    import signal
+    import subprocess
+    import sys
+    root = tmp_path / "sessions"
+    env = {**os.environ, "PDFNEST_RENDER_SESSION_DIR": str(root), "APP_ENV": "test"}
+    owner_script = (
+        "from app.api.tools.render.session import SESSION_ROOT; import time; "
+        "p=SESSION_ROOT/('a'*32); p.mkdir(); (p/'source.pdf').write_bytes(b'orphan'); "
+        "(SESSION_ROOT/'pdfnest-session-upload-crashed.pdf').write_bytes(b'partial'); "
+        "d=SESSION_ROOT/'pdfnest-render-job-abcdefgh'; d.mkdir(); (d/'output.jpg').write_bytes(b'partial render'); "
+        "print('ready',flush=True); time.sleep(60)"
+    )
+    owner = subprocess.Popen([sys.executable, "-c", owner_script], env=env,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        import select
+        assert select.select([owner.stdout], [], [], 10)[0], "owner did not become ready"
+        assert owner.stdout.readline().strip() == "ready"
+        peer = subprocess.run([sys.executable, "-c", "import app.api.tools.render.session"],
+                              env=env, capture_output=True, text=True, timeout=10)
+        assert peer.returncode != 0
+        assert "already owned" in peer.stderr
+        assert (root / ("a" * 32) / "source.pdf").exists()
+        owner.send_signal(signal.SIGKILL)
+        owner.wait(timeout=10)
+        restarted = subprocess.run(
+            [sys.executable, "-c", "from app.api.tools.render.session import SESSION_ROOT; "
+             "assert sorted(p.name for p in SESSION_ROOT.iterdir()) == ['.manager.lock']"],
+            env=env, capture_output=True, text=True, timeout=10)
+        assert restarted.returncode == 0, restarted.stderr
+    finally:
+        owner.kill() if owner.poll() is None else None
+        owner.communicate(timeout=10)
+
+
+def test_production_rejects_unbounded_persistent_pool(monkeypatch):
+    from dataclasses import replace
+    from app.core import config
+    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.setenv("PDFNEST_RENDER_REPLICAS", "1")
+    monkeypatch.setattr(config, "settings", replace(config.settings, enable_persistent_render_pool=True))
+    with pytest.raises(RuntimeError, match="persistent render pool"):
+        session.validate_render_topology()
+
+
+@pytest.mark.anyio
+async def test_render_intermediates_reserve_shared_budget_before_child(monkeypatch, tmp_path):
+    root = tmp_path / "sessions"
+    root.mkdir()
+    monkeypatch.setattr(session, "SESSION_ROOT", root)
+    manager = session.RenderSessionManager()
+    monkeypatch.setattr(service, "session_manager", manager)
+    monkeypatch.setattr(session, "MAX_SESSION_TOTAL_BYTES", 10)
+    monkeypatch.setattr(service, "MAX_RENDER_OUTPUT_BYTES", 8)
+    existing = _register_synthetic_session(manager, root, "2" * 32, "owner-a", b"pdf")
+    async def forbidden_child(*_args, **_kwargs):
+        pytest.fail("native child started without storage capacity")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", forbidden_child)
+    with pytest.raises(session.SessionStorageLimitError):
+        await service.render_page_to_jpeg_bytes_subprocess(b"%PDF", 1, 72)
+    assert manager.used_bytes == 3
+    assert manager.get(existing.session_id) is existing
+    assert sorted(p.name for p in root.iterdir()) == ["2" * 32]
+
+
+@pytest.mark.anyio
+async def test_render_failed_output_cleanup_retains_liability(monkeypatch, tmp_path):
+    import sys
+    root = tmp_path / "sessions"
+    root.mkdir()
+    monkeypatch.setattr(session, "SESSION_ROOT", root)
+    manager = session.RenderSessionManager()
+    monkeypatch.setattr(service, "session_manager", manager)
+    monkeypatch.setattr(service, "MAX_RENDER_OUTPUT_BYTES", 8)
+    def render(command):
+        output = command[command.index("--output") + 1]
+        return [sys.executable, "-c", "import sys;open(sys.argv[1],'wb').write(b'jpeg')", output]
+    patch_render_child(monkeypatch, render)
+    original_remove = session._remove_managed_path
+    def fail_output_and_directory(path):
+        if path.name == "output.jpg" or path.name.startswith("pdfnest-render-job-"):
+            raise OSError("synthetic removal denial")
+        return original_remove(path)
+    with monkeypatch.context() as patch:
+        patch.setattr(session, "_remove_managed_path", fail_output_and_directory)
+        assert (await service.render_page_to_jpeg_bytes_subprocess(b"%PDF", 1, 72))[0] == b"jpeg"
+        assert manager.used_bytes == 8, "full reserved output remains charged until removal is verified"
+        assert len(list(root.glob("*/output.jpg"))) == 1
+    retry = manager.reserve_storage("owner")
+    retry.release()
+    assert manager.used_bytes == 0
+    assert list(root.iterdir()) == []
+
+
+@pytest.mark.parametrize("arguments", ["--workers 2", "--workers=2", "-w2", "-w 2"])
+def test_render_topology_rejects_server_cli_multiprocess(monkeypatch, arguments):
+    import shlex
+    import sys
+    monkeypatch.setattr(sys, "argv", ["uvicorn", "app.main:app", *shlex.split(arguments)])
+    with pytest.raises(RuntimeError, match="worker arguments"):
+        session.validate_render_topology()
+
+
+def test_render_topology_rejects_gunicorn_multiprocess_environment(monkeypatch):
+    monkeypatch.setenv("GUNICORN_CMD_ARGS", "--workers 2")
+    with pytest.raises(RuntimeError, match="worker arguments"):
+        session.validate_render_topology()
+
+
+@pytest.mark.anyio
+async def test_concurrent_render_intermediates_cannot_overadmit_shared_budget(monkeypatch, tmp_path):
+    import sys
+    root = tmp_path / "sessions"
+    root.mkdir()
+    monkeypatch.setattr(session, "SESSION_ROOT", root)
+    manager = session.RenderSessionManager()
+    monkeypatch.setattr(service, "session_manager", manager)
+    monkeypatch.setattr(session, "MAX_SESSION_TOTAL_BYTES", 20)
+    monkeypatch.setattr(service, "MAX_RENDER_OUTPUT_BYTES", 8)
+    started, release = tmp_path / "started", tmp_path / "release"
+    def render(command):
+        output = command[command.index("--output") + 1]
+        script = "import sys,time;from pathlib import Path;Path(sys.argv[2]).touch();\nwhile not Path(sys.argv[3]).exists():time.sleep(.01)\nPath(sys.argv[1]).write_bytes(b'jpeg')"
+        return [sys.executable, "-c", script, output, str(started), str(release)]
+    patch_render_child(monkeypatch, render)
+    first = asyncio.create_task(service.render_page_to_jpeg_bytes_subprocess(b"%PDF", 1, 72))
+    try:
+        async with asyncio.timeout(5):
+            while not started.exists(): await asyncio.sleep(.01)
+        assert manager.used_bytes == 12
+        with pytest.raises(session.SessionStorageLimitError):
+            await service.render_page_to_jpeg_bytes_subprocess(b"%PDF", 1, 72)
+        assert manager.used_bytes == 12
+        assert len(list(root.iterdir())) == 1
+        release.touch()
+        assert (await first)[0] == b"jpeg"
+    finally:
+        release.touch()
+        first.cancel()
+        await asyncio.gather(first, return_exceptions=True)
+    assert manager.used_bytes == 0
+    assert list(root.iterdir()) == []
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("cleanup", ["delete", "expiry", "eviction"])
+async def test_open_render_source_keeps_deletion_liability_until_child_reaped(monkeypatch, tmp_path, cleanup):
+    import sys
+    root = tmp_path / "sessions"
+    root.mkdir()
+    monkeypatch.setattr(session, "SESSION_ROOT", root)
+    manager = session.RenderSessionManager()
+    monkeypatch.setattr(service, "session_manager", manager)
+    monkeypatch.setattr(service, "MAX_RENDER_OUTPUT_BYTES", 8)
+    existing = _register_synthetic_session(manager, root, "3" * 32, "owner-a", b"pdf")
+    marker, release = tmp_path / "opened", tmp_path / "release"
+    def render(command):
+        source = command[command.index("--input") + 1]
+        output = command[command.index("--output") + 1]
+        script = (
+            "import sys,time; from pathlib import Path; f=open(sys.argv[1],'rb'); "
+            "Path(sys.argv[3]).touch(); "
+            "\nwhile not Path(sys.argv[4]).exists(): time.sleep(.01)\n"
+            "assert f.read()==b'pdf'; f.close(); Path(sys.argv[2]).write_bytes(b'jpeg')"
+        )
+        return [sys.executable, "-c", script, source, output, str(marker), str(release)]
+    children = patch_render_child(monkeypatch, render)
+    task = asyncio.create_task(service.get_render_session_page(existing.session_id, 1, 72))
+    try:
+        async with asyncio.timeout(5):
+            while not marker.exists():
+                await asyncio.sleep(.01)
+        if cleanup == "delete":
+            manager.delete(existing.session_id)
+        elif cleanup == "expiry":
+            existing.last_accessed_at = 0
+            manager.get_optional(existing.session_id)
+        else:
+            with manager._lock:
+                assert manager._evict_oldest_locked("owner-a")
+        assert manager.get_optional(existing.session_id) is None
+        assert existing.file_path.exists(), "open-source blocks must remain charged and managed"
+        assert manager.used_bytes == existing.file_size + 8
+        assert existing.active_renders == 1
+        release.touch()
+        assert await task == b"jpeg"
+        assert children[0].returncode is not None
+        assert existing.active_renders == 0
+        assert manager.used_bytes == 0
+        assert list(root.iterdir()) == []
+    finally:
+        release.touch()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize("environment", [" production ", "staging", "canary", " production", "PRODUCTION "])
+def test_managed_environment_cannot_bypass_topology_guards(monkeypatch, environment):
+    from dataclasses import replace
+    from app.core import config
+    monkeypatch.setenv("APP_ENV", environment)
+    monkeypatch.delenv("PDFNEST_RENDER_REPLICAS", raising=False)
+    with pytest.raises(RuntimeError, match="PDFNEST_RENDER_REPLICAS"):
+        session.validate_render_topology()
+    monkeypatch.setenv("PDFNEST_RENDER_REPLICAS", "1")
+    monkeypatch.setattr(config, "settings", replace(config.settings, enable_persistent_render_pool=True))
+    with pytest.raises(RuntimeError, match="persistent render pool"):
+        session.validate_render_topology()
+
+
+@pytest.mark.parametrize("artifact", ["4" * 32, "pdfnest-render-job-abcdefgh"])
+def test_restart_refuses_unverified_writer_even_after_root_lock_is_released(tmp_path, artifact):
+    root = tmp_path / "sessions"
+    directory = root / artifact
+    directory.mkdir(parents=True)
+    (directory / "writer.active").touch()
+    (directory / "source.pdf").write_bytes(b"writer-owned bytes")
+    with pytest.raises(RuntimeError, match="drainage is unverified"):
+        session._claim_session_root(root)
+    assert (directory / "source.pdf").read_bytes() == b"writer-owned bytes"
+    # Only the actual guardian's post-reap receipt permits automatic recovery.
+    (directory / "writer.drained").touch()
+    lock = session._claim_session_root(root)
+    lock.close()
+    assert not directory.exists()
+
+
+def test_missing_guardian_drain_receipt_quarantines_bytes_and_admission(tmp_path, monkeypatch):
+    from app.api.tools.render.supervisor import PreviewProcessControl
+    root = tmp_path / "sessions"
+    root.mkdir()
+    monkeypatch.setattr(session, "SESSION_ROOT", root)
+    monkeypatch.setattr(session, "_SESSION_ROOT_QUARANTINED", False)
+    manager = session.RenderSessionManager()
+    existing = _register_synthetic_session(manager, root, "5" * 32, "owner", b"retained")
+    control = PreviewProcessControl(session._SESSION_ROOT_LOCK.fileno())
+    try:
+        control.started = True
+        with pytest.raises(RuntimeError, match="drainage is unverified"):
+            control.verify()
+        with pytest.raises(RuntimeError, match="quarantined"):
+            manager.reserve_storage("owner")
+        with pytest.raises(RuntimeError, match="quarantined"):
+            manager.delete(existing.session_id)
+        assert existing.file_path.read_bytes() == b"retained"
+        assert manager._committed_bytes == existing.file_size
+    finally:
+        control.close()
+
+
+def test_root_flock_survives_api_and_guardian_death_in_actual_writer(tmp_path):
+    import os
+    import signal
+    import subprocess
+    import sys
+    from app.controller.linux import pidfd_open, pidfd_signal
+    root = tmp_path / "sessions"
+    guardian_marker, writer_marker = tmp_path / "guardian.pid", tmp_path / "writer.pid"
+    env = {**os.environ, "APP_ENV": "test", "PDFNEST_RENDER_SESSION_DIR": str(root)}
+    writer = ("import os,time; from pathlib import Path; "
+              f"Path({str(writer_marker)!r}).write_text(str(os.getpid())); time.sleep(60)")
+    owner_script = (
+        "import os,subprocess,sys,time; from pathlib import Path; "
+        "from app.api.tools.render.session import _SESSION_ROOT_LOCK,SESSION_ROOT; "
+        "from app.api.tools.render.supervisor import PreviewProcessControl; "
+        "d=SESSION_ROOT/'pdfnest-render-job-abcdefgh'; d.mkdir(); "
+        "c=PreviewProcessControl(_SESSION_ROOT_LOCK.fileno(),d/'writer.drained'); "
+        f"p=subprocess.Popen([sys.executable,'-m','app.api.tools.render.supervisor',str(os.getpid()),sys.executable,'-c',{writer!r}],"
+        "env=c.environment(os.environ),pass_fds=c.pass_fds); "
+        f"Path({str(guardian_marker)!r}).write_text(str(p.pid)); time.sleep(60)"
+    )
+    owner = subprocess.Popen([sys.executable, "-c", owner_script], env=env,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    handles = []
+    try:
+        deadline = time.monotonic() + 10
+        while not writer_marker.exists():
+            assert owner.poll() is None
+            assert time.monotonic() < deadline
+            time.sleep(.01)
+        guardian_pid = int(guardian_marker.read_text())
+        writer_pid = int(writer_marker.read_text())
+        guardian_fd, writer_fd = pidfd_open(guardian_pid), pidfd_open(writer_pid)
+        handles += [guardian_fd, writer_fd]
+        pidfd_signal(guardian_fd, signal.SIGSTOP)
+        owner.kill()
+        owner.wait(timeout=5)
+        peer_command = [sys.executable, "-c", "import app.api.tools.render.session"]
+        peer = subprocess.run(peer_command, env=env, capture_output=True, text=True, timeout=10)
+        assert peer.returncode != 0 and "already owned" in peer.stderr
+        pidfd_signal(guardian_fd, signal.SIGKILL)
+        time.sleep(.05)
+        peer = subprocess.run(peer_command, env=env, capture_output=True, text=True, timeout=10)
+        assert peer.returncode != 0 and "already owned" in peer.stderr, "actual writer must retain the inherited root lock"
+        pidfd_signal(writer_fd, signal.SIGKILL)
+        deadline = time.monotonic() + 3
+        while True:
+            peer = subprocess.run(peer_command, env=env, capture_output=True, text=True, timeout=10)
+            if "already owned" not in peer.stderr:
+                break
+            assert time.monotonic() < deadline
+        assert peer.returncode != 0 and "drainage is unverified" in peer.stderr
+    finally:
+        if owner.poll() is None:
+            owner.kill()
+        owner.wait(timeout=5)
+        for descriptor in handles:
+            try:
+                pidfd_signal(descriptor, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            os.close(descriptor)
