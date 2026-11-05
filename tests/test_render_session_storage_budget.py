@@ -1027,3 +1027,24 @@ def test_legacy_root_with_unlocked_old_native_writer_is_rejected_unchanged(tmp_p
         if writer.poll() is None:
             writer.kill()
         writer.wait(timeout=5)
+
+
+def test_fifo_root_protocol_marker_is_rejected_without_blocking_or_mutation(tmp_path):
+    import os
+    import stat
+    import subprocess
+    import sys
+    root = tmp_path / "fifo-root"
+    root.mkdir(mode=0o755)
+    marker = root / session.ROOT_PROTOCOL_MARKER
+    os.mkfifo(marker, 0o600)
+    root_mode, marker_inode = root.stat().st_mode, marker.lstat().st_ino
+    environment = {**os.environ, "PDFNEST_RENDER_SESSION_DIR": str(root), "APP_ENV": "test"}
+    result = subprocess.run([sys.executable, "-c", "import app.api.tools.render.session"],
+                            env=environment, capture_output=True, text=True, timeout=5)
+    assert result.returncode != 0
+    assert "unsupported render session root protocol" in result.stderr
+    assert root.stat().st_mode == root_mode
+    assert marker.lstat().st_ino == marker_inode
+    assert stat.S_ISFIFO(marker.lstat().st_mode)
+    assert set(root.iterdir()) == {marker}, "rejection must precede manager-lock or version initialization"
