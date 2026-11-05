@@ -43,6 +43,24 @@ MAX_SESSIONS = _bounded_positive_env("PDFNEST_RENDER_MAX_SESSIONS", 32, 32)
 MAX_SESSION_FILE_BYTES = _bounded_positive_env("PDFNEST_RENDER_MAX_SESSION_BYTES", 64 * 1024 * 1024, 64 * 1024 * 1024)
 MAX_SESSION_OWNER_BYTES = _bounded_positive_env("PDFNEST_RENDER_MAX_OWNER_BYTES", 128 * 1024 * 1024, 128 * 1024 * 1024)
 MAX_SESSION_TOTAL_BYTES = _bounded_positive_env("PDFNEST_RENDER_MAX_TOTAL_BYTES", 256 * 1024 * 1024, 256 * 1024 * 1024)
+ROOT_PROTOCOL_MARKER = ".render-root-protocol"
+ROOT_PROTOCOL_VERSION = b"pdfnest-render-root-v1\n"
+
+
+def _root_protocol_exists(root: Path) -> bool:
+    try:
+        descriptor = os.open(root / ROOT_PROTOCOL_MARKER, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise RuntimeError("unsupported render session root protocol") from exc
+    with os.fdopen(descriptor, "rb") as marker:
+        info = os.fstat(marker.fileno())
+        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                or info.st_size != len(ROOT_PROTOCOL_VERSION)
+                or marker.read(len(ROOT_PROTOCOL_VERSION) + 1) != ROOT_PROTOCOL_VERSION):
+            raise RuntimeError("unsupported render session root protocol")
+    return True
 
 
 def _remove_managed_path(path: Path) -> None:
@@ -72,16 +90,20 @@ def _claim_session_root(root: Path):
     """Own one session root and remove only known stale session artifacts.
 
     Storage accounting is process-local. A nonblocking process lock makes that
-    limit meaningful by refusing a second manager process on the same local
-    session filesystem. The lock is released by the OS after a crash; the next
-    process can then safely remove orphaned session directories and upload
-    staging files before accepting work.
+    limit meaningful by refusing a second manager on the same local filesystem.
+    Writers inherit that lock; versioned recovery also checks their drain
+    markers. Only an empty root can join this protocol. A nonempty legacy root
+    cannot prove its old writers are gone and must remain untouched.
     """
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     root_stat = root.lstat()
     if not stat.S_ISDIR(root_stat.st_mode):
         raise RuntimeError("render session root must be a real directory")
-    root.chmod(0o700)
+    # Older managers did not pass their flock to native writers. Their missing
+    # lock owner cannot prove that a nonempty legacy root is safe to reconcile.
+    # Reject before creating/chmodding anything in that root.
+    if not _root_protocol_exists(root) and any(root.iterdir()):
+        raise RuntimeError("nonempty unversioned render session root is unsupported")
 
     lock_path = root / ".manager.lock"
     flags = os.O_CREAT | os.O_RDWR
@@ -93,14 +115,30 @@ def _claim_session_root(root: Path):
         raise RuntimeError("unable to open render session manager lock") from exc
     lock_file = os.fdopen(lock_fd, "r+b", closefd=True)
     try:
-        os.fchmod(lock_file.fileno(), 0o600)
         try:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             raise RuntimeError("render session root is already owned by another process") from exc
 
+        if not _root_protocol_exists(root):
+            if {entry.name for entry in root.iterdir()} != {".manager.lock"}:
+                raise RuntimeError("nonempty unversioned render session root is unsupported")
+            descriptor = os.open(root / ROOT_PROTOCOL_MARKER,
+                                 os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(descriptor, "wb") as marker:
+                marker.write(ROOT_PROTOCOL_VERSION)
+                marker.flush()
+                os.fsync(marker.fileno())
+            directory_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        os.fchmod(lock_file.fileno(), 0o600)
+        root.chmod(0o700)
+
         for entry in root.iterdir():
-            if entry.name == ".manager.lock":
+            if entry.name in (".manager.lock", ROOT_PROTOCOL_MARKER):
                 continue
             if re.fullmatch(r"[0-9a-f]{32}", entry.name):
                 if not stat.S_ISDIR(entry.lstat().st_mode):

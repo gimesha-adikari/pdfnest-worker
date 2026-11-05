@@ -71,9 +71,13 @@ intermediate and reservation liabilities. Empty per-job active/drained journal
 markers also make restart refuse an unresolved writer, even after its inherited
 lock is gone. Startup may automatically reconcile a marked job only after the
 actual guardian recorded successful drainage. No production mechanism fabricates
-a receipt or clears quarantine. Unmarked artifacts from older code retain the
-existing cleanup compatibility behavior; adopting an older root requires a
-quiescent rollout, which this code-only change does not perform or attest.
+a receipt or clears quarantine. A root protocol/version marker is initialized
+and synced only after exclusively claiming an empty root. A nonempty unversioned
+root, including a legacy lock-only root, is rejected before creating, chmodding,
+or removing anything inside it. Older writers did not inherit the manager flock,
+so an unlocked legacy root cannot prove their absence. There is no override or
+automatic adoption of legacy contents. Valid protocol roots retain the guarded
+orphan recovery described above.
 
 API output reads are independently bounded. Resource ceilings and this trusted
 guardian lifecycle are not a kernel security boundary against compromised native
@@ -93,7 +97,9 @@ oversized direct uploads and outputs, native guardian owner death, an actual OS
 file-size ceiling, repeated cancellation during subprocess creation, inherited
 root ownership after API plus guardian death, missing-receipt quarantine,
 restart refusal for unresolved writers, and bounded stopped-guardian cancellation
-in both page rendering and metadata.
+in both page rendering and metadata. Protocol regressions also retain a real old
+writer's linked source while a new process rejects its unversioned root, verify
+unchanged legacy files/permissions, and recover valid marked-root orphans.
 
 The existing owner-eviction, failed-delete, metadata/native failure, render raster,
 capacity, timeout, and recovery regressions remain part of the focused gate.

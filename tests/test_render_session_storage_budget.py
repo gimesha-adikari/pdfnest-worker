@@ -16,6 +16,7 @@ from app.api.tools.render import service, session
 
 def test_session_root_claim_cleans_stale_artifacts_and_rejects_second_manager(tmp_path: Path):
     root = tmp_path / "sessions"
+    session._claim_session_root(root).close()
     stale_session = root / "0123456789abcdef0123456789abcdef"
     stale_session.mkdir(parents=True)
     (stale_session / "source.pdf").write_bytes(b"synthetic stale data")
@@ -24,7 +25,7 @@ def test_session_root_claim_cleans_stale_artifacts_and_rejects_second_manager(tm
 
     lock = session._claim_session_root(root)
     try:
-        assert set(root.iterdir()) == {root / ".manager.lock"}
+        assert set(root.iterdir()) == {root / ".manager.lock", root / session.ROOT_PROTOCOL_MARKER}
         with pytest.raises(RuntimeError, match="already owned"):
             session._claim_session_root(root)
     finally:
@@ -33,6 +34,7 @@ def test_session_root_claim_cleans_stale_artifacts_and_rejects_second_manager(tm
 
 def test_session_root_restart_fails_closed_when_orphan_cleanup_fails(tmp_path: Path, monkeypatch):
     root = tmp_path / "sessions"
+    session._claim_session_root(root).close()
     orphan = root / "0123456789abcdef0123456789abcdef"
     orphan.mkdir(parents=True)
     (orphan / "source.pdf").write_bytes(b"synthetic orphan")
@@ -51,7 +53,7 @@ def test_session_root_restart_fails_closed_when_orphan_cleanup_fails(tmp_path: P
     lock = session._claim_session_root(root)
     try:
         assert not orphan.exists()
-        assert set(root.iterdir()) == {root / ".manager.lock"}
+        assert set(root.iterdir()) == {root / ".manager.lock", root / session.ROOT_PROTOCOL_MARKER}
     finally:
         lock.close()
 
@@ -657,7 +659,7 @@ def test_process_lock_rejects_peer_and_restart_reconciles_killed_owner(tmp_path)
         owner.wait(timeout=10)
         restarted = subprocess.run(
             [sys.executable, "-c", "from app.api.tools.render.session import SESSION_ROOT; "
-             "assert sorted(p.name for p in SESSION_ROOT.iterdir()) == ['.manager.lock']"],
+             "assert sorted(p.name for p in SESSION_ROOT.iterdir()) == ['.manager.lock', '.render-root-protocol']"],
             env=env, capture_output=True, text=True, timeout=10)
         assert restarted.returncode == 0, restarted.stderr
     finally:
@@ -843,6 +845,7 @@ def test_managed_environment_cannot_bypass_topology_guards(monkeypatch, environm
 @pytest.mark.parametrize("artifact", ["4" * 32, "pdfnest-render-job-abcdefgh"])
 def test_restart_refuses_unverified_writer_even_after_root_lock_is_released(tmp_path, artifact):
     root = tmp_path / "sessions"
+    session._claim_session_root(root).close()
     directory = root / artifact
     directory.mkdir(parents=True)
     (directory / "writer.active").touch()
@@ -942,3 +945,85 @@ def test_root_flock_survives_api_and_guardian_death_in_actual_writer(tmp_path):
             except ProcessLookupError:
                 pass
             os.close(descriptor)
+
+
+def test_root_protocol_is_initialized_on_empty_root_and_allows_marked_orphan_recovery(tmp_path):
+    root = tmp_path / "sessions"
+    claimed = session._claim_session_root(root)
+    marker = root / session.ROOT_PROTOCOL_MARKER
+    assert marker.read_bytes() == session.ROOT_PROTOCOL_VERSION
+    marker_inode = marker.stat().st_ino
+    claimed.close()
+    orphan = root / "pdfnest-session-upload-marked-orphan.pdf"
+    orphan.write_bytes(b"partial upload")
+    restarted = session._claim_session_root(root)
+    restarted.close()
+    assert not orphan.exists()
+    assert marker.read_bytes() == session.ROOT_PROTOCOL_VERSION
+    assert marker.stat().st_ino == marker_inode
+
+
+@pytest.mark.parametrize("artifact", [".manager.lock", "pdfnest-session-upload-legacy.pdf", "6" * 32])
+def test_nonempty_unversioned_root_is_rejected_without_modification(tmp_path, artifact):
+    root = tmp_path / "legacy"
+    root.mkdir(mode=0o755)
+    path = root / artifact
+    if len(artifact) == 32:
+        path.mkdir()
+        (path / "source.pdf").write_bytes(b"legacy document")
+    else:
+        path.write_bytes(b"legacy bytes")
+    before = {str(p.relative_to(root)): (p.stat().st_mode, p.stat().st_ino, p.stat().st_mtime_ns)
+              for p in [root, *root.rglob("*")]}
+    with pytest.raises(RuntimeError, match="nonempty unversioned"):
+        session._claim_session_root(root)
+    after = {str(p.relative_to(root)): (p.stat().st_mode, p.stat().st_ino, p.stat().st_mtime_ns)
+             for p in [root, *root.rglob("*")]}
+    assert after == before
+    assert not (root / session.ROOT_PROTOCOL_MARKER).exists()
+
+
+def test_legacy_root_with_unlocked_old_native_writer_is_rejected_unchanged(tmp_path):
+    import os
+    import subprocess
+    import sys
+    root = tmp_path / "legacy"
+    root.mkdir(mode=0o755)
+    directory = root / ("7" * 32)
+    directory.mkdir()
+    source = directory / "source.pdf"
+    source.write_bytes(b"legacy source")
+    (root / ".manager.lock").write_bytes(b"old lock inode")
+    opened, release = tmp_path / "opened", tmp_path / "release"
+    script = (
+        "import sys,time;from pathlib import Path;f=open(sys.argv[1],'r+b');"
+        "Path(sys.argv[2]).touch();"
+        "\nwhile not Path(sys.argv[3]).exists():time.sleep(.01)\n"
+        "f.seek(0,2);f.write(b'+writer');f.flush();f.close()"
+    )
+    writer = subprocess.Popen([sys.executable, "-c", script, str(source), str(opened), str(release)])
+    try:
+        deadline = time.monotonic() + 5
+        while not opened.exists():
+            assert writer.poll() is None
+            assert time.monotonic() < deadline
+            time.sleep(.01)
+        before_mode, before_inode = root.stat().st_mode, source.stat().st_ino
+        env = {**os.environ, "PDFNEST_RENDER_SESSION_DIR": str(root), "APP_ENV": "test"}
+        newcomer = subprocess.run([sys.executable, "-c", "import app.api.tools.render.session"],
+                                 env=env, capture_output=True, text=True, timeout=10)
+        assert newcomer.returncode != 0 and "nonempty unversioned" in newcomer.stderr
+        assert root.stat().st_mode == before_mode
+        assert source.stat().st_ino == before_inode
+        assert source.read_bytes() == b"legacy source"
+        assert (root / ".manager.lock").read_bytes() == b"old lock inode"
+        assert not (root / session.ROOT_PROTOCOL_MARKER).exists()
+        release.touch()
+        writer.wait(timeout=5)
+        assert writer.returncode == 0
+        assert source.read_bytes() == b"legacy source+writer", "the old writer must retain its linked source"
+    finally:
+        release.touch()
+        if writer.poll() is None:
+            writer.kill()
+        writer.wait(timeout=5)
