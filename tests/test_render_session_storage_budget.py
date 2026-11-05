@@ -363,6 +363,45 @@ async def test_oversized_reservation_never_publishes_candidate(monkeypatch, tmp_
 
 
 @pytest.mark.anyio
+async def test_session_limit_never_evicts_another_owner(monkeypatch, tmp_path: Path):
+    root = tmp_path / "sessions"
+    monkeypatch.setattr(session, "SESSION_ROOT", root)
+    root.mkdir()
+    monkeypatch.setattr(session, "MAX_SESSIONS", 1)
+    monkeypatch.setattr(session, "MAX_SESSION_TOTAL_BYTES", 1024)
+    monkeypatch.setattr(session, "MAX_SESSION_OWNER_BYTES", 1024)
+    monkeypatch.setattr(session, "MAX_SESSION_FILE_BYTES", 1024)
+    manager = session.RenderSessionManager()
+    existing = _register_synthetic_session(
+        manager,
+        root,
+        "9" * 32,
+        "owner-a",
+        b"synthetic existing session",
+    )
+    candidate = tmp_path / "candidate.pdf"
+    candidate.write_bytes(b"synthetic candidate session")
+
+    async def inspect_one_page(_path):
+        return 1
+
+    monkeypatch.setattr(session, "inspect_page_count", inspect_one_page)
+
+    with pytest.raises(session.SessionStorageLimitError, match="full for this owner"):
+        await manager.create(
+            candidate,
+            candidate.stat().st_size,
+            hashlib.sha256(candidate.read_bytes()).hexdigest(),
+            "owner-b",
+        )
+
+    assert manager.get(existing.session_id) is existing
+    assert existing.file_path.read_bytes() == b"synthetic existing session"
+    assert manager.used_bytes == existing.file_size
+    assert manager._committed_by_scope == {"owner-a": existing.file_size}
+
+
+@pytest.mark.anyio
 async def test_dedup_hit_keeps_failed_staging_cleanup_accounted(monkeypatch, tmp_path: Path):
     root = tmp_path / "sessions"
     monkeypatch.setattr(session, "SESSION_ROOT", root)
