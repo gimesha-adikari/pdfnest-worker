@@ -139,6 +139,8 @@ class RenderConcurrencyLimiter:
         Ensures cancellation-safe and exception-safe slot release via finally.
         Yields a timings dict populated with queue_wait_ms and render_execution_ms.
         """
+        from .session import assert_render_process_owner
+        assert_render_process_owner()
         sem = self._get_semaphore()
 
         # 1. Queue Bounded Check

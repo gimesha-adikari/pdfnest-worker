@@ -85,6 +85,8 @@ def _inspect(path: Path, cancelled: threading.Event) -> int:
                     cancellation_check=check, env=env,
                     max_output_bytes=1024, cleanup_group_on_exit=True,
                     legacy_runner=run_hardened_subprocess,
+                    preview_root_fd=_preview_root_fd() if not domain.required else None,
+                    preview_drain_marker=str(path.parent / "writer.drained") if not domain.required else None,
                 )
                 domain.drain()
             if domain.required:
@@ -137,9 +139,19 @@ async def inspect_page_count(path: Path) -> int:
     return await session_file_io(_inspect, path, cancelled, cancelled=cancelled)
 
 
+def _preview_root_fd():
+    from .session import _SESSION_ROOT_LOCK, assert_render_process_owner
+    assert_render_process_owner()
+    return _SESSION_ROOT_LOCK.fileno()
+
+
 def _child(path: str) -> None:
     from app.core.native_child import apply_resource_limits
+    from .child_limits import apply_render_child_limits
     apply_resource_limits()
+    # Metadata creation shares preview admission, so it must consume the same
+    # 512 MiB / 25 CPU-second native-child budget as page rendering.
+    apply_render_child_limits()
     # Only the resource-limited disposable child imports/uses native parsing.
     import pymupdf as fitz
     from .renderer import PdfRenderDocument
@@ -162,6 +174,15 @@ def main():
     if sys.argv[1] == "--child":
         _child(sys.argv[2])
         return 0
+    from .supervisor import ROOT_LOCK_FD_ENV, CANCEL_FD_ENV, DRAIN_FD_ENV
+    if ROOT_LOCK_FD_ENV in os.environ:
+        from .supervisor import supervise
+        return supervise([sys.executable, "-m", _MODULE, "--child", sys.argv[1]],
+                         owner_pid=int(sys.argv[2]),
+                         root_lock_fd=int(os.environ[ROOT_LOCK_FD_ENV]),
+                         cancel_fd=int(os.environ[CANCEL_FD_ENV]),
+                         drain_fd=int(os.environ[DRAIN_FD_ENV]),
+                         wall_timeout=METADATA_TIMEOUT_SECONDS)
     from app.core.native_supervisor import main as supervise
     # Preserve the guardian's owner-death detection and private process group.
     return supervise([sys.executable, "-m", _MODULE, "--child", sys.argv[1]])

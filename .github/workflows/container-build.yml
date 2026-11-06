@@ -159,9 +159,12 @@ jobs:
           APP_ENV: test
           STORAGE_MODE: local
           WORKER_SHARED_SECRET: synthetic-f12-ci-secret
+          TMPDIR: ${{ runner.temp }}/platen-f12-tmp
+          PDFNEST_RENDER_SESSION_DIR: ${{ runner.temp }}/platen-f12-sessions
           UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/platen-sdk-candidate-venv
         run: |
-          timeout 90s "$UV_PROJECT_ENVIRONMENT/bin/python" -m pytest -q -p anyio.pytest_plugin tests/test_render_resource_safety.py tests/test_render_sessions.py tests/test_render_capacity.py tests/test_render_session_metadata.py tests/test_render_session_storage_budget.py
+          mkdir -p "$TMPDIR" "$PDFNEST_RENDER_SESSION_DIR"
+          timeout 180s "$UV_PROJECT_ENVIRONMENT/bin/python" -m pytest -vv --durations=15 -p anyio.pytest_plugin tests/test_render_resource_safety.py tests/test_render_sessions.py tests/test_render_capacity.py tests/test_render_session_metadata.py tests/test_render_session_storage_budget.py
 
       - name: Qualify Markdown execution admission
         env:

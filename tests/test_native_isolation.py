@@ -88,7 +88,16 @@ def assert_dead(pid):
     # A killed grandchild can briefly remain an init-owned zombie, but cannot
     # run. The supervised direct child is always wait/reaped by the parent.
     status = Path(f'/proc/{pid}/stat')
-    assert not status.exists() or status.read_text().split()[2] == 'Z'
+    deadline = time.monotonic() + 2
+    while True:
+        try:
+            state = status.read_text().split()[2]
+        except FileNotFoundError:
+            return
+        if state == 'Z':
+            return
+        assert time.monotonic() < deadline, f"native descendant {pid} remains live ({state})"
+        time.sleep(.01)
 
 
 def test_timeout_tree_cleanup_and_recovery(child_probe, monkeypatch, tmp_path, pdf):

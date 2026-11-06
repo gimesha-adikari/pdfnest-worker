@@ -54,6 +54,8 @@ validate_runtime_config()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    from app.api.tools.render.session import validate_render_topology
+    validate_render_topology()
     print(f"[{APP_NAME}] starting in {APP_ENV} mode")
     if not remote_storage_enabled():
         local_root = get_local_storage_dir()
