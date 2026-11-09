@@ -33,6 +33,7 @@ OPERATIONS.update({
     'inspect_pdf': ('app.core.native_document_helpers', 'inspect_pdf', None),
     'preview_source': ('app.core.native_document_helpers', 'preview_source', 'output_path'),
     'structured_document': ('app.core.native_document_helpers', 'structured_document', None),
+    'validate_word_edit_transport': ('app.core.word_edits', 'validate_word_edit_transport', None),
 })
 
 # Explicit exports keep the process boundary visible to type/static tools.
@@ -60,6 +61,7 @@ editor_colors = partial(execute, 'editor_colors')
 inspect_pdf = partial(execute, 'inspect_pdf')
 preview_source = partial(execute, 'preview_source')
 structured_document = partial(execute, 'structured_document')
+validate_word_edit_transport = partial(execute, 'validate_word_edit_transport')
 
 __all__ = [
     'execute_ocr_text',
@@ -86,4 +88,5 @@ __all__ = [
     'inspect_pdf',
     'preview_source',
     'structured_document',
+    'validate_word_edit_transport',
 ]

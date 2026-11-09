@@ -114,6 +114,14 @@ def arguments(operation,fixtures,tmp_path):
     if 'boxes' in p.required:values['boxes']=[{'page':1,'x':15,'y':20,'width':250,'height':30}]
     if 'max_pages' in p.required:values['max_pages']=10
     if 'page_index' in p.required:values['page_index']=0
+    if 'envelope' in p.required:
+        values['envelope']={
+            'edit_protocol':'platen_word_edits.v1',
+            'source_tracker':'owned/test/editor_source/source.pdf',
+            'extraction_job_id':'extract-test',
+            'baseline_digest':'sha256:'+'a'*64,
+            'edits':[{'page_num':1,'element_id':'line-1','word_id':'word-1','expected_original_text':'word','replacement_text':'🧪𠮷','style_override':None,'fit_policy':'preserve_neighbors'}],
+        }
     if 'layout' in p.required:values['layout']={'pages':[{'source':'NATIVE_EXTRACTION','page_num':1,'elements':[{'x':15,'y':20,'width':260,'height':35}]}]}
     if operation=='execute_ocr_markup':values['query']='F11'
     if operation in ('execute_ocr_text','execute_document_extraction','execute_pdf_to_markdown','structured_document'):values['routing_policy']='FAST'

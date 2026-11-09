@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import hashlib
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -46,6 +47,7 @@ from app.core.ocr_markup_engine import (
 from app.core.editor_ocr_engine import (
     EDITOR_OCR_CONSUMER_GENERAL_EDITOR,
     EditorOcrEngineConfigurationError,
+    configured_editor_ocr_engine,
 )
 from app.core.studio_editor_extraction_engine import (
     STUDIO_EDITOR_EXTRACTION_CONSUMER,
@@ -82,6 +84,16 @@ from app.core.native_operations import (
     execute_studio_markup_region_ocr,
     execute_legacy_editor_ocr,
     execute_legacy_markup,
+    validate_word_edit_transport,
+)
+
+from app.core.word_edits import (
+    WORD_EDIT_PROTOCOL,
+    WordEditProtocolError,
+    build_word_edit_baseline,
+    editor_engine_fingerprint,
+    native_transport_digest,
+    validate_word_edit_request,
 )
 
 logger = logging.getLogger(__name__)
@@ -123,6 +135,14 @@ def _cleanup_input_objects(keys: list[str]) -> None:
             delete_object(key)
         except Exception:
             logger.warning("OCR V2 input cleanup failed for key %s", key, exc_info=True)
+
+
+def _sha256_file(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _record_raster_failure(job_id: str, exc: Exception) -> None:
@@ -809,6 +829,7 @@ def editor_extract_job(
     try:
         check_cancellation(job_id)
         download_to_path(source_key, input_path)
+        source_sha256 = _sha256_file(input_path)
         check_cancellation(job_id)
         def report_editor_page(done: int, total: int, _page: object) -> None:
             if not ocr_v2:
@@ -848,6 +869,25 @@ def editor_extract_job(
                 result, input_path, password,
                 visible_geometry=consumer != EDITOR_OCR_CONSUMER_GENERAL_EDITOR,
                 cancellation_check=lambda: check_cancellation(job_id),
+            )
+            if _sha256_file(input_path) != source_sha256:
+                raise ValueError("source changed during extraction")
+
+        if (
+            ocr_v2
+            and consumer == EDITOR_OCR_CONSUMER_GENERAL_EDITOR
+            and type(result) is dict
+            and result.get("schema_version") == "ocr_v2_editor_layout.v1"
+            and type(result.get("pages")) is list
+        ):
+            language_mode = str(result.get("language_mode") or language_mode or "EXPLICIT")
+            selected_languages = result.get("languages") or languages or ["eng"]
+            engine_fingerprint = editor_engine_fingerprint(
+                configured_editor_ocr_engine(), language_mode, list(selected_languages)
+            )
+            result["word_edit_protocols"] = [WORD_EDIT_PROTOCOL]
+            result["word_edit_baseline"] = build_word_edit_baseline(
+                job_id, source_sha256, engine_fingerprint, result
             )
 
         # The extract layout is public editor data. Storage keys remain inside
@@ -1009,6 +1049,102 @@ def editor_compile_job(
     finally:
         release_lease(job_id, owner_identity)
         cleanup_paths(input_path, pages_json_path, output_pdf_path)
+
+
+@dramatiq.actor(queue_name="editor", max_retries=0, time_limit=600_000)
+def editor_word_edit_compile_job(job_id: str, envelope: dict[str, Any]) -> None:
+    """Validate and carry word intent to native isolation, then fail closed.
+
+    This Phase 2 actor deliberately creates no output PDF and never calls the
+    legacy whole-line compiler.
+    """
+    job = get_job(job_id)
+    if job is None:
+        return
+
+    payload = job.payload or {}
+    owner_identity = job.owner_identity or payload.get("ownerIdentity") or "guest:anonymous"
+    acquired, reason = acquire_lease(job_id, owner_identity)
+    if not acquired:
+        logger.warning("Execution capacity full (%s) for word edit job %s. Retrying...", reason, job_id)
+        raise Retry(message=f"Execution capacity full: {reason}", delay=5000)
+
+    source_path = temp_file_path(prefix="pdfnest-word-source-", suffix=".pdf")
+    update_job(
+        job_id,
+        status=JobState.running,
+        started_at=datetime.now(timezone.utc),
+        progress=0,
+        message="Word edit request validation started",
+    )
+    try:
+        check_cancellation(job_id)
+        extraction_id = envelope.get("extraction_job_id") if type(envelope) is dict else None
+        extraction = get_job(extraction_id) if type(extraction_id) is str else None
+        validated = validate_word_edit_request(envelope, extraction)
+        source_key = validated["source_tracker"]
+        download_to_path(source_key, source_path)
+        check_cancellation(job_id)
+
+        extraction_result = extraction.result or {}
+        expected_source_sha = extraction_result["word_edit_baseline"]["source_sha256"]
+        if _sha256_file(source_path) != expected_source_sha:
+            raise WordEditProtocolError("source bytes no longer match the extraction baseline")
+
+        update_job(job_id, progress=50, message="Word edit request validated against frozen extraction")
+        expected_transport_digest = native_transport_digest(validated)
+        receipt = validate_word_edit_transport(input_path=str(source_path), envelope=validated)
+        if (
+            type(receipt) is not dict
+            or receipt.get("protocol") != WORD_EDIT_PROTOCOL
+            or receipt.get("extraction_job_id") != validated["extraction_job_id"]
+            or receipt.get("baseline_digest") != validated["baseline_digest"]
+            or receipt.get("operation_count") != len(validated["edits"])
+            or receipt.get("transport_digest") != expected_transport_digest
+            or receipt.get("source_sha256") != expected_source_sha
+        ):
+            raise WordEditProtocolError("isolated word edit transport receipt did not match the validated request")
+
+        # Compilation is intentionally unsupported for Phase 2. A failed job
+        # has no artifact_key and the download route already rejects it.
+        update_job(
+            job_id,
+            status=JobState.failed,
+            finished_at=datetime.now(timezone.utc),
+            progress=100,
+            result={
+                "transport_receipt": receipt,
+                "validated_operation_count": len(validated["edits"]),
+            },
+            error="Precise PDF word compilation is not implemented yet; no PDF was produced.",
+            error_code="WORD_EDIT_COMPILATION_NOT_IMPLEMENTED",
+            message="Word edit operations reached isolated validation; compilation is not implemented",
+        )
+    except JobCancelledException:
+        update_job(job_id, status=JobState.cancelled, finished_at=datetime.now(timezone.utc), message="Word edit request cancelled")
+    except WordEditProtocolError as exc:
+        logger.warning("Rejected word edit request for job %s: %s", job_id, exc)
+        update_job(
+            job_id,
+            status=JobState.failed,
+            finished_at=datetime.now(timezone.utc),
+            error="The word edit request did not match its trusted extraction baseline.",
+            error_code="WORD_EDIT_BASELINE_MISMATCH",
+            message="Word edit baseline validation failed",
+        )
+    except Exception:
+        logger.exception("Word edit transport failed for job %s", job_id)
+        update_job(
+            job_id,
+            status=JobState.failed,
+            finished_at=datetime.now(timezone.utc),
+            error="The word edit request could not cross the isolated worker boundary.",
+            error_code="WORD_EDIT_TRANSPORT_FAILED",
+            message="Word edit transport failed",
+        )
+    finally:
+        release_lease(job_id, owner_identity)
+        cleanup_paths(source_path)
 
 
 def _markup_public_error(exc: Exception) -> tuple[str, str]:

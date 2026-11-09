@@ -60,6 +60,7 @@ PROFILES.update({
  'inspect_pdf': profile('path max_pages', 'path max_pages', 'path'),
  'preview_source': profile('input_path output_path page_index', 'input_path output_path page_index', 'input_path', 'output_path'),
  'structured_document': profile('input_path ' + LANGUAGE, 'input_path', 'input_path', callbacks=('cancellation_check','page_progress_callback')),
+ 'validate_word_edit_transport': profile('input_path envelope', 'input_path envelope', 'input_path'),
 })
 
 def plain(value, depth=0):
@@ -121,7 +122,7 @@ def options_valid(values, p):
                 raise DomainUnavailable()
             if key == 'color' and (len(value)!=3 or any(type(v) not in (int,float) or not 0<=v<=1 for v in value)):
                 raise DomainUnavailable()
-        elif key in ('layout', 'selection', 'language_usage'):
+        elif key in ('layout', 'selection', 'language_usage', 'envelope'):
             if value is not None and type(value) is not dict:
                 raise DomainUnavailable()
         elif key in ('page_index','max_pages','dpi'):
