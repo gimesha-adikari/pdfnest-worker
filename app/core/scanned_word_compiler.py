@@ -25,6 +25,20 @@ _DETECT_MARGIN = 1.5
 _CONTEXT_MARGIN = 4.0
 _PATCH_DPI = 288
 _VALIDATION_DPIS = (72, 144, 288)
+_NATIVE_FONT_ALIASES = {
+    "Helvetica": "helv",
+    "Helvetica-Bold": "hebo",
+    "Helvetica-Oblique": "heit",
+    "Helvetica-BoldOblique": "hebi",
+    "Times-Roman": "tiro",
+    "Times-Bold": "tibo",
+    "Times-Italic": "tiit",
+    "Times-BoldItalic": "tibi",
+    "Courier": "cour",
+    "Courier-Bold": "cobo",
+    "Courier-Oblique": "coit",
+    "Courier-BoldOblique": "cobi",
+}
 
 
 def compile_scanned_word_edits(
@@ -74,7 +88,12 @@ def compile_scanned_word_edits(
                 plan, refusal = _prepare_target(source, target)
                 if refusal:
                     return _refusal(refusal)
+                plan["edit_order"] = len(plans)
                 plans.append(plan)
+
+            order_error = _assign_content_order(plans, source)
+            if order_error:
+                return _refusal(order_error)
 
             # Preflight the entire edit set before modifying any page.
             for index, left in enumerate(plans):
@@ -84,29 +103,60 @@ def compile_scanned_word_edits(
 
         document = fitz.open(source_path)
         try:
+            plans_by_page: dict[int, list[dict[str, Any]]] = {}
             for plan in plans:
+                plans_by_page.setdefault(plan["page_index"], []).append(plan)
+            for page_index, page_plans in plans_by_page.items():
                 if cancellation_check:
                     cancellation_check()
-                page = document[plan["page_index"]]
-                if plan["hidden_rect"] is not None:
-                    page.add_redact_annot(plan["hidden_rect"], fill=None, cross_out=False)
-                    page.apply_redactions(images=0, graphics=0, text=0)
-                page.insert_image(
-                    plan["allowed_rect"],
-                    stream=plan["patch_png"],
-                    overlay=True,
-                    keep_proportion=False,
-                )
-                replacement = plan["edit"]["replacement_text"]
-                if replacement:
-                    page.insert_text(
-                        fitz.Point(plan["target_rect"].x0, plan["baseline"]),
-                        replacement,
-                        fontname="tibo",
-                        fontsize=plan["font_size"],
-                        color=plan["ink_color"],
-                        overlay=True,
+                page = document[page_index]
+                redactions = [plan["redaction_rect"] for plan in page_plans if plan["redaction_rect"] is not None]
+                for redaction_rect in redactions:
+                    page.add_redact_annot(redaction_rect, fill=None, cross_out=False)
+                if redactions:
+                    # PyMuPDF 1.28: images=0 and graphics=0 preserve all
+                    # existing image and vector drawing content; text=0 removes
+                    # only text whose glyph boxes intersect our preflighted
+                    # rectangles.
+                    page.apply_redactions(
+                        images=fitz.PDF_REDACT_IMAGE_NONE,
+                        graphics=fitz.PDF_REDACT_LINE_ART_NONE,
+                        text=fitz.PDF_REDACT_TEXT_REMOVE,
                     )
+                for plan in sorted(page_plans, key=lambda item: (item["insertion_slot"], item["edit_order"])):
+                    if cancellation_check:
+                        cancellation_check()
+                    replacement = plan["edit"]["replacement_text"]
+                    if plan["representation"] in {"image_scan", "searchable_scan"}:
+                        page.insert_image(
+                            plan["allowed_rect"],
+                            stream=plan["patch_png"],
+                            overlay=True,
+                            keep_proportion=False,
+                        )
+                        if replacement:
+                            plan["semantic_xref"] = _insert_semantic_text(
+                                page,
+                                plan["target_rect"].x0,
+                                plan["baseline"],
+                                replacement,
+                                fontname="tibo",
+                                fontsize=plan["font_size"],
+                                color=plan["ink_color"],
+                                render_mode=3,
+                            )
+                    elif replacement:
+                        plan["semantic_xref"] = _insert_semantic_text(
+                            page,
+                            plan["text_origin"][0],
+                            plan["text_origin"][1],
+                            replacement,
+                            fontname=plan["font_alias"],
+                            fontsize=plan["font_size"],
+                            color=plan["ink_color"],
+                            render_mode=0,
+                        )
+                _reorder_semantic_streams(document, page, page_plans)
             document.save(temporary, garbage=0, deflate=False, deflate_images=False)
         finally:
             document.close()
@@ -198,16 +248,40 @@ def _prepare_target(source: fitz.Document, resolved: dict[str, Any]) -> tuple[di
     target_rect = fitz.Rect(x0, y0, x1, y1)
     if target_rect.is_empty or not page.rect.contains(target_rect) or target_rect.width > page.rect.width * 0.5 or target_rect.height > page.rect.height * 0.15:
         return None, "UNSUPPORTED_WORD_GEOMETRY"
-    allowed_rect = fitz.Rect(x0 - _TARGET_MARGIN, y0 - _TARGET_MARGIN, x1 + _TARGET_MARGIN, y1 + _TARGET_MARGIN) & page.rect
-    detect_rect = fitz.Rect(x0 - _DETECT_MARGIN, y0 - _DETECT_MARGIN, x1 + _DETECT_MARGIN, y1 + _DETECT_MARGIN) & page.rect
-    context_rect = fitz.Rect(x0 - _CONTEXT_MARGIN, y0 - _CONTEXT_MARGIN, x1 + _CONTEXT_MARGIN, y1 + _CONTEXT_MARGIN) & page.rect
+    image_rects = _image_rects(page)
+    intersecting_images = [rect for rect in image_rects if rect.intersects(target_rect)]
+    containing_images = [rect for rect in intersecting_images if rect.contains(target_rect)]
+    if any(not rect.contains(target_rect) for rect in intersecting_images):
+        return None, "AMBIGUOUS_TARGET_REPRESENTATION"
+    if len(containing_images) > 1:
+        return None, "AMBIGUOUS_TARGET_REPRESENTATION"
+    if containing_images:
+        return _prepare_scan_target(page, resolved, page_index, target_rect)
+    return _prepare_native_target(page, resolved, page_index, target_rect)
+
+
+def _prepare_scan_target(
+    page: fitz.Page,
+    resolved: dict[str, Any],
+    page_index: int,
+    target_rect: fitz.Rect,
+) -> tuple[dict[str, Any] | None, str | None]:
+    edit = resolved["edit"]
+    allowed_rect = fitz.Rect(
+        target_rect.x0 - _TARGET_MARGIN,
+        target_rect.y0 - _TARGET_MARGIN,
+        target_rect.x1 + _TARGET_MARGIN,
+        target_rect.y1 + _TARGET_MARGIN,
+    ) & page.rect
+    detect_rect = fitz.Rect(target_rect.x0 - _DETECT_MARGIN, target_rect.y0 - _DETECT_MARGIN,
+                            target_rect.x1 + _DETECT_MARGIN, target_rect.y1 + _DETECT_MARGIN) & page.rect
+    context_rect = fitz.Rect(target_rect.x0 - _CONTEXT_MARGIN, target_rect.y0 - _CONTEXT_MARGIN,
+                             target_rect.x1 + _CONTEXT_MARGIN, target_rect.y1 + _CONTEXT_MARGIN) & page.rect
     if allowed_rect.is_empty:
         return None, "UNSUPPORTED_WORD_GEOMETRY"
-    if not _image_contains_target(page, target_rect):
-        return None, "TARGET_NOT_IMAGE_BACKED"
     if _drawing_overlaps(page, detect_rect):
         return None, "BACKGROUND_RULE_OVERLAP"
-    hidden_rect, hidden_error = _hidden_target_rect(page, target_rect, edit["expected_original_text"])
+    hidden_rect, source_word_index, hidden_error = _hidden_target_rect(page, target_rect, edit["expected_original_text"])
     if hidden_error:
         return None, hidden_error
 
@@ -234,17 +308,353 @@ def _prepare_target(source: fitz.Document, resolved: dict[str, Any]) -> tuple[di
         measured_width = fitz.get_text_length(replacement, fontname="tibo", fontsize=font_size)
         if measured_width > target_rect.width * 0.96:
             return None, "REPLACEMENT_DOES_NOT_FIT"
+        try:
+            patch = _render_replacement_patch(
+                patch,
+                allowed_px,
+                context_origin_x,
+                context_origin_y,
+                target_rect,
+                target_rect.y0 + target_rect.height * 0.80,
+                replacement,
+                font_size,
+                ink_color,
+            )
+        except Exception:
+            return None, "REPLACEMENT_RENDER_UNSUPPORTED"
+    insertion_slot = source_word_index
+    if insertion_slot is None:
+        insertion_slot, order_error = _scan_insertion_slot(page, target_rect)
+        if order_error:
+            return None, order_error
     return {
         "edit": edit,
         "page_index": page_index,
         "target_rect": target_rect,
         "allowed_rect": allowed_rect,
-        "hidden_rect": hidden_rect,
+        "replacement_rect": target_rect,
+        "redaction_rect": hidden_rect,
+        "representation": "searchable_scan" if hidden_rect is not None else "image_scan",
+        "source_word_index": source_word_index,
+        "insertion_slot": insertion_slot,
         "baseline": target_rect.y0 + target_rect.height * 0.80,
         "font_size": font_size,
         "ink_color": ink_color,
         "patch_png": _png_bytes(patch),
     }, None
+
+
+def _prepare_native_target(
+    page: fitz.Page,
+    resolved: dict[str, Any],
+    page_index: int,
+    requested_rect: fitz.Rect,
+) -> tuple[dict[str, Any] | None, str | None]:
+    edit = resolved["edit"]
+    expected = edit["expected_original_text"]
+    if any(0xFB00 <= ord(char) <= 0xFB06 for char in expected):
+        return None, "NATIVE_GLYPH_CLUSTER_UNSUPPORTED"
+    if not expected or any(ord(char) > 0x7F for char in expected):
+        return None, "NATIVE_SOURCE_TEXT_UNSUPPORTED"
+    words = page.get_text("words", sort=False)
+    matching_words: list[tuple[int, Any, fitz.Rect]] = []
+    for index, word in enumerate(words):
+        if str(word[4]) != expected:
+            continue
+        word_rect = fitz.Rect(word[:4])
+        intersection = word_rect & requested_rect
+        denominator = min(word_rect.get_area(), requested_rect.get_area())
+        if not intersection.is_empty and intersection.get_area() / max(0.01, denominator) >= 0.65:
+            matching_words.append((index, word, word_rect))
+    if not matching_words:
+        return None, "NATIVE_TARGET_NOT_FOUND"
+    if len(matching_words) != 1:
+        return None, "NATIVE_TARGET_AMBIGUOUS"
+    source_word_index, source_word, word_rect = matching_words[0]
+    traces = page.get_texttrace()
+    selected_chars: list[tuple[int, int, dict[str, Any], Any, fitz.Rect]] = []
+    for span_index, span in enumerate(traces):
+        for char_index, char in enumerate(span.get("chars", ())):
+            if len(char) < 4:
+                continue
+            glyph_rect = fitz.Rect(char[3])
+            center = fitz.Point((glyph_rect.x0 + glyph_rect.x1) / 2, (glyph_rect.y0 + glyph_rect.y1) / 2)
+            if word_rect.contains(center):
+                selected_chars.append((span_index, char_index, span, char, glyph_rect))
+    span_indices = {entry[0] for entry in selected_chars if int(entry[3][0]) != 32}
+    if not selected_chars or not span_indices:
+        return None, "NATIVE_SOURCE_GLYPHS_UNRESOLVED"
+    if len(span_indices) != 1:
+        return None, "NATIVE_STYLE_SPANS_UNSUPPORTED"
+    span_index = next(iter(span_indices))
+    span = traces[span_index]
+    glyph_chars = [entry for entry in selected_chars if entry[0] == span_index and int(entry[3][0]) != 32]
+    source_text = "".join(chr(int(entry[3][0])) for entry in glyph_chars)
+    if any(ord(char) > 0x7F for char in source_text):
+        return None, "NATIVE_GLYPH_CLUSTER_UNSUPPORTED"
+    if source_text != expected:
+        return None, "NATIVE_SOURCE_TEXT_IDENTITY_MISMATCH"
+    if span.get("type") != 0 or span.get("wmode") != 0 or tuple(span.get("dir", ())) != (1.0, 0.0):
+        return None, "NATIVE_TEXT_RENDERING_UNSUPPORTED"
+    font_name = str(span.get("font", ""))
+    font_alias = _NATIVE_FONT_ALIASES.get(font_name)
+    replacement = edit["replacement_text"]
+    if replacement and font_alias is None:
+        return None, "NATIVE_FONT_UNSUPPORTED"
+    try:
+        font = fitz.Font(fontname=font_alias) if font_alias is not None else None
+    except Exception:
+        return None, "NATIVE_FONT_UNSUPPORTED"
+    fontsize = float(span.get("size", 0.0))
+    if not math.isfinite(fontsize) or fontsize <= 0:
+        return None, "NATIVE_FONT_UNSUPPORTED"
+    origin = tuple(map(float, glyph_chars[0][3][2]))
+    color = _normalize_color(span.get("color", (0.0, 0.0, 0.0)))
+    glyph_rects = [entry[4] for entry in glyph_chars]
+    redaction_rect = _union_rects(glyph_rects)
+    selected_ids = {(entry[0], entry[1]) for entry in glyph_chars}
+    for other_span_index, other_span in enumerate(traces):
+        for other_index, char in enumerate(other_span.get("chars", ())):
+            if len(char) < 4 or (other_span_index, other_index) in selected_ids or int(char[0]) == 32:
+                continue
+            other_rect = fitz.Rect(char[3])
+            if _overlap_area(other_rect, redaction_rect) > 0.05:
+                return None, "NATIVE_GLYPH_OVERLAP"
+
+    replacement_extent = None
+    if replacement:
+        if not replacement.strip():
+            return None, "UNSUPPORTED_REPLACEMENT_TEXT"
+        if not all(font.has_glyph(ord(char)) for char in replacement):
+            return None, "NATIVE_FONT_GLYPH_UNSUPPORTED"
+        projected_glyphs = _project_font_glyphs(font, replacement, origin, fontsize)
+        if not projected_glyphs:
+            return None, "UNSUPPORTED_REPLACEMENT_TEXT"
+        replacement_extent = _union_rects(projected_glyphs)
+        same_line_neighbors: list[fitz.Rect] = []
+        for other_span_index, other_span in enumerate(traces):
+            for other_index, char in enumerate(other_span.get("chars", ())):
+                if len(char) < 4 or (other_span_index, other_index) in selected_ids or int(char[0]) == 32:
+                    continue
+                other_origin = char[2]
+                other_rect = fitz.Rect(char[3])
+                if abs(float(other_origin[1]) - origin[1]) <= fontsize * 0.30:
+                    same_line_neighbors.append(other_rect)
+        next_glyph_x = min(
+            (rect.x0 for rect in same_line_neighbors if rect.x0 >= word_rect.x1 - 0.05),
+            default=page.rect.x1,
+        )
+        text_width = font.text_length(replacement, fontsize)
+        if origin[0] + text_width > next_glyph_x - 0.35:
+            return None, "REPLACEMENT_DOES_NOT_FIT"
+        if any(_overlap_area(projected, neighbor) > 0.05 for projected in projected_glyphs for neighbor in same_line_neighbors):
+            return None, "NATIVE_REPLACEMENT_COLLISION"
+        if replacement_extent.x0 < page.rect.x0 or replacement_extent.y0 < page.rect.y0 or replacement_extent.x1 > page.rect.x1 or replacement_extent.y1 > page.rect.y1:
+            return None, "UNSUPPORTED_WORD_GEOMETRY"
+    allowed_rect = fitz.Rect(word_rect)
+    if replacement_extent is not None:
+        allowed_rect |= replacement_extent
+    if any(rect.intersects(allowed_rect) for rect in _image_rects(page)):
+        return None, "NATIVE_IMAGE_OVERLAP"
+    if _drawing_overlaps(page, allowed_rect):
+        return None, "NATIVE_GRAPHICS_OVERLAP"
+    if _annotation_overlaps(page, allowed_rect):
+        return None, "NATIVE_ANNOTATION_OVERLAP"
+
+    return {
+        "edit": edit,
+        "page_index": page_index,
+        "target_rect": word_rect,
+        "allowed_rect": allowed_rect,
+        "replacement_rect": replacement_extent or word_rect,
+        "redaction_rect": redaction_rect,
+        "representation": "native_text",
+        "source_word_index": source_word_index,
+        "insertion_slot": source_word_index,
+        "text_origin": origin,
+        "font_alias": font_alias,
+        "font_size": fontsize,
+        "ink_color": color,
+    }, None
+
+
+def _image_rects(page: fitz.Page) -> list[fitz.Rect]:
+    rectangles: list[fitz.Rect] = []
+    for image in page.get_images(full=True):
+        xref = int(image[0])
+        if xref > 0:
+            rectangles.extend(fitz.Rect(rect) for rect in page.get_image_rects(xref))
+    return rectangles
+
+
+def _union_rects(rectangles: list[fitz.Rect]) -> fitz.Rect:
+    if not rectangles:
+        return fitz.Rect()
+    return fitz.Rect(
+        min(rect.x0 for rect in rectangles),
+        min(rect.y0 for rect in rectangles),
+        max(rect.x1 for rect in rectangles),
+        max(rect.y1 for rect in rectangles),
+    )
+
+
+def _overlap_area(left: fitz.Rect, right: fitz.Rect) -> float:
+    intersection = left & right
+    return 0.0 if intersection.is_empty else intersection.get_area()
+
+
+def _normalize_color(value: Any) -> tuple[float, float, float]:
+    if type(value) in (int, float):
+        channel = max(0.0, min(1.0, float(value)))
+        return channel, channel, channel
+    if isinstance(value, (tuple, list)) and len(value) >= 3:
+        return tuple(max(0.0, min(1.0, float(channel))) for channel in value[:3])
+    return 0.0, 0.0, 0.0
+
+
+def _project_font_glyphs(font: fitz.Font, text: str, origin: tuple[float, float], fontsize: float) -> list[fitz.Rect]:
+    cursor_x = origin[0]
+    rectangles: list[fitz.Rect] = []
+    for char in text:
+        codepoint = ord(char)
+        glyph = font.glyph_bbox(codepoint)
+        if not glyph.is_empty:
+            rectangles.append(fitz.Rect(
+                cursor_x + glyph.x0 * fontsize,
+                origin[1] - glyph.y1 * fontsize,
+                cursor_x + glyph.x1 * fontsize,
+                origin[1] - glyph.y0 * fontsize,
+            ))
+        cursor_x += font.glyph_advance(codepoint) * fontsize
+    return rectangles
+
+
+def _annotation_overlaps(page: fitz.Page, target: fitz.Rect) -> bool:
+    annotations = list(page.annots() or ())
+    widgets = list(page.widgets() or ())
+    return any(fitz.Rect(item.rect).intersects(target) for item in annotations + widgets)
+
+
+def _render_replacement_patch(
+    patch: Image.Image,
+    allowed_px: tuple[int, int, int, int],
+    context_origin_x: int,
+    context_origin_y: int,
+    target_rect: fitz.Rect,
+    baseline: float,
+    replacement: str,
+    font_size: float,
+    color: tuple[float, float, float],
+) -> Image.Image:
+    scale = _PATCH_DPI / 72.0
+    patch_origin_x = (context_origin_x + allowed_px[0]) / scale
+    patch_origin_y = (context_origin_y + allowed_px[1]) / scale
+    overlay_doc = fitz.open()
+    try:
+        page = overlay_doc.new_page(width=patch.width / scale, height=patch.height / scale)
+        page.insert_text(
+            fitz.Point(target_rect.x0 - patch_origin_x, baseline - patch_origin_y),
+            replacement,
+            fontname="tibo",
+            fontsize=font_size,
+            color=color,
+            overlay=True,
+        )
+        pixmap = page.get_pixmap(matrix=fitz.Matrix(scale, scale), colorspace=fitz.csRGB, alpha=True)
+        overlay = Image.frombytes("RGBA", (pixmap.width, pixmap.height), pixmap.samples)
+        if overlay.size != patch.size:
+            aligned = Image.new("RGBA", patch.size, (0, 0, 0, 0))
+            aligned.alpha_composite(overlay.crop((0, 0, min(overlay.width, patch.width), min(overlay.height, patch.height))))
+            overlay = aligned
+        return Image.alpha_composite(patch.convert("RGBA"), overlay).convert("RGB")
+    finally:
+        overlay_doc.close()
+
+
+def _scan_insertion_slot(page: fitz.Page, target_rect: fitz.Rect) -> tuple[int | None, str | None]:
+    words = page.get_text("words", sort=False)
+    if not words:
+        return 0, None
+    first, last = fitz.Rect(words[0][:4]), fitz.Rect(words[-1][:4])
+    if target_rect.y1 <= first.y0 or (abs(target_rect.y0 - first.y0) < 0.5 and target_rect.x1 <= first.x0):
+        return 0, None
+    if target_rect.y0 >= last.y1 or (abs(target_rect.y0 - last.y0) < 0.5 and target_rect.x0 >= last.x1):
+        return len(words), None
+    return None, "TEXT_READING_ORDER_UNSUPPORTED"
+
+
+def _assign_content_order(plans: list[dict[str, Any]], source: fitz.Document) -> str | None:
+    by_page: dict[int, list[dict[str, Any]]] = {}
+    for plan in plans:
+        by_page.setdefault(plan["page_index"], []).append(plan)
+    for page_index, page_plans in by_page.items():
+        source_words = source[page_index].get_text("words", sort=False)
+        targeted_indices = {
+            plan["source_word_index"]
+            for plan in page_plans
+            if plan["source_word_index"] is not None
+        }
+        for plan in page_plans:
+            slot = plan["insertion_slot"]
+            prefix = all(index in targeted_indices for index in range(slot))
+            suffix = all(index in targeted_indices for index in range(slot, len(source_words)))
+            if prefix:
+                plan["semantic_position"] = "head"
+            elif suffix:
+                plan["semantic_position"] = "tail"
+            elif plan["edit"]["replacement_text"]:
+                return "TEXT_READING_ORDER_UNSUPPORTED"
+            else:
+                # A deletion adds no text object, so the existing stream order
+                # remains correct regardless of its position.
+                plan["semantic_position"] = "tail"
+    return None
+
+
+def _insert_semantic_text(
+    page: fitz.Page,
+    x: float,
+    y: float,
+    text: str,
+    *,
+    fontname: str,
+    fontsize: float,
+    color: tuple[float, float, float],
+    render_mode: int,
+) -> int:
+    before = set(page.get_contents())
+    page.insert_text(
+        fitz.Point(x, y),
+        text,
+        fontname=fontname,
+        fontsize=fontsize,
+        color=color,
+        render_mode=render_mode,
+        overlay=True,
+    )
+    created = [xref for xref in page.get_contents() if xref not in before]
+    if len(created) != 1:
+        raise RuntimeError("native text insertion did not create one isolated content stream")
+    return created[0]
+
+
+def _reorder_semantic_streams(document: fitz.Document, page: fitz.Page, plans: list[dict[str, Any]]) -> None:
+    head = [
+        plan["semantic_xref"]
+        for plan in sorted(plans, key=lambda item: (item["insertion_slot"], item["edit_order"]))
+        if plan.get("semantic_position") == "head" and plan.get("semantic_xref")
+    ]
+    tail = [
+        plan["semantic_xref"]
+        for plan in sorted(plans, key=lambda item: (item["insertion_slot"], item["edit_order"]))
+        if plan.get("semantic_position") == "tail" and plan.get("semantic_xref")
+    ]
+    semantic = set(head + tail)
+    base = [xref for xref in page.get_contents() if xref not in semantic]
+    ordered = head + base + tail
+    if len(ordered) != len(set(ordered)):
+        raise RuntimeError("duplicate page content stream identity")
+    document.xref_set_key(page.xref, "Contents", "[" + " ".join(f"{xref} 0 R" for xref in ordered) + "]")
 
 
 def _supported_geometry(page: fitz.Page) -> bool:
@@ -294,43 +704,83 @@ def _normalize_text(value: str) -> str:
     return value.strip().strip(".,;:!?\"'()[]{}<>–—").casefold()
 
 
-def _hidden_target_rect(page: fitz.Page, target_rect: fitz.Rect, expected: str) -> tuple[fitz.Rect | None, str | None]:
-    overlapping: list[fitz.Rect] = []
-    for word in page.get_text("words"):
+def _hidden_target_rect(
+    page: fitz.Page,
+    target_rect: fitz.Rect,
+    expected: str,
+) -> tuple[fitz.Rect | None, int | None, str | None]:
+    overlapping: list[tuple[int, fitz.Rect]] = []
+    words = page.get_text("words", sort=False)
+    for word_index, word in enumerate(words):
         if _normalize_text(str(word[4])) == _normalize_text(expected):
             rect = fitz.Rect(word[:4])
             if rect.intersects(target_rect):
-                overlapping.append(rect)
+                overlapping.append((word_index, rect))
     if not overlapping:
         # Any text at the image target is conflicting when it does not match
         # the frozen selected word, whether visible or hidden.
-        for span in page.get_texttrace():
-            if fitz.Rect(span["bbox"]).intersects(target_rect):
-                return None, "TEXT_LAYER_CONFLICT"
-        return None, None
+        if any(_trace_has_glyph_in_rect(span, target_rect) for span in page.get_texttrace()):
+            return None, None, "TEXT_LAYER_CONFLICT"
+        return None, None, None
     if len(overlapping) != 1:
-        return None, "HIDDEN_OCR_AMBIGUOUS"
-    text_rect = overlapping[0]
+        return None, None, "HIDDEN_OCR_AMBIGUOUS"
+    word_index, text_rect = overlapping[0]
     intersection = text_rect & target_rect
     if intersection.is_empty or intersection.get_area() / max(0.01, min(text_rect.get_area(), target_rect.get_area())) < 0.65:
-        return None, "HIDDEN_OCR_ALIGNMENT_UNCERTAIN"
-    trace = [
-        span for span in page.get_texttrace()
-        if _normalize_text("".join(chr(character[0]) for character in span.get("chars", ()))) == _normalize_text(expected)
-        and fitz.Rect(span["bbox"]).intersects(target_rect)
-    ]
-    if len(trace) != 1:
-        return None, "HIDDEN_OCR_AMBIGUOUS"
-    if trace[0].get("type") != 3:
-        return None, "VISIBLE_TEXT_LAYER_CONFLICT"
+        return None, None, "HIDDEN_OCR_ALIGNMENT_UNCERTAIN"
+    matching_spans: list[tuple[dict[str, Any], str, list[fitz.Rect]]] = []
+    conflicting_glyph = False
+    for span in page.get_texttrace():
+        selected: list[tuple[int, fitz.Rect]] = []
+        for char in span.get("chars", ()):
+            if len(char) < 4:
+                continue
+            glyph_rect = fitz.Rect(char[3])
+            center = fitz.Point((glyph_rect.x0 + glyph_rect.x1) / 2, (glyph_rect.y0 + glyph_rect.y1) / 2)
+            if text_rect.contains(center) and int(char[0]) != 32:
+                selected.append((int(char[0]), glyph_rect))
+            elif _overlap_area(glyph_rect, text_rect) > 0.05 and int(char[0]) != 32:
+                conflicting_glyph = True
+        if selected:
+            matching_spans.append((
+                span,
+                "".join(chr(codepoint) for codepoint, _ in selected),
+                [rect for _, rect in selected],
+            ))
+    if conflicting_glyph or len(matching_spans) != 1:
+        return None, None, "HIDDEN_OCR_AMBIGUOUS"
+    trace, selected_text, selected_rects = matching_spans[0]
+    if trace.get("type") != 3:
+        return None, None, "VISIBLE_TEXT_LAYER_CONFLICT"
+    if trace.get("wmode") != 0 or tuple(trace.get("dir", ())) != (1.0, 0.0):
+        return None, None, "HIDDEN_OCR_ALIGNMENT_UNCERTAIN"
+    if _normalize_text(selected_text) != _normalize_text(expected):
+        return None, None, "HIDDEN_OCR_ALIGNMENT_UNCERTAIN"
     redact = fitz.Rect(text_rect.x0 - 0.1, text_rect.y0 - 0.1, text_rect.x1 + 0.1, text_rect.y1 + 0.1)
     # OCR/native text boxes can differ from the rendered ink by a fraction of
     # a point. Keep hidden-layer removal tightly bounded to a 1.25pt margin.
     allowed = fitz.Rect(target_rect.x0 - 1.25, target_rect.y0 - 1.25,
                         target_rect.x1 + 1.25, target_rect.y1 + 1.25)
     if not allowed.contains(redact):
-        return None, "HIDDEN_OCR_ALIGNMENT_UNCERTAIN"
-    return redact, None
+        return None, None, "HIDDEN_OCR_ALIGNMENT_UNCERTAIN"
+    for other_index, word in enumerate(words):
+        if other_index == word_index:
+            continue
+        if _overlap_area(fitz.Rect(word[:4]), redact) > 0.05:
+            return None, None, "HIDDEN_OCR_NEIGHBOR_OVERLAP"
+    selected_union = _union_rects(selected_rects)
+    if not redact.contains(selected_union):
+        return None, None, "HIDDEN_OCR_ALIGNMENT_UNCERTAIN"
+    return redact, word_index, None
+
+
+def _trace_has_glyph_in_rect(span: dict[str, Any], target: fitz.Rect) -> bool:
+    for char in span.get("chars", ()):
+        if len(char) < 4:
+            continue
+        if _overlap_area(fitz.Rect(char[3]), target) > 0.05 and int(char[0]) != 32:
+            return True
+    return False
 
 
 def _rect_pixels(rect: fitz.Rect, scale: float, size: tuple[int, int], origin_x: int, origin_y: int) -> tuple[int, int, int, int]:
@@ -515,17 +965,37 @@ def _validate_candidate(source_path: Path, candidate_path: Path, plans: list[dic
         checks["outside_changed_pixels_144dpi"] = outside_by_dpi["144"]
         checks["target_results"] = []
         target_content_valid = True
+        text_order_preserved = True
+        plans_by_page: dict[int, list[dict[str, Any]]] = {}
+        for plan in plans:
+            plans_by_page.setdefault(plan["page_index"], []).append(plan)
+        for page_index in range(page_count):
+            if cancellation_check:
+                cancellation_check()
+            expected_words = _expected_page_words(source[page_index], plans_by_page.get(page_index, []))
+            candidate_words = [str(word[4]) for word in candidate[page_index].get_text("words", sort=False)]
+            text_order_preserved &= candidate_words == expected_words
+        checks["text_reading_order_preserved"] = text_order_preserved
         for plan in plans:
             page_index = plan["page_index"]
             page = candidate[page_index]
             rect = plan["target_rect"]
             replacement = plan["edit"]["replacement_text"]
+            replacement_tokens = replacement.split()
+            replacement_tokens = replacement.split()
             target_words = [
-                word for word in page.get_text("words")
+                word for word in page.get_text("words", sort=False)
                 if fitz.Rect(word[:4]).intersects(rect)
             ]
-            replacement_hits = [word for word in target_words if _normalize_text(str(word[4])) == _normalize_text(replacement)] if replacement else []
-            old_hits = [word for word in target_words if _normalize_text(str(word[4])) == _normalize_text(plan["edit"]["expected_original_text"])]
+            old_hits = [
+                word for word in target_words
+                if _normalize_text(str(word[4])) == _normalize_text(plan["edit"]["expected_original_text"])
+            ]
+            replacement_hits = [
+                str(word[4]) for word in page.get_text("words", sort=False)
+                if str(word[4]) in replacement_tokens
+                and fitz.Rect(word[:4]).intersects(plan["replacement_rect"])
+            ]
             if replacement:
                 allowed_rect = plan["allowed_rect"]
                 exact_search = any(found.intersects(allowed_rect) for found in page.search_for(replacement))
@@ -535,11 +1005,16 @@ def _validate_candidate(source_path: Path, candidate_path: Path, plans: list[dic
                 "page_num": page_index + 1,
                 "element_id": plan["edit"]["element_id"],
                 "word_id": plan["edit"]["word_id"],
+                "representation": plan["representation"],
                 "replacement_searchable": exact_search,
-                "replacement_hits_at_target": len(replacement_hits),
+                "replacement_hits_at_target": replacement_hits,
                 "old_target_hits_at_target": len(old_hits),
             })
-            target_content_valid &= (len(old_hits) == 0 and (len(replacement_hits) == 1 if replacement else not target_words) and exact_search)
+            target_content_valid &= (
+                len(old_hits) == 0
+                and replacement_hits == replacement_tokens
+                and exact_search
+            )
 
         neighbors_preserved = True
         for page_index in range(page_count):
@@ -559,8 +1034,32 @@ def _validate_candidate(source_path: Path, candidate_path: Path, plans: list[dic
         checks["outside_pixels_clear"] = all(value == 0 for value in outside_by_dpi.values())
         checks["target_content_valid"] = target_content_valid
         checks["valid"] = all((checks["page_count"], checks["geometry"], checks["image_streams_preserved"],
-                               checks["neighbors_preserved"], checks["outside_pixels_clear"], checks["target_content_valid"]))
+                               checks["neighbors_preserved"], checks["outside_pixels_clear"], checks["target_content_valid"],
+                               checks["text_reading_order_preserved"]))
     return checks
+
+
+def _expected_page_words(page: fitz.Page, plans: list[dict[str, Any]]) -> list[str]:
+    source_words = page.get_text("words", sort=False)
+    replacement_by_index = {
+        plan["source_word_index"]: plan["edit"]["replacement_text"].split()
+        for plan in plans
+        if plan["source_word_index"] is not None
+    }
+    insertions_by_slot: dict[int, list[dict[str, Any]]] = {}
+    for plan in plans:
+        if plan["source_word_index"] is None:
+            insertions_by_slot.setdefault(plan["insertion_slot"], []).append(plan)
+    expected: list[str] = []
+    for slot in range(len(source_words) + 1):
+        for plan in sorted(insertions_by_slot.get(slot, []), key=lambda item: item["edit_order"]):
+            expected.extend(plan["edit"]["replacement_text"].split())
+        if slot < len(source_words):
+            if slot in replacement_by_index:
+                expected.extend(replacement_by_index[slot])
+            else:
+                expected.append(str(source_words[slot][4]))
+    return expected
 
 
 def _sha256_file(path: Path) -> str:

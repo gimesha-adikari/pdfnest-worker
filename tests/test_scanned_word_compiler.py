@@ -50,7 +50,13 @@ def _fixture_pdf(path: Path, *, texture: bool = False, border: bool = False, sta
     page = doc.new_page(width=width_pt, height=height_pt)
     page.insert_image(page.rect, stream=stream.getvalue())
     if hidden_ocr:
-        page.insert_text(fitz.Point(x0, y0 + (y1 - y0) * 0.8), "Ministry", fontsize=(y1 - y0) * 0.8, render_mode=3)
+        page.insert_text(
+            fitz.Point(x0, y0 + (y1 - y0) * 0.8),
+            "Ministry of Education, Higher",
+            fontname="helv",
+            fontsize=(y1 - y0) * 0.8,
+            render_mode=3,
+        )
     if rotation:
         page.set_rotation(rotation)
     if crop:
@@ -60,12 +66,19 @@ def _fixture_pdf(path: Path, *, texture: bool = False, border: bool = False, sta
     return [x0, y0, x1, y1]
 
 
-def _request(bbox: list[float], replacement: str = "hello", *, page: int = 1, word_id: str = "word-1"):
+def _request(
+    bbox: list[float],
+    replacement: str = "hello",
+    *,
+    page: int = 1,
+    word_id: str = "word-1",
+    expected: str = "Ministry",
+):
     edit = {
         "page_num": page,
         "element_id": "line-1",
         "word_id": word_id,
-        "expected_original_text": "Ministry",
+        "expected_original_text": expected,
         "replacement_text": replacement,
         "style_override": None,
         "fit_policy": "preserve_neighbors",
@@ -87,6 +100,56 @@ def _request(bbox: list[float], replacement: str = "hello", *, page: int = 1, wo
         "baseline_digest": digest,
     }]
     return envelope, resolved, source_sha
+
+
+def _native_fixture_pdf(path: Path, text: str, *, start: tuple[float, float] = (60, 100), fontname: str = "helv") -> list[list[float]]:
+    doc = fitz.open()
+    page = doc.new_page(width=595, height=842)
+    page.draw_line((40, 150), (220, 150), color=(0.1, 0.2, 0.8), width=0.5)
+    if fontname == "custom":
+        fontname = "DejaVuFixture"
+        page.insert_font(fontname=fontname, fontfile="/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
+    page.insert_text(fitz.Point(*start), text, fontname=fontname, fontsize=14, color=(0.1, 0.2, 0.3))
+    boxes = [[float(value) for value in word[:4]] for word in page.get_text("words")]
+    doc.save(path)
+    doc.close()
+    return boxes
+
+
+def _mixed_native_scan_pdf(path: Path, *, stamp: bool = False) -> tuple[list[float], list[float]]:
+    scale = 3
+    image = Image.new("RGB", (300 * scale, 100 * scale), "white")
+    draw = ImageDraw.Draw(image)
+    font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 42)
+    image_origin = (54, 45)
+    draw.text(image_origin, "Ministry of Education, Higher", font=font, fill=(28, 28, 28))
+    ministry = draw.textbbox(image_origin, "Ministry", font=font)
+    if stamp:
+        draw.ellipse((ministry[0] + 10, ministry[1], ministry[0] + 55, ministry[3]), outline=(180, 0, 0), width=5)
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    doc = fitz.open()
+    page = doc.new_page(width=595, height=842)
+    page.insert_text((30, 80), "Notice", fontname="helv", fontsize=14)
+    native = [float(value) for value in page.get_text("words")[0][:4]]
+    scan_rect = fitz.Rect(100, 150, 400, 250)
+    page.insert_image(scan_rect, stream=buffer.getvalue())
+    target = [
+        scan_rect.x0 + ministry[0] / scale,
+        scan_rect.y0 + ministry[1] / scale,
+        scan_rect.x0 + ministry[2] / scale,
+        scan_rect.y0 + ministry[3] / scale,
+    ]
+    page.insert_text(
+        fitz.Point(target[0], target[1] + (target[3] - target[1]) * 0.8),
+        "Ministry of Education, Higher",
+        fontname="helv",
+        fontsize=(target[3] - target[1]) * 0.8,
+        render_mode=3,
+    )
+    doc.save(path)
+    doc.close()
+    return native, target
 
 
 def _two_page_fixture(path: Path, tmp_path: Path, *, second_stamp: bool = False):
@@ -158,6 +221,285 @@ def test_removes_aligned_hidden_ocr_and_rejects_visible_text_conflict(tmp_path):
     result = compile_scanned_word_edits(visible_source, visible_output, envelope, resolved, source_sha)
     assert result == {"status": "REFUSED", "error_code": "VISIBLE_TEXT_LAYER_CONFLICT"}
     assert not visible_output.exists()
+
+
+def test_searchable_scan_replacement_keeps_unsorted_copy_order_and_removes_stale_word(tmp_path):
+    source = tmp_path / "searchable-source.pdf"
+    output = tmp_path / "searchable-candidate.pdf"
+    bbox = _fixture_pdf(source, hidden_ocr=True)
+    envelope, resolved, source_sha = _request(bbox)
+    source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    resolved[0]["source_sha256"] = source_sha
+
+    result = compile_scanned_word_edits(source, output, envelope, resolved, source_sha)
+
+    assert result["status"] == "EDITED", result
+    with fitz.open(output) as edited:
+        words = [word[4] for word in edited[0].get_text("words", sort=False)]
+        assert words == ["hello", "of", "Education,", "Higher"]
+        assert len(edited[0].search_for("hello")) == 1
+        assert edited[0].search_for("Ministry") == []
+
+
+def test_native_replacement_targets_repeated_word_by_position_and_preserves_neighbors(tmp_path):
+    source = tmp_path / "native-repeated-source.pdf"
+    output = tmp_path / "native-repeated-candidate.pdf"
+    boxes = _native_fixture_pdf(source, "Ministry Ministry of Education")
+    envelope, resolved, source_sha = _request(boxes[0], replacement="hello")
+    source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    resolved[0]["source_sha256"] = source_sha
+
+    result = compile_scanned_word_edits(source, output, envelope, resolved, source_sha)
+
+    assert result["status"] == "EDITED", result
+    assert result["target_results"][0]["representation"] == "native_text"
+    with fitz.open(source) as original, fitz.open(output) as edited:
+        original_words = original[0].get_text("words", sort=False)
+        edited_words = edited[0].get_text("words", sort=False)
+        assert [word[4] for word in edited_words] == ["hello", "Ministry", "of", "Education"]
+        assert tuple(round(value, 2) for value in edited_words[2][:4]) == tuple(round(value, 2) for value in original_words[2][:4])
+        original_drawings = original[0].get_drawings()
+        edited_drawings = edited[0].get_drawings()
+        assert len(original_drawings) == len(edited_drawings) == 1
+        assert original_drawings[0]["items"] == edited_drawings[0]["items"]
+        assert original_drawings[0]["color"] == edited_drawings[0]["color"]
+        assert original_drawings[0]["width"] == edited_drawings[0]["width"]
+    assert result["outside_changed_pixels_by_dpi"] == {"72": 0, "144": 0, "288": 0}
+
+
+def test_native_later_repeated_word_is_refused_when_extraction_order_cannot_be_preserved(tmp_path):
+    source = tmp_path / "native-later-source.pdf"
+    output = tmp_path / "native-later-candidate.pdf"
+    boxes = _native_fixture_pdf(source, "Ministry Ministry of Education")
+    envelope, resolved, source_sha = _request(boxes[1], replacement="hello")
+    resolved[0]["edit"]["word_id"] = "word-second"
+    envelope["edits"][0]["word_id"] = "word-second"
+    source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    resolved[0]["source_sha256"] = source_sha
+
+    result = compile_scanned_word_edits(source, output, envelope, resolved, source_sha)
+
+    assert result == {"status": "REFUSED", "error_code": "TEXT_READING_ORDER_UNSUPPORTED"}
+    assert not output.exists()
+
+
+def test_native_repeated_terminal_word_is_replaced_at_its_exact_position(tmp_path):
+    source = tmp_path / "native-terminal-repeat-source.pdf"
+    output = tmp_path / "native-terminal-repeat-candidate.pdf"
+    boxes = _native_fixture_pdf(source, "Ministry of Ministry")
+    envelope, resolved, source_sha = _request(boxes[2], replacement="hello")
+    resolved[0]["edit"]["word_id"] = "word-last"
+    envelope["edits"][0]["word_id"] = "word-last"
+    source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    resolved[0]["source_sha256"] = source_sha
+
+    result = compile_scanned_word_edits(source, output, envelope, resolved, source_sha)
+
+    assert result["status"] == "EDITED", result
+    with fitz.open(output) as edited:
+        assert [word[4] for word in edited[0].get_text("words", sort=False)] == ["Ministry", "of", "hello"]
+        assert edited[0].search_for("Ministry")
+        assert len(edited[0].search_for("hello")) == 1
+
+
+def test_native_deletion_updates_text_without_moving_neighbor_glyphs(tmp_path):
+    source = tmp_path / "native-delete-source.pdf"
+    output = tmp_path / "native-delete-candidate.pdf"
+    boxes = _native_fixture_pdf(source, "Ministry of Education")
+    envelope, resolved, source_sha = _request(boxes[0], replacement="")
+    source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    resolved[0]["source_sha256"] = source_sha
+
+    result = compile_scanned_word_edits(source, output, envelope, resolved, source_sha)
+
+    assert result["status"] == "EDITED", result
+    with fitz.open(source) as original, fitz.open(output) as edited:
+        assert [word[4] for word in edited[0].get_text("words", sort=False)] == ["of", "Education"]
+        assert tuple(round(value, 2) for value in edited[0].get_text("words", sort=False)[0][:4]) == tuple(
+            round(value, 2) for value in original[0].get_text("words", sort=False)[1][:4]
+        )
+
+
+def test_native_replacement_can_grow_when_verified_free_space_is_available(tmp_path):
+    source = tmp_path / "native-growth-source.pdf"
+    output = tmp_path / "native-growth-candidate.pdf"
+    boxes = _native_fixture_pdf(source, "Hi")
+    envelope, resolved, source_sha = _request(boxes[0], replacement="Greetings", expected="Hi")
+    source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    resolved[0]["source_sha256"] = source_sha
+
+    result = compile_scanned_word_edits(source, output, envelope, resolved, source_sha)
+
+    assert result["status"] == "EDITED", result
+    with fitz.open(output) as edited:
+        assert [word[4] for word in edited[0].get_text("words", sort=False)] == ["Greetings"]
+
+
+def test_mixed_page_routes_native_and_hidden_scan_words_by_target_representation(tmp_path):
+    source = tmp_path / "mixed-source.pdf"
+    output = tmp_path / "mixed-candidate.pdf"
+    native_bbox, scan_bbox = _mixed_native_scan_pdf(source)
+    edits = [
+        {"page_num": 1, "element_id": "native-line", "word_id": "native-notice", "expected_original_text": "Notice",
+         "replacement_text": "Report", "style_override": None, "fit_policy": "preserve_neighbors"},
+        {"page_num": 1, "element_id": "scan-line", "word_id": "scan-ministry", "expected_original_text": "Ministry",
+         "replacement_text": "hello", "style_override": None, "fit_policy": "preserve_neighbors"},
+    ]
+    digest = "sha256:" + "1" * 64
+    envelope = {"edit_protocol": PROTOCOL, "source_tracker": "source-key", "extraction_job_id": "extract-1",
+                "baseline_digest": digest, "edits": edits}
+    source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    resolved = [
+        {"edit": edits[0], "bbox": native_bbox, "page_size": [595.0, 842.0], "source_sha256": source_sha, "baseline_digest": digest},
+        {"edit": edits[1], "bbox": scan_bbox, "page_size": [595.0, 842.0], "source_sha256": source_sha, "baseline_digest": digest},
+    ]
+
+    result = compile_scanned_word_edits(source, output, envelope, resolved, source_sha)
+
+    assert result["status"] == "EDITED", result
+    assert [target["representation"] for target in result["target_results"]] == ["native_text", "searchable_scan"]
+    with fitz.open(output) as edited:
+        assert [word[4] for word in edited[0].get_text("words", sort=False)] == ["Report", "hello", "of", "Education,", "Higher"]
+        assert len(edited[0].search_for("Ministry")) == 0
+
+
+def test_mixed_page_refuses_all_operations_if_scan_target_is_stamped(tmp_path):
+    source = tmp_path / "mixed-stamped-source.pdf"
+    output = tmp_path / "mixed-stamped-candidate.pdf"
+    native_bbox, scan_bbox = _mixed_native_scan_pdf(source, stamp=True)
+    edits = [
+        {"page_num": 1, "element_id": "native-line", "word_id": "native-notice", "expected_original_text": "Notice",
+         "replacement_text": "Report", "style_override": None, "fit_policy": "preserve_neighbors"},
+        {"page_num": 1, "element_id": "scan-line", "word_id": "scan-ministry", "expected_original_text": "Ministry",
+         "replacement_text": "hello", "style_override": None, "fit_policy": "preserve_neighbors"},
+    ]
+    digest = "sha256:" + "1" * 64
+    envelope = {"edit_protocol": PROTOCOL, "source_tracker": "source-key", "extraction_job_id": "extract-1",
+                "baseline_digest": digest, "edits": edits}
+    source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    resolved = [
+        {"edit": edits[0], "bbox": native_bbox, "page_size": [595.0, 842.0], "source_sha256": source_sha, "baseline_digest": digest},
+        {"edit": edits[1], "bbox": scan_bbox, "page_size": [595.0, 842.0], "source_sha256": source_sha, "baseline_digest": digest},
+    ]
+
+    result = compile_scanned_word_edits(source, output, envelope, resolved, source_sha)
+
+    assert result["status"] == "REFUSED"
+    assert result["error_code"] == "BACKGROUND_COLORED_OVERLAP"
+    assert not output.exists()
+
+
+def test_native_custom_font_is_refused_without_creating_candidate(tmp_path):
+    source = tmp_path / "native-custom-font-source.pdf"
+    output = tmp_path / "native-custom-font-candidate.pdf"
+    boxes = _native_fixture_pdf(source, "Ministry of Education", fontname="custom")
+    envelope, resolved, source_sha = _request(boxes[0])
+    source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    resolved[0]["source_sha256"] = source_sha
+
+    result = compile_scanned_word_edits(source, output, envelope, resolved, source_sha)
+
+    assert result == {"status": "REFUSED", "error_code": "NATIVE_FONT_UNSUPPORTED"}
+    assert not output.exists()
+
+
+def test_native_ligature_is_refused_before_mutation(tmp_path):
+    source = tmp_path / "native-ligature-source.pdf"
+    output = tmp_path / "native-ligature-candidate.pdf"
+    doc = fitz.open()
+    page = doc.new_page(width=595, height=842)
+    page.insert_font(fontname="DejaVuFixture", fontfile="/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
+    page.insert_text((60, 100), "\ufb01", fontname="DejaVuFixture", fontsize=14)
+    bbox = [float(value) for value in page.get_text("words")[0][:4]]
+    doc.save(source)
+    doc.close()
+    envelope, resolved, source_sha = _request(bbox, replacement="fi", expected="\ufb01")
+    source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    resolved[0]["source_sha256"] = source_sha
+
+    result = compile_scanned_word_edits(source, output, envelope, resolved, source_sha)
+
+    assert result == {"status": "REFUSED", "error_code": "NATIVE_GLYPH_CLUSTER_UNSUPPORTED"}
+    assert not output.exists()
+
+
+def test_native_overprinted_word_is_refused_as_ambiguous(tmp_path):
+    source = tmp_path / "native-overprint-source.pdf"
+    output = tmp_path / "native-overprint-candidate.pdf"
+    doc = fitz.open()
+    page = doc.new_page(width=595, height=842)
+    page.insert_text((60, 100), "Ministry", fontname="helv", fontsize=14)
+    bbox = [float(value) for value in page.get_text("words")[0][:4]]
+    page.insert_text((60, 100), "Ministry", fontname="helv", fontsize=14)
+    doc.save(source)
+    doc.close()
+    envelope, resolved, source_sha = _request(bbox)
+    source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    resolved[0]["source_sha256"] = source_sha
+
+    result = compile_scanned_word_edits(source, output, envelope, resolved, source_sha)
+
+    assert result == {"status": "REFUSED", "error_code": "NATIVE_TARGET_AMBIGUOUS"}
+    assert not output.exists()
+
+
+def test_native_replacement_that_collides_with_following_text_is_refused(tmp_path):
+    source = tmp_path / "native-overflow-source.pdf"
+    output = tmp_path / "native-overflow-candidate.pdf"
+    boxes = _native_fixture_pdf(source, "Ministry of Education")
+    envelope, resolved, source_sha = _request(boxes[0], replacement="ExtremelyLongReplacement")
+    source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    resolved[0]["source_sha256"] = source_sha
+
+    result = compile_scanned_word_edits(source, output, envelope, resolved, source_sha)
+
+    assert result == {"status": "REFUSED", "error_code": "REPLACEMENT_DOES_NOT_FIT"}
+    assert not output.exists()
+
+
+def test_native_word_over_vector_line_is_refused_without_modifying_source_or_output(tmp_path):
+    source = tmp_path / "native-vector-overlap-source.pdf"
+    output = tmp_path / "native-vector-overlap-candidate.pdf"
+    doc = fitz.open()
+    page = doc.new_page(width=595, height=842)
+    page.insert_text((60, 100), "Ministry of Education", fontname="helv", fontsize=14)
+    bbox = [float(value) for value in page.get_text("words")[0][:4]]
+    page.draw_line((bbox[0], bbox[1] + 5), (bbox[2], bbox[1] + 5), color=(0.8, 0, 0), width=1)
+    doc.save(source)
+    doc.close()
+    source_bytes = source.read_bytes()
+    envelope, resolved, source_sha = _request(bbox)
+    source_sha = hashlib.sha256(source_bytes).hexdigest()
+    resolved[0]["source_sha256"] = source_sha
+
+    result = compile_scanned_word_edits(source, output, envelope, resolved, source_sha)
+
+    assert result == {"status": "REFUSED", "error_code": "NATIVE_GRAPHICS_OVERLAP"}
+    assert not output.exists()
+    assert source.read_bytes() == source_bytes
+
+
+def test_native_text_over_scan_image_is_refused_as_layer_conflict(tmp_path):
+    source = tmp_path / "native-over-scan-source.pdf"
+    output = tmp_path / "native-over-scan-candidate.pdf"
+    image = Image.new("RGB", (595, 842), "white")
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    doc = fitz.open()
+    page = doc.new_page(width=595, height=842)
+    page.insert_image(page.rect, stream=buffer.getvalue())
+    page.insert_text((60, 100), "Ministry", fontname="helv", fontsize=14)
+    bbox = [float(value) for value in page.get_text("words")[0][:4]]
+    doc.save(source)
+    doc.close()
+    envelope, resolved, source_sha = _request(bbox)
+    source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    resolved[0]["source_sha256"] = source_sha
+
+    result = compile_scanned_word_edits(source, output, envelope, resolved, source_sha)
+
+    assert result == {"status": "REFUSED", "error_code": "VISIBLE_TEXT_LAYER_CONFLICT"}
+    assert not output.exists()
 
 
 @pytest.mark.parametrize(
