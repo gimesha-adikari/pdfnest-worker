@@ -85,6 +85,7 @@ from app.core.native_operations import (
     execute_legacy_editor_ocr,
     execute_legacy_markup,
     validate_word_edit_transport,
+    compile_scanned_word_edits,
 )
 
 from app.core.word_edits import (
@@ -93,6 +94,7 @@ from app.core.word_edits import (
     build_word_edit_baseline,
     editor_engine_fingerprint,
     native_transport_digest,
+    resolve_word_edit_targets,
     validate_word_edit_request,
 )
 
@@ -1053,11 +1055,7 @@ def editor_compile_job(
 
 @dramatiq.actor(queue_name="editor", max_retries=0, time_limit=600_000)
 def editor_word_edit_compile_job(job_id: str, envelope: dict[str, Any]) -> None:
-    """Validate and carry word intent to native isolation, then fail closed.
-
-    This Phase 2 actor deliberately creates no output PDF and never calls the
-    legacy whole-line compiler.
-    """
+    """Validate frozen intent, compile supported scans, and publish a verified PDF."""
     job = get_job(job_id)
     if job is None:
         return
@@ -1070,6 +1068,7 @@ def editor_word_edit_compile_job(job_id: str, envelope: dict[str, Any]) -> None:
         raise Retry(message=f"Execution capacity full: {reason}", delay=5000)
 
     source_path = temp_file_path(prefix="pdfnest-word-source-", suffix=".pdf")
+    output_pdf_path = temp_file_path(prefix="pdfnest-word-output-", suffix=".pdf")
     update_job(
         job_id,
         status=JobState.running,
@@ -1090,6 +1089,7 @@ def editor_word_edit_compile_job(job_id: str, envelope: dict[str, Any]) -> None:
         expected_source_sha = extraction_result["word_edit_baseline"]["source_sha256"]
         if _sha256_file(source_path) != expected_source_sha:
             raise WordEditProtocolError("source bytes no longer match the extraction baseline")
+        resolved_targets = resolve_word_edit_targets(validated, extraction_result)
 
         update_job(job_id, progress=50, message="Word edit request validated against frozen extraction")
         expected_transport_digest = native_transport_digest(validated)
@@ -1105,20 +1105,91 @@ def editor_word_edit_compile_job(job_id: str, envelope: dict[str, Any]) -> None:
         ):
             raise WordEditProtocolError("isolated word edit transport receipt did not match the validated request")
 
-        # Compilation is intentionally unsupported for Phase 2. A failed job
-        # has no artifact_key and the download route already rejects it.
+        update_job(job_id, progress=60, message="Compiling localized scanned-word corrections")
+        # temp_file_path creates an empty file; the isolated compiler requires
+        # a fresh destination so it can atomically publish a verified PDF.
+        cleanup_paths(output_pdf_path)
+        compiled = compile_scanned_word_edits(
+            str(source_path),
+            str(output_pdf_path),
+            validated,
+            resolved_targets,
+            expected_source_sha,
+            cancellation_check=lambda: check_cancellation(job_id),
+        )
+        check_cancellation(job_id)
+        if type(compiled) is not dict or compiled.get("status") != "EDITED":
+            cleanup_paths(output_pdf_path)
+            error_code = compiled.get("error_code") if type(compiled) is dict else None
+            if type(error_code) is not str or not error_code:
+                error_code = "WORD_EDIT_CANDIDATE_INVALID"
+            update_job(
+                job_id,
+                status=JobState.failed,
+                finished_at=datetime.now(timezone.utc),
+                progress=100,
+                result={
+                    "transport_receipt": receipt,
+                    "validated_operation_count": len(validated["edits"]),
+                },
+                error="The selected-word edit could not be applied safely to this PDF. No downloadable PDF was produced.",
+                error_code=error_code,
+                message="The scanned-word edit was refused by the compiler",
+            )
+            return
+
+        if not Path(output_pdf_path).is_file() or _sha256_file(output_pdf_path) != compiled.get("artifact_sha256"):
+            cleanup_paths(output_pdf_path)
+            update_job(
+                job_id,
+                status=JobState.failed,
+                finished_at=datetime.now(timezone.utc),
+                result={"transport_receipt": receipt},
+                error="The compiled candidate did not pass artifact identity checks.",
+                error_code="WORD_EDIT_CANDIDATE_INVALID",
+                message="Compiled artifact validation failed",
+            )
+            return
+        with fitz.open(output_pdf_path) as candidate:
+            if len(candidate) != len(extraction_result.get("pages", [])):
+                cleanup_paths(output_pdf_path)
+                update_job(
+                    job_id,
+                    status=JobState.failed,
+                    finished_at=datetime.now(timezone.utc),
+                    result={"transport_receipt": receipt},
+                    error="The compiled candidate page count did not match the validated source.",
+                    error_code="WORD_EDIT_CANDIDATE_INVALID",
+                    message="Compiled artifact validation failed",
+                )
+                return
+
+        output_key = build_key("jobs/editor/word-edit/output", suffix=".pdf")
+        upload_path(output_pdf_path, output_key, content_type="application/pdf")
+        source_name = (extraction.payload or {}).get("source_name") or "document.pdf"
+        download_name = f"edited_{Path(source_name).stem}.pdf"
         update_job(
             job_id,
-            status=JobState.failed,
+            status=JobState.succeeded,
             finished_at=datetime.now(timezone.utc),
             progress=100,
+            total_pages=compiled["page_count"],
+            completed_pages=compiled["page_count"],
             result={
                 "transport_receipt": receipt,
                 "validated_operation_count": len(validated["edits"]),
+                "artifact_key": output_key,
+                "artifact_name": download_name,
+                "artifact_sha256": compiled["artifact_sha256"],
+                "page_count": compiled["page_count"],
+                "compiler_protocol": compiled["protocol"],
+                "source_sha256": expected_source_sha,
+                "baseline_digest": validated["baseline_digest"],
+                "target_results": compiled["target_results"],
+                "outside_changed_pixels_144dpi": compiled["outside_changed_pixels_144dpi"],
+                "outside_changed_pixels_by_dpi": compiled["outside_changed_pixels_by_dpi"],
             },
-            error="Precise PDF word compilation is not implemented yet; no PDF was produced.",
-            error_code="WORD_EDIT_COMPILATION_NOT_IMPLEMENTED",
-            message="Word edit operations reached isolated validation; compilation is not implemented",
+            message="Scanned-word edit compilation completed",
         )
     except JobCancelledException:
         update_job(job_id, status=JobState.cancelled, finished_at=datetime.now(timezone.utc), message="Word edit request cancelled")
@@ -1144,7 +1215,7 @@ def editor_word_edit_compile_job(job_id: str, envelope: dict[str, Any]) -> None:
         )
     finally:
         release_lease(job_id, owner_identity)
-        cleanup_paths(source_path)
+        cleanup_paths(source_path, output_pdf_path)
 
 
 def _markup_public_error(exc: Exception) -> tuple[str, str]:

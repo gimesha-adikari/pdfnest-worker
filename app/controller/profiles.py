@@ -61,6 +61,7 @@ PROFILES.update({
  'preview_source': profile('input_path output_path page_index', 'input_path output_path page_index', 'input_path', 'output_path'),
  'structured_document': profile('input_path ' + LANGUAGE, 'input_path', 'input_path', callbacks=('cancellation_check','page_progress_callback')),
  'validate_word_edit_transport': profile('input_path envelope', 'input_path envelope', 'input_path'),
+ 'compile_scanned_word_edits': profile('input_path output_pdf_path envelope resolved_targets expected_source_sha256', 'input_path output_pdf_path envelope resolved_targets expected_source_sha256', 'input_path', 'output_pdf_path', callbacks=('cancellation_check',)),
 })
 
 def plain(value, depth=0):
@@ -124,6 +125,9 @@ def options_valid(values, p):
                 raise DomainUnavailable()
         elif key in ('layout', 'selection', 'language_usage', 'envelope'):
             if value is not None and type(value) is not dict:
+                raise DomainUnavailable()
+        elif key == 'resolved_targets':
+            if type(value) is not list or len(value) > 1000 or any(type(item) is not dict for item in value):
                 raise DomainUnavailable()
         elif key in ('page_index','max_pages','dpi'):
             if type(value) is not int or not (0 if key == 'page_index' else 1) <= value <= (1200 if key == 'dpi' else 10000):

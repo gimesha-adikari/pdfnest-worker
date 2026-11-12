@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from collections.abc import Mapping
 from pathlib import Path
@@ -254,6 +255,72 @@ def validate_word_edit_request(request: Any, extraction: Any) -> dict[str, Any]:
     if encoded_size > NATIVE_FRAME_LIMIT - 4096:
         raise WordEditProtocolError("validated operations exceed the native isolation frame limit")
     return request
+
+
+def resolve_word_edit_targets(
+    validated_request: Mapping[str, Any],
+    extraction_result: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Resolve exact v1 operation identities into server-held page geometry.
+
+    This must only be called after ``validate_word_edit_request``. Coordinates
+    are read from the frozen extraction result; the request itself contains no
+    authoritative geometry.
+    """
+    baseline = extraction_result.get("word_edit_baseline")
+    pages = extraction_result.get("pages")
+    if type(baseline) is not dict or type(pages) is not list:
+        raise WordEditProtocolError("trusted extraction geometry is unavailable")
+    source_sha = baseline.get("source_sha256")
+    baseline_hash = baseline.get("digest")
+    if type(source_sha) is not str or not _DIGEST_RE.fullmatch(source_sha):
+        raise WordEditProtocolError("trusted source identity is malformed")
+    if baseline_hash != validated_request.get("baseline_digest"):
+        raise WordEditProtocolError("trusted word edit baseline is stale")
+
+    pages_by_number: dict[int, Mapping[str, Any]] = {}
+    for page in pages:
+        if type(page) is not dict or type(page.get("page_num")) is not int:
+            raise WordEditProtocolError("trusted extraction page geometry is malformed")
+        page_num = page["page_num"]
+        if page_num < 1 or page_num in pages_by_number:
+            raise WordEditProtocolError("trusted extraction page geometry is ambiguous")
+        pages_by_number[page_num] = page
+
+    resolved: list[dict[str, Any]] = []
+    for edit in validated_request.get("edits", []):
+        page = pages_by_number.get(edit.get("page_num"))
+        if page is None:
+            raise WordEditProtocolError("word edit page is absent from trusted extraction")
+        page_width, page_height = page.get("width"), page.get("height")
+        if any(type(value) not in (int, float) or not math.isfinite(value) or value <= 0 for value in (page_width, page_height)):
+            raise WordEditProtocolError("trusted extraction page geometry is malformed")
+        elements = page.get("elements")
+        if type(elements) is not list:
+            raise WordEditProtocolError("trusted extraction elements are malformed")
+        matching_elements = [element for element in elements if type(element) is dict and element.get("id") == edit.get("element_id")]
+        if len(matching_elements) != 1:
+            raise WordEditProtocolError("word edit element is absent or ambiguous in trusted extraction")
+        words = matching_elements[0].get("word_geometry")
+        if type(words) is not list:
+            raise WordEditProtocolError("trusted extraction word geometry is malformed")
+        matching_words = [word for word in words if type(word) is dict and word.get("id") == edit.get("word_id")]
+        if len(matching_words) != 1:
+            raise WordEditProtocolError("word edit target is absent or ambiguous in trusted extraction")
+        word = matching_words[0]
+        if word.get("text") != edit.get("expected_original_text"):
+            raise WordEditProtocolError("word edit text does not match trusted geometry")
+        x, y, width, height = (word.get(name) for name in ("x", "y", "width", "height"))
+        if any(type(value) not in (int, float) or not math.isfinite(value) for value in (x, y, width, height)) or width <= 0 or height <= 0:
+            raise WordEditProtocolError("trusted extraction word geometry is malformed")
+        resolved.append({
+            "edit": dict(edit),
+            "bbox": [float(x), float(y), float(x + width), float(y + height)],
+            "page_size": [float(page_width), float(page_height)],
+            "source_sha256": source_sha,
+            "baseline_digest": baseline_hash,
+        })
+    return resolved
 
 
 def native_transport_digest(envelope: Mapping[str, Any]) -> str:

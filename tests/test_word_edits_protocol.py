@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 from fastapi import HTTPException
 from pydantic import ValidationError
+import pymupdf as fitz
 
 from app.core.word_edits import (
     WORD_EDIT_PROTOCOL,
@@ -17,6 +18,7 @@ from app.core.word_edits import (
     baseline_digest,
     build_word_edit_baseline,
     native_transport_digest,
+    resolve_word_edit_targets,
     validate_word_edit_request,
     validate_word_edit_transport as transport_operation,
 )
@@ -34,6 +36,8 @@ def extraction_fixture():
         "languages": ["eng"],
         "pages": [{
             "page_num": 1,
+            "width": 595.0,
+            "height": 842.0,
             "elements": [{
                 "id": "line-1",
                 "word_ids": ["word-1", "word-2", "word-3"],
@@ -103,6 +107,21 @@ def test_validates_final_snapshot_against_immutable_baseline_and_preserves_unico
     assert validated["edits"][0]["replacement_text"] == "🧪𠮷"
     assert validated["edits"][1]["replacement_text"] == ""
     assert native_transport_digest(validated) == native_transport_digest(deepcopy(request))
+
+
+def test_resolves_repeated_word_identity_to_frozen_server_geometry():
+    extraction = extraction_fixture()
+    request = request_fixture(extraction)
+    request["edits"] = [request["edits"][0] | {"replacement_text": "third"}]
+    resolved = resolve_word_edit_targets(validate_word_edit_request(request, extraction), extraction["result"])
+    assert resolved == [{
+        "edit": request["edits"][0],
+        "bbox": [7.0, 2.0, 10.0, 6.0],
+        "page_size": [595.0, 842.0],
+        "source_sha256": extraction["result"]["word_edit_baseline"]["source_sha256"],
+        "baseline_digest": request["baseline_digest"],
+    }]
+    assert resolved[0]["edit"]["word_id"] == "word-3"
 
 
 @pytest.mark.parametrize(
@@ -243,7 +262,7 @@ def test_operations_cross_native_isolation_with_exact_identity_and_unicode(tmp_p
     }
 
 
-def test_worker_actor_forwards_exact_validated_request_then_fails_without_artifact(monkeypatch, tmp_path):
+def test_worker_actor_forwards_exact_validated_request_and_refuses_without_artifact(monkeypatch, tmp_path):
     source_bytes = b"test source PDF identity"
     extraction = extraction_fixture()
     extraction["result"]["word_edit_baseline"] = build_word_edit_baseline(
@@ -261,25 +280,87 @@ def test_worker_actor_forwards_exact_validated_request_then_fails_without_artifa
     monkeypatch.setattr(actors, "check_cancellation", lambda _job_id: None)
     monkeypatch.setattr(actors, "acquire_lease", lambda _job_id, _owner: (True, ""))
     monkeypatch.setattr(actors, "release_lease", lambda *_args: None)
-    monkeypatch.setattr(actors, "temp_file_path", lambda **_kwargs: str(tmp_path / "source.pdf"))
+    monkeypatch.setattr(actors, "temp_file_path", lambda **kwargs: str(tmp_path / ("output.pdf" if "output" in kwargs.get("prefix", "") else "source.pdf")))
     monkeypatch.setattr(actors, "download_to_path", lambda _key, path: Path(path).write_bytes(source_bytes))
-    monkeypatch.setattr(actors, "cleanup_paths", lambda *_paths: None)
+    monkeypatch.setattr(actors, "cleanup_paths", lambda *paths: [Path(path).unlink(missing_ok=True) for path in paths])
     monkeypatch.setattr(actors, "update_job", lambda _job_id, **fields: updates.append(fields))
     def capture_transport(**kwargs):
         calls.append(deepcopy(kwargs["envelope"]))
         return transport_operation(**kwargs)
 
     monkeypatch.setattr(actors, "validate_word_edit_transport", capture_transport)
+    compile_calls = []
+
+    def refuse_compile(*args, **kwargs):
+        compile_calls.append((deepcopy(args[2]), deepcopy(args[3])))
+        return {"status": "REFUSED", "error_code": "BACKGROUND_UNCERTAIN"}
+
+    monkeypatch.setattr(actors, "compile_scanned_word_edits", refuse_compile)
     monkeypatch.setattr(actors, "compile_document", lambda *_args, **_kwargs: pytest.fail("word protocol must not use legacy line compiler"))
     monkeypatch.setattr(actors, "upload_path", lambda *_args, **_kwargs: pytest.fail("unsupported word compile must not upload an artifact"))
 
     actors.editor_word_edit_compile_job.fn("word-job", envelope)
     assert calls == [envelope]
+    assert compile_calls[0][0] == envelope
+    assert compile_calls[0][1][0]["edit"]["word_id"] == "word-3"
+    assert compile_calls[0][1][0]["bbox"] == [7.0, 2.0, 10.0, 6.0]
     final = updates[-1]
     assert final["status"] == JobState.failed
-    assert final["error_code"] == "WORD_EDIT_COMPILATION_NOT_IMPLEMENTED"
+    assert final["error_code"] == "BACKGROUND_UNCERTAIN"
     assert final["result"]["validated_operation_count"] == 2
     assert "artifact_key" not in final["result"]
+
+
+def test_worker_actor_only_marks_success_after_verified_artifact_upload(monkeypatch, tmp_path):
+    source_bytes = b"test source PDF identity"
+    extraction = extraction_fixture()
+    extraction["result"]["word_edit_baseline"] = build_word_edit_baseline(
+        extraction["id"], hashlib.sha256(source_bytes).hexdigest(), "sha256:" + "b" * 64, extraction["result"]
+    )
+    envelope = request_fixture(extraction)
+    extraction_job = SimpleNamespace(**extraction, owner_identity="owner")
+    compile_job = SimpleNamespace(id="word-job", payload={"ownerIdentity": "owner"}, owner_identity="owner")
+    updates = []
+    uploaded = []
+    monkeypatch.setattr(actors, "get_job", lambda job_id: extraction_job if job_id == "extract-1" else compile_job)
+    monkeypatch.setattr(actors, "check_cancellation", lambda _job_id: None)
+    monkeypatch.setattr(actors, "acquire_lease", lambda _job_id, _owner: (True, ""))
+    monkeypatch.setattr(actors, "release_lease", lambda *_args: None)
+    monkeypatch.setattr(actors, "temp_file_path", lambda **kwargs: str(tmp_path / ("output.pdf" if "output" in kwargs.get("prefix", "") else "source.pdf")))
+    monkeypatch.setattr(actors, "download_to_path", lambda _key, path: Path(path).write_bytes(source_bytes))
+    monkeypatch.setattr(actors, "cleanup_paths", lambda *paths: [Path(path).unlink(missing_ok=True) for path in paths])
+    monkeypatch.setattr(actors, "update_job", lambda _job_id, **fields: updates.append(fields))
+    monkeypatch.setattr(actors, "validate_word_edit_transport", lambda **kwargs: transport_operation(**kwargs))
+    monkeypatch.setattr(actors, "build_key", lambda *_args, **_kwargs: "jobs/editor/word-edit/output/test.pdf")
+
+    def compile_candidate(_source, output_path, _request, _targets, source_sha, cancellation_check=None):
+        doc = fitz.open()
+        doc.new_page(width=595, height=842)
+        doc.save(output_path)
+        doc.close()
+        return {
+            "status": "EDITED",
+            "protocol": WORD_EDIT_PROTOCOL,
+            "page_count": 1,
+            "operation_count": 2,
+            "artifact_sha256": actors._sha256_file(output_path),
+            "target_results": [],
+            "outside_changed_pixels_144dpi": 0,
+            "outside_changed_pixels_by_dpi": {"72": 0, "144": 0, "288": 0},
+            "source_sha256": source_sha,
+        }
+
+    monkeypatch.setattr(actors, "compile_scanned_word_edits", compile_candidate)
+    monkeypatch.setattr(actors, "upload_path", lambda path, key, content_type: uploaded.append((Path(path).read_bytes(), key, content_type)))
+
+    actors.editor_word_edit_compile_job.fn("word-job", envelope)
+
+    assert len(uploaded) == 1
+    assert uploaded[0][1:] == ("jobs/editor/word-edit/output/test.pdf", "application/pdf")
+    final = updates[-1]
+    assert final["status"] == JobState.succeeded
+    assert final["result"]["artifact_key"] == uploaded[0][1]
+    assert final["result"]["artifact_sha256"] == hashlib.sha256(uploaded[0][0]).hexdigest()
 
 
 def test_failed_word_edit_download_is_rejected_without_streaming(monkeypatch):

@@ -122,6 +122,17 @@ def arguments(operation,fixtures,tmp_path):
             'baseline_digest':'sha256:'+'a'*64,
             'edits':[{'page_num':1,'element_id':'line-1','word_id':'word-1','expected_original_text':'word','replacement_text':'🧪𠮷','style_override':None,'fit_policy':'preserve_neighbors'}],
         }
+    if 'resolved_targets' in p.required:
+        import hashlib
+        digest = hashlib.sha256(pdf.read_bytes()).hexdigest()
+        values['expected_source_sha256'] = digest
+        values['resolved_targets'] = [{
+            'edit': values['envelope']['edits'][0],
+            'bbox': [20.0, 10.0, 40.0, 20.0],
+            'page_size': [300.0, 200.0],
+            'source_sha256': digest,
+            'baseline_digest': values['envelope']['baseline_digest'],
+        }]
     if 'layout' in p.required:values['layout']={'pages':[{'source':'NATIVE_EXTRACTION','page_num':1,'elements':[{'x':15,'y':20,'width':260,'height':35}]}]}
     if operation=='execute_ocr_markup':values['query']='F11'
     if operation in ('execute_ocr_text','execute_document_extraction','execute_pdf_to_markdown','structured_document'):values['routing_policy']='FAST'
@@ -147,6 +158,7 @@ def test_all24_actual_dispatcher_roundtrip_and_release(controller,fixtures,tmp_p
             with pymupdf.open(output) as pdf:
                 assert len(pdf)==1
                 if operation in ('execute_ocr_markup','execute_studio_markup_region_ocr','execute_legacy_markup','process_markup_pdf'):assert list(pdf[0].annots()) or pdf[0].get_drawings()
+                if operation == 'compile_scanned_word_edits': assert result['status'] == 'REFUSED'
         elif output.suffix=='.docx':
             import zipfile
             assert 'word/document.xml' in zipfile.ZipFile(output).namelist()
