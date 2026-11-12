@@ -9,11 +9,13 @@ from __future__ import annotations
 from collections import Counter
 from hashlib import sha256
 from io import BytesIO
+import html
 import math
 import os
 from pathlib import Path
 from statistics import median
 from typing import Any, Callable
+import unicodedata
 
 import pymupdf as fitz
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageOps
@@ -24,6 +26,21 @@ _TARGET_MARGIN = 1.0
 _DETECT_MARGIN = 1.5
 _CONTEXT_MARGIN = 4.0
 _PATCH_DPI = 288
+_MAX_SCRIPT_PATCH_PIXELS = 10_000_000
+_SCRIPT_FONTS = {
+    "sinhala": {
+        "range": (0x0D80, 0x0DFF),
+        "fontfile": "/usr/share/fonts/truetype/noto/NotoSansSinhala-Regular.ttf",
+        "fontname": "p5_sinhala",
+        "family": "NotoSansSinhala",
+    },
+    "tamil": {
+        "range": (0x0B80, 0x0BFF),
+        "fontfile": "/usr/share/fonts/truetype/noto/NotoSansTamil-Regular.ttf",
+        "fontname": "p5_tamil",
+        "family": "NotoSansTamil",
+    },
+}
 _VALIDATION_DPIS = (72, 144, 288)
 _NATIVE_FONT_ALIASES = {
     "Helvetica": "helv",
@@ -140,21 +157,33 @@ def compile_scanned_word_edits(
                                 plan["target_rect"].x0,
                                 plan["baseline"],
                                 replacement,
-                                fontname="tibo",
+                                fontname=plan.get("semantic_fontname") or "tibo",
                                 fontsize=plan["font_size"],
                                 color=plan["ink_color"],
                                 render_mode=3,
+                                fontfile=plan.get("semantic_fontfile"),
                             )
                     elif replacement:
+                        if plan.get("shaped_patch_png"):
+                            page.insert_image(
+                                plan["replacement_rect"],
+                                stream=plan["shaped_patch_png"],
+                                overlay=True,
+                                keep_proportion=False,
+                            )
+                            render_mode = 3
+                        else:
+                            render_mode = 0
                         plan["semantic_xref"] = _insert_semantic_text(
                             page,
                             plan["text_origin"][0],
                             plan["text_origin"][1],
                             replacement,
-                            fontname=plan["font_alias"],
+                            fontname=plan.get("semantic_fontname") or plan["font_alias"],
                             fontsize=plan["font_size"],
                             color=plan["ink_color"],
-                            render_mode=0,
+                            render_mode=render_mode,
+                            fontfile=plan.get("semantic_fontfile"),
                         )
                 _reorder_semantic_streams(document, page, page_plans)
             document.save(temporary, garbage=0, deflate=False, deflate_images=False)
@@ -226,9 +255,14 @@ def _validate_transport(
         if any(type(value) not in (int, float) or not math.isfinite(value) for value in target["bbox"] + target["page_size"]):
             return "UNSUPPORTED_WORD_GEOMETRY"
         replacement = edit.get("replacement_text")
-        if type(replacement) is not str or any(ord(char) > 0x7F for char in replacement):
+        if type(replacement) is not str:
             return "UNSUPPORTED_REPLACEMENT_TEXT"
-        if any(not (char.isalpha() or char.isdigit() or char in " -'.,;:!?()") for char in replacement):
+        script_profile, script_error = _script_profile(replacement)
+        if script_error:
+            return script_error
+        if script_profile is None and any(ord(char) > 0x7F for char in replacement):
+            return "UNSUPPORTED_REPLACEMENT_TEXT"
+        if script_profile is None and any(not (char.isalpha() or char.isdigit() or char in " -'.,;:!?()") for char in replacement):
             return "UNSUPPORTED_REPLACEMENT_TEXT"
     return None
 
@@ -245,17 +279,32 @@ def _prepare_target(source: fitz.Document, resolved: dict[str, Any]) -> tuple[di
     if abs(page.rect.width - float(expected_size[0])) > 0.05 or abs(page.rect.height - float(expected_size[1])) > 0.05:
         return None, "UNSUPPORTED_WORD_GEOMETRY"
     x0, y0, x1, y1 = map(float, resolved["bbox"])
-    target_rect = fitz.Rect(x0, y0, x1, y1)
-    if target_rect.is_empty or not page.rect.contains(target_rect) or target_rect.width > page.rect.width * 0.5 or target_rect.height > page.rect.height * 0.15:
+    visible_rect = fitz.Rect(x0, y0, x1, y1)
+    visible_page = fitz.Rect(0.0, 0.0, float(page.rect.width), float(page.rect.height))
+    native_page = _native_page_rect(page)
+    if visible_rect.is_empty or not visible_page.contains(visible_rect):
         return None, "UNSUPPORTED_WORD_GEOMETRY"
-    image_rects = _image_rects(page)
-    intersecting_images = [rect for rect in image_rects if rect.intersects(target_rect)]
-    containing_images = [rect for rect in intersecting_images if rect.contains(target_rect)]
-    if any(not rect.contains(target_rect) for rect in intersecting_images):
+    target_rect = visible_rect * page.derotation_matrix
+    target_rect.normalize()
+    if (
+        target_rect.is_empty
+        or not native_page.contains(target_rect)
+        or target_rect.width > native_page.width * 0.5
+        or target_rect.height > native_page.height * 0.15
+    ):
+        return None, "UNSUPPORTED_WORD_GEOMETRY"
+    image_occurrences = _image_occurrences(page)
+    intersecting_images = [item for item in image_occurrences if item[0].intersects(target_rect)]
+    if any(not _supported_image_transform(rect, matrix) for rect, matrix in intersecting_images):
+        return None, "UNSUPPORTED_IMAGE_TRANSFORM"
+    containing_images = [rect for rect, _ in intersecting_images if rect.contains(target_rect)]
+    if any(not rect.contains(target_rect) for rect, _ in intersecting_images):
         return None, "AMBIGUOUS_TARGET_REPRESENTATION"
     if len(containing_images) > 1:
         return None, "AMBIGUOUS_TARGET_REPRESENTATION"
     if containing_images:
+        if page.rotation != 0:
+            return None, "UNSUPPORTED_PAGE_GEOMETRY"
         return _prepare_scan_target(page, resolved, page_index, target_rect)
     return _prepare_native_target(page, resolved, page_index, target_rect)
 
@@ -304,24 +353,71 @@ def _prepare_scan_target(
     ink_color = _ink_color(context, ink_mask)
     replacement = edit["replacement_text"]
     font_size = target_rect.height * 1.10
+    replacement_script, script_error = _script_profile(replacement)
+    if script_error:
+        return None, script_error
+    semantic_fontfile = None
+    semantic_fontname = "tibo"
     if replacement:
-        measured_width = fitz.get_text_length(replacement, fontname="tibo", fontsize=font_size)
-        if measured_width > target_rect.width * 0.96:
-            return None, "REPLACEMENT_DOES_NOT_FIT"
-        try:
-            patch = _render_replacement_patch(
-                patch,
-                allowed_px,
-                context_origin_x,
-                context_origin_y,
-                target_rect,
-                target_rect.y0 + target_rect.height * 0.80,
-                replacement,
-                font_size,
-                ink_color,
+        baseline = target_rect.y0 + target_rect.height * 0.80
+        if replacement_script is not None:
+            # A searchable scan has a trusted OCR baseline and font size in its
+            # hidden text span. Use those metrics to align the shaped visible
+            # patch and the invisible Unicode replacement. Image-only scans do
+            # not provide enough typography evidence to place complex scripts
+            # safely, so refuse them instead of guessing from the OCR box.
+            if hidden_rect is None or source_word_index is None:
+                return None, "SCRIPT_SCAN_STYLE_UNRESOLVED"
+            script_metrics = _hidden_word_metrics(page, source_word_index)
+            if script_metrics is None:
+                return None, "SCRIPT_SCAN_STYLE_UNRESOLVED"
+            baseline, font_size = script_metrics
+            script_font = _SCRIPT_FONTS[replacement_script]
+            shaped, shape_error = _render_shaped_script_patch(
+                replacement, script_font, font_size, target_rect.width * 0.96, ink_color
             )
-        except Exception:
-            return None, "REPLACEMENT_RENDER_UNSUPPORTED"
+            if shape_error:
+                return None, shape_error
+            if shaped is None:
+                return None, "SCRIPT_SHAPING_UNSUPPORTED"
+            rendered_rect = fitz.Rect(
+                target_rect.x0 + shaped["offset_x"],
+                baseline + shaped["offset_y"],
+                target_rect.x0 + shaped["offset_x"] + shaped["width"],
+                baseline + shaped["offset_y"] + shaped["height"],
+            )
+            if not target_rect.contains(rendered_rect):
+                return None, "REPLACEMENT_DOES_NOT_FIT"
+            patch_origin_x = (context_origin_x + allowed_px[0]) / scale
+            patch_origin_y = (context_origin_y + allowed_px[1]) / scale
+            local_x = round((rendered_rect.x0 - patch_origin_x) * scale)
+            local_y = round((rendered_rect.y0 - patch_origin_y) * scale)
+            overlay = Image.open(BytesIO(shaped["png"])).convert("RGBA")
+            if local_x < 0 or local_y < 0 or local_x + overlay.width > patch.width or local_y + overlay.height > patch.height:
+                return None, "REPLACEMENT_DOES_NOT_FIT"
+            composite = Image.new("RGBA", patch.size, (0, 0, 0, 0))
+            composite.alpha_composite(overlay, (local_x, local_y))
+            patch = Image.alpha_composite(patch.convert("RGBA"), composite).convert("RGB")
+            semantic_fontfile = script_font["fontfile"]
+            semantic_fontname = script_font["fontname"]
+        else:
+            measured_width = fitz.get_text_length(replacement, fontname="tibo", fontsize=font_size)
+            if measured_width > target_rect.width * 0.96:
+                return None, "REPLACEMENT_DOES_NOT_FIT"
+            try:
+                patch = _render_replacement_patch(
+                    patch,
+                    allowed_px,
+                    context_origin_x,
+                    context_origin_y,
+                    target_rect,
+                    baseline,
+                    replacement,
+                    font_size,
+                    ink_color,
+                )
+            except Exception:
+                return None, "REPLACEMENT_RENDER_UNSUPPORTED"
     insertion_slot = source_word_index
     if insertion_slot is None:
         insertion_slot, order_error = _scan_insertion_slot(page, target_rect)
@@ -341,6 +437,8 @@ def _prepare_scan_target(
         "font_size": font_size,
         "ink_color": ink_color,
         "patch_png": _png_bytes(patch),
+        "semantic_fontfile": semantic_fontfile,
+        "semantic_fontname": semantic_fontname,
     }, None
 
 
@@ -354,7 +452,8 @@ def _prepare_native_target(
     expected = edit["expected_original_text"]
     if any(0xFB00 <= ord(char) <= 0xFB06 for char in expected):
         return None, "NATIVE_GLYPH_CLUSTER_UNSUPPORTED"
-    if not expected or any(ord(char) > 0x7F for char in expected):
+    expected_script, expected_script_error = _script_profile(expected)
+    if not expected or expected_script_error or (any(ord(char) > 0x7F for char in expected) and expected_script is None):
         return None, "NATIVE_SOURCE_TEXT_UNSUPPORTED"
     words = page.get_text("words", sort=False)
     matching_words: list[tuple[int, Any, fitz.Rect]] = []
@@ -390,21 +489,37 @@ def _prepare_native_target(
     span = traces[span_index]
     glyph_chars = [entry for entry in selected_chars if entry[0] == span_index and int(entry[3][0]) != 32]
     source_text = "".join(chr(int(entry[3][0])) for entry in glyph_chars)
-    if any(ord(char) > 0x7F for char in source_text):
+    source_script, source_script_error = _script_profile(source_text)
+    if source_script_error or (any(ord(char) > 0x7F for char in source_text) and source_script is None):
         return None, "NATIVE_GLYPH_CLUSTER_UNSUPPORTED"
     if source_text != expected:
         return None, "NATIVE_SOURCE_TEXT_IDENTITY_MISMATCH"
     if span.get("type") != 0 or span.get("wmode") != 0 or tuple(span.get("dir", ())) != (1.0, 0.0):
         return None, "NATIVE_TEXT_RENDERING_UNSUPPORTED"
+    replacement = edit["replacement_text"]
+    replacement_script, script_error = _script_profile(replacement)
+    if script_error:
+        return None, script_error
     font_name = str(span.get("font", ""))
     font_alias = _NATIVE_FONT_ALIASES.get(font_name)
-    replacement = edit["replacement_text"]
-    if replacement and font_alias is None:
+    if replacement and font_alias is None and replacement_script is None:
         return None, "NATIVE_FONT_UNSUPPORTED"
-    try:
-        font = fitz.Font(fontname=font_alias) if font_alias is not None else None
-    except Exception:
-        return None, "NATIVE_FONT_UNSUPPORTED"
+    if replacement_script is not None:
+        script_font = _SCRIPT_FONTS[replacement_script]
+        fontfile = Path(script_font["fontfile"])
+        if not fontfile.is_file():
+            return None, "SCRIPT_FONT_UNAVAILABLE"
+        try:
+            font = fitz.Font(fontfile=str(fontfile))
+        except Exception:
+            return None, "SCRIPT_FONT_UNAVAILABLE"
+    else:
+        script_font = None
+        fontfile = None
+        try:
+            font = fitz.Font(fontname=font_alias) if font_alias is not None else None
+        except Exception:
+            return None, "NATIVE_FONT_UNSUPPORTED"
     fontsize = float(span.get("size", 0.0))
     if not math.isfinite(fontsize) or fontsize <= 0:
         return None, "NATIVE_FONT_UNSUPPORTED"
@@ -422,15 +537,12 @@ def _prepare_native_target(
                 return None, "NATIVE_GLYPH_OVERLAP"
 
     replacement_extent = None
+    shaped_patch_png = None
     if replacement:
         if not replacement.strip():
             return None, "UNSUPPORTED_REPLACEMENT_TEXT"
-        if not all(font.has_glyph(ord(char)) for char in replacement):
+        if not _font_covers_text(font, replacement):
             return None, "NATIVE_FONT_GLYPH_UNSUPPORTED"
-        projected_glyphs = _project_font_glyphs(font, replacement, origin, fontsize)
-        if not projected_glyphs:
-            return None, "UNSUPPORTED_REPLACEMENT_TEXT"
-        replacement_extent = _union_rects(projected_glyphs)
         same_line_neighbors: list[fitz.Rect] = []
         for other_span_index, other_span in enumerate(traces):
             for other_index, char in enumerate(other_span.get("chars", ())):
@@ -442,14 +554,37 @@ def _prepare_native_target(
                     same_line_neighbors.append(other_rect)
         next_glyph_x = min(
             (rect.x0 for rect in same_line_neighbors if rect.x0 >= word_rect.x1 - 0.05),
-            default=page.rect.x1,
+            default=_native_page_rect(page).x1,
         )
-        text_width = font.text_length(replacement, fontsize)
-        if origin[0] + text_width > next_glyph_x - 0.35:
-            return None, "REPLACEMENT_DOES_NOT_FIT"
-        if any(_overlap_area(projected, neighbor) > 0.05 for projected in projected_glyphs for neighbor in same_line_neighbors):
-            return None, "NATIVE_REPLACEMENT_COLLISION"
-        if replacement_extent.x0 < page.rect.x0 or replacement_extent.y0 < page.rect.y0 or replacement_extent.x1 > page.rect.x1 or replacement_extent.y1 > page.rect.y1:
+        if replacement_script is not None:
+            shaped, shape_error = _render_shaped_script_patch(
+                replacement,
+                script_font,
+                fontsize,
+                max(0.0, next_glyph_x - origin[0] - 0.35),
+                color,
+            )
+            if shape_error:
+                return None, shape_error
+            shaped_patch_png = shaped["png"]
+            replacement_extent = fitz.Rect(
+                origin[0] + shaped["offset_x"],
+                origin[1] + shaped["offset_y"],
+                origin[0] + shaped["offset_x"] + shaped["width"],
+                origin[1] + shaped["offset_y"] + shaped["height"],
+            )
+        else:
+            projected_glyphs = _project_font_glyphs(font, replacement, origin, fontsize)
+            if not projected_glyphs:
+                return None, "UNSUPPORTED_REPLACEMENT_TEXT"
+            replacement_extent = _union_rects(projected_glyphs)
+            text_width = font.text_length(replacement, fontsize)
+            if origin[0] + text_width > next_glyph_x - 0.35:
+                return None, "REPLACEMENT_DOES_NOT_FIT"
+            if any(_overlap_area(projected, neighbor) > 0.05 for projected in projected_glyphs for neighbor in same_line_neighbors):
+                return None, "NATIVE_REPLACEMENT_COLLISION"
+        native_bounds = _native_page_rect(page)
+        if replacement_extent.x0 < native_bounds.x0 or replacement_extent.y0 < native_bounds.y0 or replacement_extent.x1 > native_bounds.x1 or replacement_extent.y1 > native_bounds.y1:
             return None, "UNSUPPORTED_WORD_GEOMETRY"
     allowed_rect = fitz.Rect(word_rect)
     if replacement_extent is not None:
@@ -473,18 +608,50 @@ def _prepare_native_target(
         "insertion_slot": source_word_index,
         "text_origin": origin,
         "font_alias": font_alias,
+        "semantic_fontfile": str(fontfile) if fontfile is not None else None,
+        "semantic_fontname": script_font["fontname"] if script_font is not None else font_alias,
+        "shaped_patch_png": shaped_patch_png,
         "font_size": fontsize,
         "ink_color": color,
     }, None
 
 
 def _image_rects(page: fitz.Page) -> list[fitz.Rect]:
-    rectangles: list[fitz.Rect] = []
+    return [rect for rect, _ in _image_occurrences(page)]
+
+
+def _image_occurrences(page: fitz.Page) -> list[tuple[fitz.Rect, fitz.Matrix]]:
+    occurrences: list[tuple[fitz.Rect, fitz.Matrix]] = []
     for image in page.get_images(full=True):
         xref = int(image[0])
         if xref > 0:
-            rectangles.extend(fitz.Rect(rect) for rect in page.get_image_rects(xref))
-    return rectangles
+            try:
+                placements = page.get_image_rects(xref, transform=True)
+            except (AttributeError, RuntimeError, ValueError):
+                placements = [
+                    (rect, fitz.Matrix(float("nan"), 0, 0, float("nan"), 0, 0))
+                    for rect in page.get_image_rects(xref)
+                ]
+            for rect, matrix in placements:
+                occurrences.append((fitz.Rect(rect), fitz.Matrix(matrix)))
+    return occurrences
+
+
+def _supported_image_transform(rect: fitz.Rect, matrix: fitz.Matrix) -> bool:
+    """Accept only positive axis-aligned image scaling plus translation."""
+    values = tuple(float(value) for value in matrix)
+    if len(values) != 6 or any(not math.isfinite(value) for value in values):
+        return False
+    a, b, c, d, _, _ = values
+    if a <= 0 or d <= 0 or abs(b) > 1e-5 or abs(c) > 1e-5:
+        return False
+    mapped_unit = fitz.Rect(0, 0, 1, 1) * matrix
+    return (
+        abs(mapped_unit.x0 - rect.x0) < 0.05
+        and abs(mapped_unit.y0 - rect.y0) < 0.05
+        and abs(mapped_unit.x1 - rect.x1) < 0.05
+        and abs(mapped_unit.y1 - rect.y1) < 0.05
+    )
 
 
 def _union_rects(rectangles: list[fitz.Rect]) -> fitz.Rect:
@@ -496,6 +663,129 @@ def _union_rects(rectangles: list[fitz.Rect]) -> fitz.Rect:
         max(rect.x1 for rect in rectangles),
         max(rect.y1 for rect in rectangles),
     )
+
+
+def _script_profile(text: str) -> tuple[str | None, str | None]:
+    if not isinstance(text, str):
+        return None, "UNSUPPORTED_REPLACEMENT_TEXT"
+    present = [
+        name for name, profile in _SCRIPT_FONTS.items()
+        if any(profile["range"][0] <= ord(char) <= profile["range"][1] for char in text)
+    ]
+    if not present:
+        if any(ord(char) > 0x7F for char in text):
+            return None, "UNSUPPORTED_REPLACEMENT_TEXT"
+        return None, None
+    if len(present) != 1:
+        return None, "UNSUPPORTED_REPLACEMENT_TEXT"
+    selected = present[0]
+    low, high = _SCRIPT_FONTS[selected]["range"]
+    if not any(low <= ord(char) <= high and unicodedata.category(char).startswith("L") for char in text):
+        return None, "UNSUPPORTED_REPLACEMENT_TEXT"
+    for char in text:
+        codepoint = ord(char)
+        if low <= codepoint <= high or codepoint in (0x200C, 0x200D):
+            continue
+        if char.isascii() and (char.isalnum() or char.isspace() or char in "-'.,;:!?()"):
+            continue
+        return None, "UNSUPPORTED_REPLACEMENT_TEXT"
+    return selected, None
+
+
+def _font_covers_text(font: fitz.Font, text: str) -> bool:
+    return all(
+        ord(char) in (0x200C, 0x200D) or font.has_glyph(ord(char)) > 0
+        for char in text
+    )
+
+
+def _render_shaped_script_patch(
+    text: str,
+    profile: dict[str, Any],
+    fontsize: float,
+    max_width: float,
+    color: tuple[float, float, float],
+) -> tuple[dict[str, Any] | None, str | None]:
+    font_path = Path(profile["fontfile"])
+    if not font_path.is_file():
+        return None, "SCRIPT_FONT_UNAVAILABLE"
+    if not math.isfinite(fontsize) or not 1.0 <= fontsize <= 256.0:
+        return None, "SCRIPT_FONT_SIZE_UNSUPPORTED"
+    if not math.isfinite(max_width) or max_width < 2.0 or max_width > 4096.0:
+        return None, "REPLACEMENT_DOES_NOT_FIT"
+    try:
+        font = fitz.Font(fontfile=str(font_path))
+    except Exception:
+        return None, "SCRIPT_FONT_UNAVAILABLE"
+    if not _font_covers_text(font, text):
+        return None, "NATIVE_FONT_GLYPH_UNSUPPORTED"
+
+    scale = _PATCH_DPI / 72.0
+    margin = max(12.0, fontsize * 1.5)
+    width = max_width + 2 * margin
+    height = fontsize * 4.0 + 2 * margin
+    if math.ceil(width * scale) * math.ceil(height * scale) > _MAX_SCRIPT_PATCH_PIXELS:
+        return None, "SCRIPT_PATCH_EXCEEDS_LIMIT"
+    color_css = ",".join(str(round(max(0.0, min(1.0, channel)) * 255)) for channel in color)
+    css = (
+        f"@font-face{{font-family:{profile['family']};src:url({font_path.name});}}"
+        "html,body{margin:0;padding:0;}"
+        f"span{{font-family:{profile['family']};font-size:{fontsize:.4f}pt;"
+        f"line-height:1.25;color:rgb({color_css});white-space:nowrap;}}"
+    )
+    document = fitz.open()
+    try:
+        page = document.new_page(width=width, height=height)
+        text_rect = fitz.Rect(margin, margin, margin + max_width, height - margin)
+        try:
+            spare_height, layout_scale = page.insert_htmlbox(
+                text_rect,
+                f"<span>{html.escape(text, quote=False)}</span>",
+                css=css,
+                archive=fitz.Archive(str(font_path.parent)),
+                scale_low=1.0,
+            )
+        except Exception:
+            return None, "SCRIPT_SHAPING_UNSUPPORTED"
+        if spare_height < 0 or layout_scale < 0.999999:
+            return None, "REPLACEMENT_DOES_NOT_FIT"
+        traces = [span for span in page.get_texttrace() if span.get("chars")]
+        if not traces or any(
+            span.get("type") != 0
+            or span.get("wmode") != 0
+            or tuple(span.get("dir", ())) != (1.0, 0.0)
+            for span in traces
+        ):
+            return None, "SCRIPT_SHAPING_UNSUPPORTED"
+        origins = [tuple(map(float, char[2])) for span in traces for char in span.get("chars", ()) if len(char) >= 3]
+        if not origins or any(abs(origin[1] - origins[0][1]) > 0.1 for origin in origins):
+            return None, "SCRIPT_SHAPING_UNSUPPORTED"
+
+        pixmap = page.get_pixmap(matrix=fitz.Matrix(scale, scale), colorspace=fitz.csRGB, alpha=True)
+        if pixmap.width * pixmap.height > _MAX_SCRIPT_PATCH_PIXELS or pixmap.n != 4:
+            return None, "SCRIPT_PATCH_EXCEEDS_LIMIT"
+        rendered = Image.frombytes("RGBA", (pixmap.width, pixmap.height), pixmap.samples)
+        ink_bbox = rendered.getchannel("A").getbbox()
+        if ink_bbox is None:
+            return None, "SCRIPT_SHAPING_UNSUPPORTED"
+        shaped = rendered.crop(ink_bbox)
+        baseline_x, baseline_y = origins[0]
+        offset_x = float(pixmap.x) / scale + ink_bbox[0] / scale - baseline_x
+        offset_y = float(pixmap.y) / scale + ink_bbox[1] / scale - baseline_y
+        return {
+            "png": _png_bytes(shaped),
+            "width": shaped.width / scale,
+            "height": shaped.height / scale,
+            "offset_x": offset_x,
+            "offset_y": offset_y,
+        }, None
+    finally:
+        document.close()
+
+
+def _native_page_rect(page: fitz.Page) -> fitz.Rect:
+    """Return the unrotated CropBox-relative frame used by text/page APIs."""
+    return fitz.Rect(0.0, 0.0, float(page.cropbox.width), float(page.cropbox.height))
 
 
 def _overlap_area(left: fitz.Rect, right: fitz.Rect) -> float:
@@ -621,7 +911,10 @@ def _insert_semantic_text(
     fontsize: float,
     color: tuple[float, float, float],
     render_mode: int,
+    fontfile: str | None = None,
 ) -> int:
+    if fontfile:
+        page.insert_font(fontname=fontname, fontfile=fontfile)
     before = set(page.get_contents())
     page.insert_text(
         fitz.Point(x, y),
@@ -658,14 +951,19 @@ def _reorder_semantic_streams(document: fitz.Document, page: fitz.Page, plans: l
 
 
 def _supported_geometry(page: fitz.Page) -> bool:
+    rotation = page.rotation
+    if rotation not in (0, 90, 180, 270):
+        return False
+    crop = page.cropbox
+    media = page.mediabox
+    if crop.is_empty or crop.width <= 0 or crop.height <= 0 or media.is_empty:
+        return False
+    expected_size = (crop.height, crop.width) if rotation in (90, 270) else (crop.width, crop.height)
     return (
-        page.rotation == 0
-        and abs(page.cropbox.x0 - page.mediabox.x0) < 0.05
-        and abs(page.cropbox.y0 - page.mediabox.y0) < 0.05
-        and abs(page.cropbox.x1 - page.mediabox.x1) < 0.05
-        and abs(page.cropbox.y1 - page.mediabox.y1) < 0.05
-        and abs(page.rect.x0) < 0.05
+        abs(page.rect.x0) < 0.05
         and abs(page.rect.y0) < 0.05
+        and abs(page.rect.width - expected_size[0]) < 0.05
+        and abs(page.rect.height - expected_size[1]) < 0.05
     )
 
 
@@ -774,6 +1072,38 @@ def _hidden_target_rect(
     return redact, word_index, None
 
 
+def _hidden_word_metrics(page: fitz.Page, word_index: int) -> tuple[float, float] | None:
+    """Return the validated hidden OCR word's baseline and point size."""
+    words = page.get_text("words", sort=False)
+    if word_index < 0 or word_index >= len(words):
+        return None
+    word_rect = fitz.Rect(words[word_index][:4])
+    matches: list[tuple[float, float]] = []
+    for span in page.get_texttrace():
+        selected = []
+        for char in span.get("chars", ()):
+            if len(char) < 4 or int(char[0]) == 32:
+                continue
+            glyph_rect = fitz.Rect(char[3])
+            center = fitz.Point((glyph_rect.x0 + glyph_rect.x1) / 2, (glyph_rect.y0 + glyph_rect.y1) / 2)
+            if word_rect.contains(center):
+                selected.append(char)
+        if selected:
+            if span.get("type") != 3 or span.get("wmode") != 0 or tuple(span.get("dir", ())) != (1.0, 0.0):
+                return None
+            try:
+                baseline = float(selected[0][2][1])
+                fontsize = float(span["size"])
+            except (IndexError, KeyError, TypeError, ValueError):
+                return None
+            if not math.isfinite(baseline) or not math.isfinite(fontsize) or fontsize <= 0:
+                return None
+            matches.append((baseline, fontsize))
+    if len(matches) != 1:
+        return None
+    return matches[0]
+
+
 def _trace_has_glyph_in_rect(span: dict[str, Any], target: fitz.Rect) -> bool:
     for char in span.get("chars", ()):
         if len(char) < 4:
@@ -810,7 +1140,45 @@ def _detect_protected_overlap(image: Image.Image, target: tuple[int, int, int, i
     columns = [sum(1 for y in range(height) if gray.getpixel((x, y)) < 105) for x in range(width)]
     if any(count >= width * 0.92 for count in rows) or any(count >= height * 0.92 for count in columns):
         return "BACKGROUND_RULE_OVERLAP"
+    if _has_oversized_connected_ink(crop):
+        return "BACKGROUND_UNCERTAIN"
     return None
+
+
+def _has_oversized_connected_ink(image: Image.Image) -> bool:
+    """Refuse a raster target containing a long connected mark across the word."""
+    gray = ImageOps.grayscale(image)
+    width, height = gray.size
+    if width < 2 or height < 2 or width * height > 200_000:
+        return True
+    pixels = gray.tobytes()
+    visited = bytearray(len(pixels))
+    min_width = max(12, math.ceil(width * 0.55))
+    min_height = max(5, math.ceil(height * 0.35))
+    for start, value in enumerate(pixels):
+        if value >= 105 or visited[start]:
+            continue
+        queue = [start]
+        visited[start] = 1
+        left = right = start % width
+        top = bottom = start // width
+        while queue:
+            current = queue.pop()
+            x, y = current % width, current // width
+            left = min(left, x)
+            right = max(right, x)
+            top = min(top, y)
+            bottom = max(bottom, y)
+            for neighbor_y in range(max(0, y - 1), min(height, y + 2)):
+                row = neighbor_y * width
+                for neighbor_x in range(max(0, x - 1), min(width, x + 2)):
+                    neighbor = row + neighbor_x
+                    if not visited[neighbor] and pixels[neighbor] < 105:
+                        visited[neighbor] = 1
+                        queue.append(neighbor)
+        if right - left + 1 >= min_width and bottom - top + 1 >= min_height:
+            return True
+    return False
 
 
 def _repair_ink_mask(image: Image.Image, target: tuple[int, int, int, int]) -> tuple[Image.Image, Image.Image]:
@@ -954,7 +1322,13 @@ def _validate_candidate(source_path: Path, candidate_path: Path, plans: list[dic
                 cancellation_check()
             for page_index in range(page_count):
                 original_image, candidate_image = _render(source[page_index], dpi), _render(candidate[page_index], dpi)
-                allowed = [plan["allowed_rect"] for plan in plans if plan["page_index"] == page_index]
+                allowed = []
+                for plan in plans:
+                    if plan["page_index"] != page_index:
+                        continue
+                    visible_rect = fitz.Rect(plan["allowed_rect"]) * source[page_index].rotation_matrix
+                    visible_rect.normalize()
+                    allowed.append(visible_rect)
                 changed, outside = _pixel_counts(original_image, candidate_image, allowed, dpi)
                 outside_by_dpi[str(dpi)] += max(0, outside)
                 if page_index not in target_page_indices and changed != 0:

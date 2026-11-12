@@ -15,9 +15,13 @@ from app.core.scanned_word_compiler import compile_scanned_word_edits
 PROTOCOL = "platen_word_edits.v1"
 
 
-def _fixture_pdf(path: Path, *, texture: bool = False, border: bool = False, stamp: bool = False, rotation: int = 0, crop: bool = False, hidden_ocr: bool = False, lossy: bool = False, skew: float = 0):
+def _fixture_pdf(path: Path, *, texture: bool = False, gradient: bool = False, border: bool = False, stamp: bool = False, handwriting: bool = False, rotation: int = 0, crop: bool = False, hidden_ocr: bool = False, lossy: bool = False, skew: float = 0):
     width_pt, height_pt, scale = 595, 842, 3
     image = Image.new("RGB", (width_pt * scale, height_pt * scale), (247, 245, 238) if texture else "white")
+    if gradient:
+        gradient_layer = Image.linear_gradient("L").resize(image.size, Image.Resampling.BICUBIC)
+        gradient_layer = gradient_layer.point(lambda value: max(230, min(252, 230 + value // 12)))
+        image = Image.merge("RGB", (gradient_layer, gradient_layer.copy(), gradient_layer.copy()))
     if texture:
         pixels = image.load()
         for y in range(image.height):
@@ -29,6 +33,12 @@ def _fixture_pdf(path: Path, *, texture: bool = False, border: bool = False, sta
     origin = (120 * scale, 52 * scale)
     draw.text(origin, "Ministry of Education, Higher", font=font, fill=(28, 28, 28))
     target_px = draw.textbbox(origin, "Ministry", font=font)
+    if handwriting:
+        draw.line(
+            [(target_px[0] + 12, target_px[1] + 9), (target_px[0] + 88, target_px[1] + 34),
+             (target_px[0] + 166, target_px[1] + 5)],
+            fill=(25, 25, 25), width=9,
+        )
     if border:
         draw.line((target_px[0], target_px[1] + 2, target_px[2], target_px[1] + 2), fill=(25, 25, 25), width=3)
     if stamp:
@@ -66,6 +76,38 @@ def _fixture_pdf(path: Path, *, texture: bool = False, border: bool = False, sta
     return [x0, y0, x1, y1]
 
 
+def _placed_image_scan_pdf(path: Path, *, image_rotation: int = 0) -> list[float]:
+    source_width, source_height = 300, 200
+    base = fitz.open()
+    base_page = base.new_page(width=source_width, height=source_height)
+    base_page.insert_text((20, 60), "Ministry of Education, Higher", fontname="helv", fontsize=18)
+    source_target = fitz.Rect(next(word for word in base_page.get_text("words") if word[4] == "Ministry")[:4])
+    raster = base_page.get_pixmap(dpi=72, colorspace=fitz.csRGB, alpha=False)
+    image_bytes = raster.tobytes("png")
+    base.close()
+
+    document = fitz.open()
+    page = document.new_page(width=595, height=842)
+    placement = fitz.Rect(100, 150, 400, 350)
+    image_xref = page.insert_image(placement, stream=image_bytes, rotate=image_rotation)
+    if image_rotation == 0:
+        target = [
+            source_target.x0 + placement.x0,
+            source_target.y0 + placement.y0,
+            source_target.x1 + placement.x0,
+            source_target.y1 + placement.y0,
+        ]
+        page.insert_text((120, 210), "Ministry of Education, Higher", fontname="helv", fontsize=18, render_mode=3)
+    else:
+        # This target is inside the rotated image occurrence; the compiler must
+        # reject its non-axis-aligned placement before interpreting OCR boxes.
+        target = fitz.Rect(190, 160, 220, 180)
+    assert image_xref > 0
+    document.save(path)
+    document.close()
+    return [float(value) for value in target]
+
+
 def _request(
     bbox: list[float],
     replacement: str = "hello",
@@ -73,6 +115,7 @@ def _request(
     page: int = 1,
     word_id: str = "word-1",
     expected: str = "Ministry",
+    page_size: tuple[float, float] = (595.0, 842.0),
 ):
     edit = {
         "page_num": page,
@@ -95,7 +138,7 @@ def _request(
     resolved = [{
         "edit": edit,
         "bbox": bbox,
-        "page_size": [595.0, 842.0],
+        "page_size": [float(page_size[0]), float(page_size[1])],
         "source_sha256": source_sha,
         "baseline_digest": digest,
     }]
@@ -335,6 +378,46 @@ def test_native_replacement_can_grow_when_verified_free_space_is_available(tmp_p
         assert [word[4] for word in edited[0].get_text("words", sort=False)] == ["Greetings"]
 
 
+@pytest.mark.parametrize("rotation", [0, 90, 180, 270])
+@pytest.mark.parametrize("cropped", [False, True])
+def test_native_word_coordinates_follow_pdf_rotation_and_cropbox_matrices(tmp_path, rotation, cropped):
+    source = tmp_path / f"source-{rotation}-{cropped}.pdf"
+    output = tmp_path / f"candidate-{rotation}-{cropped}.pdf"
+    document = fitz.open()
+    page = document.new_page(width=595, height=842)
+    page.insert_text((120, 200), "Ministry of Education, Higher", fontname="helv", fontsize=14)
+    if cropped:
+        page.set_cropbox(fitz.Rect(50, 80, 545, 780))
+    page.set_rotation(rotation)
+    word = next(item for item in page.get_text("words", sort=False) if item[4] == "Ministry")
+    visible_rect = fitz.Rect(word[:4]) * page.rotation_matrix
+    visible_bbox = [float(value) for value in visible_rect]
+    page_size = (float(page.rect.width), float(page.rect.height))
+    document.save(source)
+    document.close()
+    envelope, resolved, _ = _request(visible_bbox, page_size=page_size)
+    source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    resolved[0]["source_sha256"] = source_sha
+
+    result = compile_scanned_word_edits(source, output, envelope, resolved, source_sha)
+
+    assert result["status"] == "EDITED", result
+    assert output.is_file()
+    assert result["outside_changed_pixels_by_dpi"] == {"72": 0, "144": 0, "288": 0}
+    with fitz.open(source) as original, fitz.open(output) as candidate:
+        assert len(original) == len(candidate) == 1
+        assert candidate[0].rect == original[0].rect
+        assert candidate[0].mediabox == original[0].mediabox
+        assert candidate[0].cropbox == original[0].cropbox
+        assert candidate[0].rotation == rotation
+        assert [word[4] for word in candidate[0].get_text("words", sort=False)] == [
+            "hello", "of", "Education,", "Higher",
+        ]
+        assert [word[4] for word in original[0].get_text("words", sort=False)][1:] == [
+            "of", "Education,", "Higher",
+        ]
+
+
 def test_mixed_page_routes_native_and_hidden_scan_words_by_target_representation(tmp_path):
     source = tmp_path / "mixed-source.pdf"
     output = tmp_path / "mixed-candidate.pdf"
@@ -507,8 +590,6 @@ def test_native_text_over_scan_image_is_refused_as_layer_conflict(tmp_path):
     [
         ({"stamp": True}, "BACKGROUND_COLORED_OVERLAP"),
         ({"border": True}, "BACKGROUND_RULE_OVERLAP"),
-        ({"rotation": 90}, "UNSUPPORTED_PAGE_GEOMETRY"),
-        ({"crop": True}, "UNSUPPORTED_PAGE_GEOMETRY"),
     ],
 )
 def test_refuses_unsupported_background_or_geometry_without_output(tmp_path, kwargs, code):
@@ -522,6 +603,85 @@ def test_refuses_unsupported_background_or_geometry_without_output(tmp_path, kwa
     result = compile_scanned_word_edits(source, output, envelope, resolved, source_sha)
 
     assert result == {"status": "REFUSED", "error_code": code}
+    assert not output.exists()
+
+
+def test_scanned_cropbox_offset_maps_target_to_the_visible_page_frame(tmp_path):
+    source = tmp_path / "cropped-source.pdf"
+    output = tmp_path / "cropped-candidate.pdf"
+    bbox = _fixture_pdf(source, crop=True)
+    visible_bbox = [bbox[0] - 10, bbox[1] - 10, bbox[2] - 10, bbox[3] - 10]
+    with fitz.open(source) as document:
+        page_size = (float(document[0].rect.width), float(document[0].rect.height))
+    envelope, resolved, source_sha = _request(visible_bbox, page_size=page_size)
+    source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    resolved[0]["source_sha256"] = source_sha
+
+    result = compile_scanned_word_edits(source, output, envelope, resolved, source_sha)
+
+    assert result["status"] == "EDITED", result
+    assert result["outside_changed_pixels_by_dpi"] == {"72": 0, "144": 0, "288": 0}
+    with fitz.open(source) as original, fitz.open(output) as candidate:
+        assert candidate[0].rect == original[0].rect
+        assert candidate[0].cropbox == original[0].cropbox
+        assert "hello" in candidate[0].get_text()
+        assert "Ministry" not in candidate[0].get_text()
+
+
+def test_rotated_scanned_page_is_refused_after_visible_to_native_mapping(tmp_path):
+    source = tmp_path / "rotated-scan-source.pdf"
+    output = tmp_path / "rotated-scan-candidate.pdf"
+    native_bbox = _fixture_pdf(source, rotation=90)
+    with fitz.open(source) as document:
+        page = document[0]
+        visible_bbox = [float(value) for value in fitz.Rect(native_bbox) * page.rotation_matrix]
+        page_size = (float(page.rect.width), float(page.rect.height))
+    envelope, resolved, source_sha = _request(visible_bbox, page_size=page_size)
+    source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    resolved[0]["source_sha256"] = source_sha
+
+    result = compile_scanned_word_edits(source, output, envelope, resolved, source_sha)
+
+    assert result == {"status": "REFUSED", "error_code": "UNSUPPORTED_PAGE_GEOMETRY"}
+    assert not output.exists()
+
+
+def test_translated_axis_aligned_image_scan_is_compiled_with_its_actual_matrix(tmp_path):
+    source = tmp_path / "placed-image-source.pdf"
+    output = tmp_path / "placed-image-candidate.pdf"
+    bbox = _placed_image_scan_pdf(source)
+    with fitz.open(source) as document:
+        page = document[0]
+        image = page.get_images(full=True)[0]
+        rect, matrix = page.get_image_rects(image[0], transform=True)[0]
+        assert rect == fitz.Rect(100, 150, 400, 350)
+        assert tuple(matrix) == pytest.approx((300, 0, 0, 200, 100, 150))
+    envelope, resolved, _ = _request(bbox)
+    source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    resolved[0]["source_sha256"] = source_sha
+
+    result = compile_scanned_word_edits(source, output, envelope, resolved, source_sha)
+
+    assert result["status"] == "EDITED", result
+    assert result["image_streams_preserved"] is True
+    assert result["outside_changed_pixels_by_dpi"] == {"72": 0, "144": 0, "288": 0}
+    with fitz.open(output) as candidate:
+        assert [word[4] for word in candidate[0].get_text("words", sort=False)] == [
+            "hello", "of", "Education,", "Higher",
+        ]
+
+
+def test_rotated_image_occurrence_is_refused_before_patch_planning(tmp_path):
+    source = tmp_path / "rotated-image-source.pdf"
+    output = tmp_path / "rotated-image-candidate.pdf"
+    bbox = _placed_image_scan_pdf(source, image_rotation=90)
+    envelope, resolved, _ = _request(bbox)
+    source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    resolved[0]["source_sha256"] = source_sha
+
+    result = compile_scanned_word_edits(source, output, envelope, resolved, source_sha)
+
+    assert result == {"status": "REFUSED", "error_code": "UNSUPPORTED_IMAGE_TRANSFORM"}
     assert not output.exists()
 
 
@@ -563,6 +723,21 @@ def test_refuses_non_english_text_and_overflow(tmp_path):
         assert not output.exists()
 
 
+def test_refuses_handwriting_over_scanned_word_without_output(tmp_path):
+    source = tmp_path / "handwritten-source.pdf"
+    output = tmp_path / "handwritten-candidate.pdf"
+    bbox = _fixture_pdf(source, handwriting=True)
+    envelope, resolved, _ = _request(bbox)
+    source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    resolved[0]["source_sha256"] = source_sha
+
+    result = compile_scanned_word_edits(source, output, envelope, resolved, source_sha)
+
+    assert result["status"] == "REFUSED", result
+    assert result["error_code"] in {"BACKGROUND_UNCERTAIN", "BACKGROUND_COLORED_OVERLAP"}
+    assert not output.exists()
+
+
 def test_compiles_lossy_mildly_skewed_scan_with_localized_patch(tmp_path):
     source = tmp_path / "lossy-skewed.pdf"
     output = tmp_path / "lossy-skewed-candidate.pdf"
@@ -575,6 +750,21 @@ def test_compiles_lossy_mildly_skewed_scan_with_localized_patch(tmp_path):
 
     assert result["status"] == "EDITED", result
     assert result["outside_changed_pixels_144dpi"] == 0
+    assert result["image_streams_preserved"] is True
+
+
+def test_compiles_scan_with_uneven_illumination_and_preserves_outside_pixels(tmp_path):
+    source = tmp_path / "gradient-source.pdf"
+    output = tmp_path / "gradient-candidate.pdf"
+    bbox = _fixture_pdf(source, gradient=True, lossy=True)
+    envelope, resolved, _ = _request(bbox)
+    source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    resolved[0]["source_sha256"] = source_sha
+
+    result = compile_scanned_word_edits(source, output, envelope, resolved, source_sha)
+
+    assert result["status"] == "EDITED", result
+    assert result["outside_changed_pixels_by_dpi"] == {"72": 0, "144": 0, "288": 0}
     assert result["image_streams_preserved"] is True
 
 
