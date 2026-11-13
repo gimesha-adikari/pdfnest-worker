@@ -76,7 +76,12 @@ def _fixture_pdf(path: Path, *, texture: bool = False, gradient: bool = False, b
     return [x0, y0, x1, y1]
 
 
-def _placed_image_scan_pdf(path: Path, *, image_rotation: int = 0) -> list[float]:
+def _placed_image_scan_pdf(
+    path: Path,
+    *,
+    image_rotation: int = 0,
+    placement: fitz.Rect | None = None,
+) -> list[float]:
     source_width, source_height = 300, 200
     base = fitz.open()
     base_page = base.new_page(width=source_width, height=source_height)
@@ -88,16 +93,24 @@ def _placed_image_scan_pdf(path: Path, *, image_rotation: int = 0) -> list[float
 
     document = fitz.open()
     page = document.new_page(width=595, height=842)
-    placement = fitz.Rect(100, 150, 400, 350)
+    placement = fitz.Rect(100, 150, 400, 350) if placement is None else fitz.Rect(placement)
     image_xref = page.insert_image(placement, stream=image_bytes, rotate=image_rotation)
     if image_rotation == 0:
+        scale_x = placement.width / source_width
+        scale_y = placement.height / source_height
         target = [
-            source_target.x0 + placement.x0,
-            source_target.y0 + placement.y0,
-            source_target.x1 + placement.x0,
-            source_target.y1 + placement.y0,
+            source_target.x0 * scale_x + placement.x0,
+            source_target.y0 * scale_y + placement.y0,
+            source_target.x1 * scale_x + placement.x0,
+            source_target.y1 * scale_y + placement.y0,
         ]
-        page.insert_text((120, 210), "Ministry of Education, Higher", fontname="helv", fontsize=18, render_mode=3)
+        page.insert_text(
+            (placement.x0 + 20 * scale_x, placement.y0 + 60 * scale_y),
+            "Ministry of Education, Higher",
+            fontname="helv",
+            fontsize=18 * min(scale_x, scale_y),
+            render_mode=3,
+        )
     else:
         # This target is inside the rotated image occurrence; the compiler must
         # reject its non-axis-aligned placement before interpreting OCR boxes.
@@ -669,6 +682,54 @@ def test_translated_axis_aligned_image_scan_is_compiled_with_its_actual_matrix(t
         assert [word[4] for word in candidate[0].get_text("words", sort=False)] == [
             "hello", "of", "Education,", "Higher",
         ]
+
+
+def test_scaled_axis_aligned_image_scan_is_compiled_with_its_actual_matrix(tmp_path):
+    source = tmp_path / "scaled-image-source.pdf"
+    output = tmp_path / "scaled-image-candidate.pdf"
+    placement = fitz.Rect(80, 120, 530, 420)
+    bbox = _placed_image_scan_pdf(source, placement=placement)
+    with fitz.open(source) as document:
+        page = document[0]
+        image = page.get_images(full=True)[0]
+        rect, matrix = page.get_image_rects(image[0], transform=True)[0]
+        assert rect == placement
+        assert tuple(matrix) == pytest.approx((450, 0, 0, 300, 80, 120))
+    envelope, resolved, _ = _request(bbox)
+    source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    resolved[0]["source_sha256"] = source_sha
+
+    result = compile_scanned_word_edits(source, output, envelope, resolved, source_sha)
+
+    assert result["status"] == "EDITED", result
+    assert result["image_streams_preserved"] is True
+    assert result["outside_changed_pixels_by_dpi"] == {"72": 0, "144": 0, "288": 0}
+    with fitz.open(output) as candidate:
+        assert [word[4] for word in candidate[0].get_text("words", sort=False)] == [
+            "hello", "of", "Education,", "Higher",
+        ]
+
+
+def test_reused_image_xobject_with_single_geometric_target_fails_closed(tmp_path):
+    source = tmp_path / "reused-image-source.pdf"
+    output = tmp_path / "reused-image-candidate.pdf"
+    bbox = _placed_image_scan_pdf(source)
+    with fitz.open(source) as document:
+        page = document[0]
+        image_xref = page.get_images(full=True)[0][0]
+        page.insert_image(fitz.Rect(100, 400, 400, 600), xref=image_xref)
+        staged = tmp_path / "reused-image-staged.pdf"
+        document.save(staged)
+    staged.replace(source)
+
+    envelope, resolved, _ = _request(bbox)
+    source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    resolved[0]["source_sha256"] = source_sha
+
+    result = compile_scanned_word_edits(source, output, envelope, resolved, source_sha)
+
+    assert result == {"status": "REFUSED", "error_code": "AMBIGUOUS_TARGET_REPRESENTATION"}
+    assert not output.exists()
 
 
 def test_rotated_image_occurrence_is_refused_before_patch_planning(tmp_path):
