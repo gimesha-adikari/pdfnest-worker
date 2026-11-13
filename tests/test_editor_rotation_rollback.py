@@ -93,6 +93,7 @@ def test_general_editor_rotation_rollback_contract(
         assert page["height"] == pytest.approx(document[0].rect.height, abs=0.01)
     assert page["width"] == pytest.approx(sdk_page["width"], abs=0.01)
     assert page["height"] == pytest.approx(sdk_page["height"], abs=0.01)
+    assert page["rotation"] == rotation
 
     # Extraction, element projection, counts, and canonical word geometry.
     assert page["kind"] == "text"

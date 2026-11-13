@@ -138,6 +138,7 @@ def project_editor_result(result: Any) -> dict[str, Any]:
                 "page_num": page.page_index + 1,
                 "width": page.geometry.width,
                 "height": page.geometry.height,
+                "rotation": int(getattr(page.geometry, "rotation", 0) or 0),
                 "elements": elements,
                 "kind": editor_page_kind(classification),
                 "is_ocr": processing_source == "OCR_RECOGNITION",

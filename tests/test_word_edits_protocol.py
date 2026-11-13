@@ -124,6 +124,109 @@ def test_resolves_repeated_word_identity_to_frozen_server_geometry():
     assert resolved[0]["edit"]["word_id"] == "word-3"
 
 
+@pytest.mark.parametrize("rotation", [0, 90, 180, 270])
+@pytest.mark.parametrize("cropped", [False, True])
+def test_resolves_canonical_native_word_geometry_into_visible_page_frame(tmp_path, rotation, cropped):
+    source = tmp_path / f"native-{rotation}-{cropped}.pdf"
+    document = fitz.open()
+    page = document.new_page(width=595, height=842)
+    page.insert_text((130, 230), "Ministry", fontname="helv", fontsize=16)
+    if cropped:
+        page.set_cropbox(fitz.Rect(50, 80, 545, 780))
+    page.set_rotation(rotation)
+    source_words = [word for word in page.get_text("words", sort=False) if word[4] == "Ministry"]
+    assert len(source_words) == 1
+    source_word = source_words[0]
+    source_rect = fitz.Rect(source_word[:4])
+    visible_rect = source_rect * page.rotation_matrix
+    page_record = {
+        "page_num": 1,
+        "width": float(page.rect.width),
+        "height": float(page.rect.height),
+        "rotation": rotation,
+        "source": "NATIVE_EXTRACTION",
+        "elements": [{
+            "id": "native-line",
+            "text": "Ministry",
+            "word_ids": ["native-ministry"],
+            "word_geometry": [{
+                "id": "native-ministry",
+                "text": "Ministry",
+                "x": float(source_rect.x0),
+                "y": float(source_rect.y0),
+                "width": float(source_rect.width),
+                "height": float(source_rect.height),
+            }],
+        }],
+    }
+    document.save(source)
+    document.close()
+    source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    result = {
+        "schema_version": "ocr_v2_editor_layout.v1",
+        "ocr_v2": True,
+        "language_mode": "EXPLICIT",
+        "languages": ["eng"],
+        "pages": [page_record],
+        "word_edit_protocols": [WORD_EDIT_PROTOCOL],
+    }
+    extraction_id = f"extract-rotation-{rotation}-{cropped}"
+    result["word_edit_baseline"] = build_word_edit_baseline(
+        extraction_id, source_sha, "sha256:" + "b" * 64, result
+    )
+    extraction = {
+        "id": extraction_id,
+        "job_type": "editor_extract",
+        "status": "succeeded",
+        "payload": {
+            "source_key": "owned/user/editor_source/native.pdf",
+            "source_name": "native.pdf",
+            "consumer": "general_editor",
+            "ocr_v2": True,
+        },
+        "result": result,
+    }
+    request = {
+        "edit_protocol": WORD_EDIT_PROTOCOL,
+        "source_tracker": extraction["payload"]["source_key"],
+        "extraction_job_id": extraction_id,
+        "baseline_digest": result["word_edit_baseline"]["digest"],
+        "edits": [{
+            "page_num": 1,
+            "element_id": "native-line",
+            "word_id": "native-ministry",
+            "expected_original_text": "Ministry",
+            "replacement_text": "hello",
+            "style_override": None,
+            "fit_policy": "preserve_neighbors",
+        }],
+    }
+    validated = validate_word_edit_request(request, extraction)
+
+    resolved = resolve_word_edit_targets(validated, result)
+
+    assert resolved[0]["bbox"] == pytest.approx(list(visible_rect), abs=0.01)
+    assert resolved[0]["page_size"] == pytest.approx([page_record["width"], page_record["height"]])
+
+
+def test_refuses_rotated_native_target_when_frozen_rotation_metadata_is_missing():
+    extraction = extraction_fixture()
+    page = extraction["result"]["pages"][0]
+    page["source"] = "NATIVE_EXTRACTION"
+    page["width"], page["height"] = 842.0, 595.0
+    extraction["result"]["word_edit_baseline"] = build_word_edit_baseline(
+        extraction["id"], "a" * 64, "sha256:" + "b" * 64, extraction["result"]
+    )
+    request = request_fixture(extraction)
+    request["edits"] = [request["edits"][0] | {"replacement_text": "third"}]
+    request["baseline_digest"] = extraction["result"]["word_edit_baseline"]["digest"]
+
+    validated = validate_word_edit_request(request, extraction)
+
+    with pytest.raises(WordEditProtocolError, match="rotation metadata"):
+        resolve_word_edit_targets(validated, extraction["result"])
+
+
 @pytest.mark.parametrize(
     ("mutate_request", "mutate_extraction"),
     [

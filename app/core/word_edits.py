@@ -313,6 +313,22 @@ def resolve_word_edit_targets(
         x, y, width, height = (word.get(name) for name in ("x", "y", "width", "height"))
         if any(type(value) not in (int, float) or not math.isfinite(value) for value in (x, y, width, height)) or width <= 0 or height <= 0:
             raise WordEditProtocolError("trusted extraction word geometry is malformed")
+        # Native text geometry is frozen in PyMuPDF's unrotated, CropBox-local
+        # page coordinates. The editor canvas and word compiler use the
+        # visible rotated page frame, so map only native targets here. OCR
+        # geometry already uses the visible frame and rotated scans fail closed
+        # in the compiler.
+        representation_source = matching_elements[0].get("source") or page.get("source")
+        if representation_source == "NATIVE_EXTRACTION":
+            rotation = page.get("rotation")
+            if type(rotation) is not int or rotation not in {0, 90, 180, 270}:
+                raise WordEditProtocolError("trusted native page rotation metadata is unavailable or unsupported")
+            if rotation == 90:
+                x, y, width, height = page_width - (y + height), x, height, width
+            elif rotation == 180:
+                x, y = page_width - (x + width), page_height - (y + height)
+            elif rotation == 270:
+                x, y, width, height = y, page_height - (x + width), height, width
         resolved.append({
             "edit": dict(edit),
             "bbox": [float(x), float(y), float(x + width), float(y + height)],

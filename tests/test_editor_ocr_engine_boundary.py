@@ -165,6 +165,7 @@ def test_editor_projection_is_engine_neutral() -> None:
 
     assert projected["schema_version"] == "ocr_v2_editor_layout.v1"
     assert projected["pages"][0]["kind"] == "scanned"
+    assert projected["pages"][0]["rotation"] == 0
     assert projected["pages"][0]["is_ocr"] is True
     assert projected["pages"][0]["elements"][0]["word_geometry"][0]["id"] == "w1"
 
