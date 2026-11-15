@@ -62,6 +62,7 @@ PROFILES.update({
  'structured_document': profile('input_path ' + LANGUAGE, 'input_path', 'input_path', callbacks=('cancellation_check','page_progress_callback')),
  'validate_word_edit_transport': profile('input_path envelope', 'input_path envelope', 'input_path'),
  'compile_scanned_word_edits': profile('input_path output_pdf_path envelope resolved_targets expected_source_sha256', 'input_path output_pdf_path envelope resolved_targets expected_source_sha256', 'input_path', 'output_pdf_path', callbacks=('cancellation_check',)),
+ 'inspect_candidate_selection': profile('input_path artifact_sha256', 'input_path artifact_sha256', 'input_path'),
 })
 
 def plain(value, depth=0):

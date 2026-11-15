@@ -133,6 +133,9 @@ def arguments(operation,fixtures,tmp_path):
             'source_sha256': digest,
             'baseline_digest': values['envelope']['baseline_digest'],
         }]
+    if 'artifact_sha256' in p.required:
+        import hashlib
+        values['artifact_sha256'] = hashlib.sha256(pdf.read_bytes()).hexdigest()
     if 'layout' in p.required:values['layout']={'pages':[{'source':'NATIVE_EXTRACTION','page_num':1,'elements':[{'x':15,'y':20,'width':260,'height':35}]}]}
     if operation=='execute_ocr_markup':values['query']='F11'
     if operation in ('execute_ocr_text','execute_document_extraction','execute_pdf_to_markdown','structured_document'):values['routing_policy']='FAST'
