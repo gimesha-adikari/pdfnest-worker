@@ -414,7 +414,8 @@ def test_worker_actor_forwards_exact_validated_request_and_refuses_without_artif
     assert "artifact_key" not in final["result"]
 
 
-def test_worker_actor_only_marks_success_after_verified_artifact_upload(monkeypatch, tmp_path):
+@pytest.mark.parametrize("selection_mode", ["valid", "raises", "wrong_digest", "mutates", "cancelled", "disabled"])
+def test_worker_actor_only_marks_success_after_verified_artifact_upload(monkeypatch, tmp_path, selection_mode):
     source_bytes = b"test source PDF identity"
     extraction = extraction_fixture()
     extraction["result"]["word_edit_baseline"] = build_word_edit_baseline(
@@ -456,14 +457,36 @@ def test_worker_actor_only_marks_success_after_verified_artifact_upload(monkeypa
     monkeypatch.setattr(actors, "compile_scanned_word_edits", compile_candidate)
     monkeypatch.setattr(actors, "upload_path", lambda path, key, content_type: uploaded.append((Path(path).read_bytes(), key, content_type)))
 
+    monkeypatch.setenv("ENABLE_CANDIDATE_WORD_SELECTION", "false" if selection_mode == "disabled" else "true")
+    selection_calls = []
+    def inspect_candidate(**kwargs):
+        assert Path(kwargs["input_path"]).read_bytes().startswith(b"%PDF")
+        assert kwargs["artifact_sha256"] == actors._sha256_file(kwargs["input_path"])
+        selection_calls.append(kwargs["artifact_sha256"])
+        if selection_mode == "raises": raise RuntimeError("synthetic selection unavailable")
+        if selection_mode == "cancelled": raise actors.JobCancelledException("synthetic cancellation")
+        if selection_mode == "mutates": Path(kwargs["input_path"]).write_bytes(b"changed candidate")
+        if selection_mode == "wrong_digest": return {"version": "platen_candidate_words.v1", "artifact_sha256": "0"*64, "pages": []}
+        return {"version": "platen_candidate_words.v1", "artifact_sha256": kwargs["artifact_sha256"], "pages": []}
+    monkeypatch.setattr(actors, "inspect_candidate_selection", inspect_candidate, raising=False)
     actors.editor_word_edit_compile_job.fn("word-job", envelope)
 
+    assert len(selection_calls) == (0 if selection_mode == "disabled" else 1)
+    if selection_mode in {"mutates", "cancelled"}:
+        assert not uploaded
+        assert updates[-1]["status"] == (JobState.cancelled if selection_mode == "cancelled" else JobState.failed)
+        assert "artifact_key" not in (updates[-1].get("result") or {})
+        return
     assert len(uploaded) == 1
     assert uploaded[0][1:] == ("jobs/editor/word-edit/output/test.pdf", "application/pdf")
     final = updates[-1]
     assert final["status"] == JobState.succeeded
     assert final["result"]["artifact_key"] == uploaded[0][1]
     assert final["result"]["artifact_sha256"] == hashlib.sha256(uploaded[0][0]).hexdigest()
+    if selection_mode == "valid":
+        assert final["result"]["candidate_selection"]["artifact_sha256"] == final["result"]["artifact_sha256"]
+    else:
+        assert final["result"]["candidate_selection"] is None
 
 
 def test_failed_word_edit_download_is_rejected_without_streaming(monkeypatch):

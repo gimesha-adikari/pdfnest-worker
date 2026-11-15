@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import hashlib
+import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -86,6 +87,7 @@ from app.core.native_operations import (
     execute_legacy_markup,
     validate_word_edit_transport,
     compile_scanned_word_edits,
+    inspect_candidate_selection,
 )
 
 from app.core.word_edits import (
@@ -1164,6 +1166,29 @@ def editor_word_edit_compile_job(job_id: str, envelope: dict[str, Any]) -> None:
                 )
                 return
 
+        candidate_selection = None
+        if os.getenv("ENABLE_CANDIDATE_WORD_SELECTION", "").strip().lower() == "true":
+            try:
+                candidate_selection = inspect_candidate_selection(
+                    input_path=str(output_pdf_path), artifact_sha256=compiled["artifact_sha256"],
+                    cancellation_check=lambda: check_cancellation(job_id),
+                )
+                if (
+                    type(candidate_selection) is not dict
+                    or candidate_selection.get("version") != "platen_candidate_words.v1"
+                    or candidate_selection.get("artifact_sha256") != compiled["artifact_sha256"]
+                ):
+                    candidate_selection = None
+            except JobCancelledException:
+                raise
+            except Exception:
+                # Selection is optional; an unqualified text layer must not
+                # replace or invalidate the independently verified PDF image.
+                logger.warning("Candidate text selection unavailable; image-only preview retained")
+        check_cancellation(job_id)
+        if _sha256_file(output_pdf_path) != compiled["artifact_sha256"]:
+            cleanup_paths(output_pdf_path)
+            raise WordEditProtocolError("candidate changed during read-only inspection")
         output_key = build_key("jobs/editor/word-edit/output", suffix=".pdf")
         upload_path(output_pdf_path, output_key, content_type="application/pdf")
         source_name = (extraction.payload or {}).get("source_name") or "document.pdf"
@@ -1186,6 +1211,7 @@ def editor_word_edit_compile_job(job_id: str, envelope: dict[str, Any]) -> None:
                 "source_sha256": expected_source_sha,
                 "baseline_digest": validated["baseline_digest"],
                 "target_results": compiled["target_results"],
+                "candidate_selection": candidate_selection,
                 "outside_changed_pixels_144dpi": compiled["outside_changed_pixels_144dpi"],
                 "outside_changed_pixels_by_dpi": compiled["outside_changed_pixels_by_dpi"],
             },
