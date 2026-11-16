@@ -52,11 +52,11 @@ def main():
                 options[name] = callback
         with raster_policy(request['raster_limit']):
             result = target(*boundary.decode(request['args']), **options)
-        boundary.write_frame(root / 'result.json', {'result': boundary.encode(result)})
+        boundary.write_result_frame(root / 'result.json', {'result': boundary.encode(result)})
     except BaseException as exc:
         # Resource exhaustion may prevent even the error frame: the parent
         # treats absent/truncated output or abnormal exit as failure.
-        boundary.write_frame(root / 'result.json', {'error': boundary.error_frame(exc)})
+        boundary.write_result_frame(root / 'result.json', {'error': boundary.error_frame(exc)})
 
 
 if __name__ == '__main__':

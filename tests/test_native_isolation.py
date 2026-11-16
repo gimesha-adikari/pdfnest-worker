@@ -164,6 +164,38 @@ def test_protocol_limits_and_no_arbitrary_import(tmp_path, monkeypatch):
         boundary.execute('os.system')
 
 
+def test_large_result_frame_round_trips_without_raising_request_frame_limit(tmp_path):
+    value = {'result': {'text': 'x' * (boundary.MAX_FRAME + 1)}}
+    path = tmp_path / 'result.frame'
+
+    boundary.write_result_frame(path, value)
+
+    assert path.stat().st_size < boundary.MAX_FRAME
+    assert boundary.read_result_frame(path) == value
+
+
+def test_controller_result_validation_accepts_compressed_editor_layout_frames(tmp_path):
+    from app.controller.profiles import validate_frame
+    value = {'result': boundary.encode({'layout': 'x' * (boundary.MAX_FRAME + 1)})}
+    path = tmp_path / 'result.frame'
+    boundary.write_result_frame(path, value)
+
+    assert validate_frame(path.read_bytes()) == value
+
+
+def test_result_frame_enforces_uncompressed_limit_on_write_and_read(tmp_path, monkeypatch):
+    path = tmp_path / 'result.frame'
+    monkeypatch.setattr(boundary, 'MAX_RESULT_FRAME', 512)
+    with pytest.raises(ValueError, match='result frame limit'):
+        boundary.write_result_frame(path, {'result': {'text': 'x' * 1024}})
+    assert not path.exists()
+
+    boundary.write_result_frame(path, {'result': {'text': 'x' * 256}})
+    monkeypatch.setattr(boundary, 'MAX_RESULT_FRAME', 128)
+    with pytest.raises(ValueError, match='result frame limit'):
+        boundary.read_result_frame(path)
+
+
 @pytest.mark.anyio
 async def test_async_cancellation_joins_child_before_cleanup(child_probe, tmp_path):
     task = asyncio.create_task(boundary.execute_async('inspect_pdf', tmp_path, 'hang'))

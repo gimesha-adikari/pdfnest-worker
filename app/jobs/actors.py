@@ -869,11 +869,18 @@ def editor_extract_job(
         check_cancellation(job_id)
         if ocr_v2:
             from app.core.native_operations import editor_colors
-            result = editor_colors(
-                result, input_path, password,
-                visible_geometry=consumer != EDITOR_OCR_CONSUMER_GENERAL_EDITOR,
-                cancellation_check=lambda: check_cancellation(job_id),
+            from app.core.editor_ocr_projection import (
+                merge_native_editor_colors,
+                native_editor_color_probe,
             )
+            color_probe = native_editor_color_probe(result)
+            if color_probe["pages"]:
+                color_result = editor_colors(
+                    color_probe, input_path, password,
+                    visible_geometry=consumer != EDITOR_OCR_CONSUMER_GENERAL_EDITOR,
+                    cancellation_check=lambda: check_cancellation(job_id),
+                )
+                result = merge_native_editor_colors(result, color_result)
             if _sha256_file(input_path) != source_sha256:
                 raise ValueError("source changed during extraction")
 

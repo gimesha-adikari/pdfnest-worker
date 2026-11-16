@@ -11,12 +11,15 @@ import os
 from pathlib import Path
 import re
 import stat
+import zlib
 from dataclasses import dataclass
 from app.core.native_domain import DomainUnavailable
 
 VERSION = 'native-operations-v1'
 MAX_BYTES = 16 * 1024 * 1024
 MAX_ARTIFACT_BYTES = 12 * 1024 * 1024
+RESULT_FRAME_MAGIC = b'P5RF1:'
+MAX_RESULT_FRAME_BYTES = 32 * 1024 * 1024
 MAX_EVENTS = 1000
 ROOT = '/work/job'
 CALLBACKS = frozenset(('cancellation_check', 'page_progress_callback', 'progress_callback', 'progress_cb', 'after_ocr'))
@@ -268,6 +271,20 @@ def validate_result(result):
 
 def validate_frame(data):
     """Validate untrusted result structure without importing a native type."""
+    if type(data) is not bytes or not 0 < len(data) <= MAX_ARTIFACT_BYTES:
+        raise DomainUnavailable()
+    if data.startswith(RESULT_FRAME_MAGIC):
+        decompressor = zlib.decompressobj()
+        try:
+            expanded = decompressor.decompress(data[len(RESULT_FRAME_MAGIC):], MAX_RESULT_FRAME_BYTES + 1)
+        except zlib.error as exc:
+            raise DomainUnavailable() from exc
+        if (len(expanded) > MAX_RESULT_FRAME_BYTES or decompressor.unconsumed_tail
+                or decompressor.unused_data or not decompressor.eof):
+            raise DomainUnavailable()
+        data = expanded
+    elif len(data) > MAX_RESULT_FRAME_BYTES:
+        raise DomainUnavailable()
     def bad_constant(_): raise DomainUnavailable()
     try: frame=json.loads(data,parse_constant=bad_constant)
     except (ValueError,UnicodeError,RecursionError) as exc: raise DomainUnavailable() from exc
