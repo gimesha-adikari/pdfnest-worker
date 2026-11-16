@@ -92,6 +92,16 @@ def compile_scanned_word_edits(
         with fitz.open(source_path) as source:
             if source.needs_pass:
                 return _refusal("PROTECTED_SOURCE_UNSUPPORTED")
+            if _has_signature_or_certification(source):
+                return _refusal("SIGNED_SOURCE_UNSUPPORTED")
+            if not source.permissions & fitz.PDF_PERM_MODIFY:
+                return _refusal("PROTECTED_SOURCE_PERMISSION_DENIED")
+            encrypt_kind, _ = source.xref_get_key(-1, "Encrypt")
+            if encrypt_kind != "null":
+                # Even an empty user password leaves the input encrypted. This
+                # compiler has no password-aware output restoration path, so
+                # saving it would silently strip the source protection.
+                return _refusal("PROTECTED_SOURCE_UNSUPPORTED")
             page_count = len(source)
             if not page_count:
                 return _refusal("INVALID_SOURCE_PDF")
@@ -1442,6 +1452,26 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _has_signature_or_certification(document: fitz.Document) -> bool:
+    """Fail closed for signature fields and certified PDFs before rewriting."""
+    try:
+        signature_flags = document.get_sigflags()
+        if isinstance(signature_flags, int) and signature_flags > 0:
+            return True
+        permission_kind, _ = document.xref_get_key(document.pdf_catalog(), "Perms")
+        if permission_kind != "null":
+            return True
+        for page in document:
+            for widget in page.widgets() or ():
+                if widget.field_type == fitz.PDF_WIDGET_TYPE_SIGNATURE:
+                    return True
+    except Exception:
+        # An inability to inspect signature state is not proof the source is
+        # unsigned, so do not rewrite it.
+        return True
+    return False
 
 
 def _refusal(error_code: str, **details: Any) -> dict[str, Any]:
