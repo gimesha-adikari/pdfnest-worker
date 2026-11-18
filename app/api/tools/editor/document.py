@@ -4,6 +4,7 @@ import difflib
 import io
 import json
 import logging
+import math
 import re
 from contextlib import suppress
 from statistics import median
