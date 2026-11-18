@@ -74,6 +74,8 @@ from app.jobs.limiter import acquire_lease, release_lease
 from app.jobs.models import JobState
 from app.jobs.store import claim_job, get_job, update_job
 
+from app.core.candidate_validation_diagnostics import summarize_candidate_validation_failure
+
 from app.core.native_operations import (
     execute_ocr_text,
     execute_searchable_pdf,
@@ -1129,6 +1131,12 @@ def editor_word_edit_compile_job(job_id: str, envelope: dict[str, Any]) -> None:
         check_cancellation(job_id)
         if type(compiled) is not dict or compiled.get("status") != "EDITED":
             cleanup_paths(output_pdf_path)
+            diagnostic = summarize_candidate_validation_failure(job_id, compiled)
+            if diagnostic is not None:
+                logger.warning(
+                    "word_edit_candidate_validation_failed %s",
+                    json.dumps(diagnostic, sort_keys=True, separators=(",", ":")),
+                )
             error_code = compiled.get("error_code") if type(compiled) is dict else None
             if type(error_code) is not str or not error_code:
                 error_code = "WORD_EDIT_CANDIDATE_INVALID"

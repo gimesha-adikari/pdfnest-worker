@@ -1017,6 +1017,54 @@ def compile_document(
             if is_ocr_page:
                 dirty_elements = [element for element in elements if is_element_dirty(element)]
 
+                if studio_visible_geometry:
+                    # Studio's OCR layout describes a localized visible-page edit.
+                    # Keep the source raster XObjects intact and limit changes to
+                    # each frozen layout element; rasterizing the whole page
+                    # changes neighboring scan content and image resources.
+                    if dirty_elements:
+                        for element in dirty_elements:
+                            rect = _studio_native_element_rect(page, element)
+                            if rect.is_empty or not rect.is_valid:
+                                raise ValueError("Studio scanned edit has invalid geometry")
+                            page.add_redact_annot(rect, fill=None)
+
+                        # Remove only any overlapping native/hidden text.  In
+                        # particular, leave raster images and vector graphics
+                        # untouched; the visible patch is painted below.
+                        page.apply_redactions(images=0, graphics=0, text=0)
+
+                        for element in dirty_elements:
+                            native_rect = _studio_native_element_rect(page, element)
+                            bg_hex = element.get("bg_color", "#ffffff")
+                            if not isinstance(bg_hex, str) or bg_hex.strip().lower() in ("", "transparent", "none"):
+                                bg_hex = "#ffffff"
+                            page.draw_rect(native_rect, color=None, fill=hex_to_rgb(bg_hex))
+
+                            replacement_text = str(element.get("text", "") or "")
+                            target = {
+                                "operation": "replace",
+                                "original_substring": str(element.get("original_text", "") or ""),
+                                "replacement_substring": replacement_text,
+                                "target_bbox": [native_rect.x0, native_rect.y0, native_rect.x1, native_rect.y1],
+                                "baseline_y": native_rect.y1,
+                                "font_info": {
+                                    "name": element.get("font", "helv"),
+                                    "size": element.get("size", 10.0),
+                                    "color": element.get("text_color", "#000000"),
+                                },
+                                "max_width": native_rect.width,
+                            }
+                            render_surgical_replacement(
+                                page,
+                                target,
+                                element=element,
+                                skip_redaction=True,
+                            )
+                    # An unedited Studio scan page must remain byte/resource
+                    # preserving and visually unchanged.
+                    continue
+
                 # Studio OCR coordinates are relative to the visibly rotated
                 # CropBox.  OCR/mixed PDFs can also retain an older selectable
                 # text layer, so remove only the edited native regions before
