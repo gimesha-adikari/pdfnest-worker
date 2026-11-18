@@ -79,10 +79,11 @@ def summarize_candidate_validation_failure(job_id: str, result: Any) -> dict[str
         "target_summaries": targets,
     }
     raw_neighbors = checks.get("neighbor_diagnostics")
-    if type(raw_neighbors) is dict and set(raw_neighbors) == {
+    required_neighbor_keys = {
         "source_word_count", "candidate_word_count", "text_count_mismatch",
         "bbox_mismatch_count", "max_bbox_delta_points",
-    }:
+    }
+    if type(raw_neighbors) is dict and required_neighbor_keys.issubset(raw_neighbors):
         integer_fields = (
             "source_word_count", "candidate_word_count",
             "text_count_mismatch", "bbox_mismatch_count",
