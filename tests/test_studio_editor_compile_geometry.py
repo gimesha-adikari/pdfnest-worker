@@ -4,9 +4,12 @@ import io
 import json
 from pathlib import Path
 
+
 import pymupdf as fitz
 from PIL import Image
+from PIL import ImageChops
 from PIL import ImageDraw
+from PIL import ImageFont
 
 from app.api.tools.editor.document import compile_document
 from app.api.tools.markup.document import process_markup_pdf
@@ -279,3 +282,172 @@ def test_studio_visible_editor_then_markup_preserves_both_operations(tmp_path: P
             and drawing["fill"][2] < 0.1
             for drawing in page.get_drawings()
         )
+
+
+
+def _outside_mask_changed_pixels(
+    source_page: fitz.Page, candidate_page: fitz.Page, mask: fitz.Rect, dpi: int
+) -> tuple[int, list[dict[str, object]]]:
+    source_pixmap = source_page.get_pixmap(dpi=dpi, colorspace=fitz.csRGB, alpha=False)
+    candidate_pixmap = candidate_page.get_pixmap(dpi=dpi, colorspace=fitz.csRGB, alpha=False)
+    assert (source_pixmap.width, source_pixmap.height) == (candidate_pixmap.width, candidate_pixmap.height)
+    source_image = Image.frombytes("RGB", (source_pixmap.width, source_pixmap.height), source_pixmap.samples)
+    candidate_image = Image.frombytes("RGB", (candidate_pixmap.width, candidate_pixmap.height), candidate_pixmap.samples)
+    difference = ImageChops.difference(source_image, candidate_image)
+    channels = difference.split()
+    maximum = ImageChops.lighter(ImageChops.lighter(channels[0], channels[1]), channels[2])
+    changed = maximum.point(lambda value: 255 if value > 2 else 0)
+    # The mask is already source-derived with the declared four-point margin;
+    # keep only the independent one-raster-pixel antialiasing band here.
+    allowed = fitz.Rect(mask)
+    scale = dpi / 72.0
+    x0 = max(0, int(allowed.x0 * scale) - 1)
+    y0 = max(0, int(allowed.y0 * scale) - 1)
+    x1 = min(source_image.width, int(allowed.x1 * scale + 0.999999) + 1)
+    y1 = min(source_image.height, int(allowed.y1 * scale + 0.999999) + 1)
+    mask_image = Image.new("L", source_image.size, 0)
+    ImageDraw.Draw(mask_image).rectangle((x0, y0, x1 - 1, y1 - 1), fill=255)
+    outside = ImageChops.multiply(changed, ImageChops.invert(mask_image))
+    count = outside.histogram()[255]
+    samples: list[dict[str, object]] = []
+    bounds = outside.getbbox()
+    if bounds is not None:
+        for py in range(bounds[1], bounds[3]):
+            for px in range(bounds[0], bounds[2]):
+                if outside.getpixel((px, py)) != 255:
+                    continue
+                source_rgb = source_image.getpixel((px, py))
+                candidate_rgb = candidate_image.getpixel((px, py))
+                page_x = (source_pixmap.x + px) * 72.0 / dpi
+                page_y = (source_pixmap.y + py) * 72.0 / dpi
+                dx = max(allowed.x0 - page_x, 0.0, page_x - allowed.x1)
+                dy = max(allowed.y0 - page_y, 0.0, page_y - allowed.y1)
+                samples.append({
+                    "raster_x": px,
+                    "raster_y": py,
+                    "page_x_pt": round(page_x, 4),
+                    "page_y_pt": round(page_y, 4),
+                    "source_rgb": list(source_rgb),
+                    "candidate_rgb": list(candidate_rgb),
+                    "distance_from_frozen_mask_pt": round((dx * dx + dy * dy) ** 0.5, 4),
+                })
+    source_image.close()
+    candidate_image.close()
+    difference.close()
+    maximum.close()
+    changed.close()
+    mask_image.close()
+    outside.close()
+    return count, samples
+
+
+def _image_stream_sha256s(page: fitz.Page) -> set[str]:
+    import hashlib
+
+    document = page.parent
+    return {
+        hashlib.sha256(document.extract_image(int(item[0]))["image"]).hexdigest()
+        for item in page.get_images(full=True)
+        if int(item[0]) > 0
+    }
+
+
+def test_studio_visible_scanned_layout_edit_preserves_pixels_outside_frozen_line_mask(tmp_path: Path) -> None:
+    source = tmp_path / "studio-scanned-source.pdf"
+    output = tmp_path / "studio-scanned-candidate.pdf"
+    image = Image.new("RGB", (1836, 2376), (248, 247, 243))
+    draw = ImageDraw.Draw(image)
+    font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 92)
+    original_line = "Studio scanned Alpha Bravo"
+    replacement_line = "Studio scanned Alpha Charlie"
+    target_px = draw.textbbox((145, 390), original_line, font=font)
+    draw.text((145, 390), original_line, font=font, fill=(20, 20, 20))
+    draw.text((145, 530), "Scanned image baseline stays local", font=font, fill=(35, 35, 35))
+    image_bytes = io.BytesIO()
+    image.save(image_bytes, format="PNG")
+    image.close()
+
+    target_mask = fitz.Rect(*(float(value) / 3.0 for value in target_px))
+    document = fitz.open()
+    page = document.new_page(width=612, height=792)
+    page.insert_image(page.rect, stream=image_bytes.getvalue())
+    page.set_cropbox(fitz.Rect(12, 16, 600, 776))
+    page.set_rotation(0)
+    document.new_page(width=612, height=792).insert_text((72, 680), "Untouched control page", fontsize=18)
+    document.save(source)
+    document.close()
+
+    with fitz.open(source) as source_document:
+        source_page = source_document[0]
+        # This source-derived OCR box and its four-point repair margin are fixed
+        # before compilation; candidate pixels never influence the mask.
+        visible_target_mask = fitz.Rect(
+            target_mask.x0 - 12.0,
+            target_mask.y0 - 16.0,
+            target_mask.x1 - 12.0,
+            target_mask.y1 - 16.0,
+        )
+        # Source OCR text bounds are transformed into visible CropBox-relative
+        # coordinates, then fixed with the established four-point margin.
+        frozen_mask = fitz.Rect(
+            visible_target_mask.x0 - 4.0,
+            visible_target_mask.y0 - 4.0,
+            visible_target_mask.x1 + 4.0,
+            visible_target_mask.y1 + 4.0,
+        )
+        source_geometry = (source_page.mediabox, source_page.cropbox, source_page.rotation)
+        source_images = _image_stream_sha256s(source_page)
+
+    layout = {
+        "schema_version": "ocr_v2_editor_layout.v1",
+        "ocr_v2": True,
+        "success": True,
+        "geometry_space": "studio_visible",
+        "pages": [{
+            "page_num": 1,
+            "width": 588,
+            "height": 760,
+            "kind": "scanned",
+            "is_ocr": True,
+            "elements": [{
+                "id": "studio-scanned-line-1",
+                "text": replacement_line,
+                "original_text": original_line,
+                "x": visible_target_mask.x0,
+                "y": visible_target_mask.y0,
+                "width": visible_target_mask.width,
+                "height": visible_target_mask.height,
+                "size": 27,
+                "font": "helv",
+                "bg_color": "#f8f7f3",
+                "text_color": "#141414",
+            }],
+        }],
+    }
+    layout_path = tmp_path / "studio-scanned-layout.json"
+    layout_path.write_text(json.dumps(layout), encoding="utf-8")
+
+    compile_document(str(source), str(output), str(layout_path))
+
+    with fitz.open(source) as source_document, fitz.open(output) as candidate_document:
+        assert len(candidate_document) == len(source_document) == 2
+        candidate_page = candidate_document[0]
+        assert (candidate_page.mediabox, candidate_page.cropbox, candidate_page.rotation) == source_geometry
+        assert "Studio scanned Alpha Charlie" in candidate_page.get_text("text")
+        assert "Studio scanned Alpha Bravo" not in candidate_page.get_text("text")
+        source_image_streams_preserved = source_images.issubset(_image_stream_sha256s(candidate_page))
+        outside_changed_details = {
+            dpi: _outside_mask_changed_pixels(source_document[0], candidate_page, frozen_mask, dpi)
+            for dpi in (72, 144, 288)
+        }
+        outside_changed_pixels = {dpi: details[0] for dpi, details in outside_changed_details.items()}
+        off_mask_samples = {dpi: details[1] for dpi, details in outside_changed_details.items() if details[0]}
+        assert source_image_streams_preserved and all(value == 0 for value in outside_changed_pixels.values()), (
+            f"source_image_streams_preserved={source_image_streams_preserved}; "
+            f"outside_changed_pixels_by_dpi={outside_changed_pixels}; "
+            f"off_mask_pixel_samples={off_mask_samples}"
+        )
+        for dpi in (72, 144, 288):
+            source_control = source_document[1].get_pixmap(dpi=dpi, colorspace=fitz.csRGB, alpha=False)
+            candidate_control = candidate_document[1].get_pixmap(dpi=dpi, colorspace=fitz.csRGB, alpha=False)
+            assert source_control.samples == candidate_control.samples

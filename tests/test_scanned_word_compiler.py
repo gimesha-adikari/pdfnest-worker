@@ -9,7 +9,10 @@ import pymupdf as fitz
 from PIL import Image, ImageDraw, ImageFont
 import pytest
 
-from app.core.scanned_word_compiler import compile_scanned_word_edits
+from app.core.scanned_word_compiler import (
+    _neighbor_word_records_preserved,
+    compile_scanned_word_edits,
+)
 
 
 PROTOCOL = "platen_word_edits.v1"
@@ -866,3 +869,19 @@ def test_multiple_repeated_word_edits_are_all_or_nothing(tmp_path):
     refusal = compile_scanned_word_edits(stamped_source, refused_output, envelope, stamped_resolved, stamped_sha)
     assert refusal == {"status": "REFUSED", "error_code": "BACKGROUND_COLORED_OVERLAP"}
     assert not refused_output.exists()
+
+
+def test_neighbor_boxes_allow_one_quantization_unit_but_reject_larger_changes():
+    source = [("of", (12.12, 30.0, 22.22, 40.0))]
+
+    one_quantized_unit = [("of", (12.13, 30.0, 22.22, 40.0))]
+    assert _neighbor_word_records_preserved(source, one_quantized_unit)
+
+    larger_shift = [("of", (12.14, 30.0, 22.22, 40.0))]
+    assert not _neighbor_word_records_preserved(source, larger_shift)
+
+    changed_text = [("off", (12.12, 30.0, 22.22, 40.0))]
+    assert not _neighbor_word_records_preserved(source, changed_text)
+
+    missing_neighbor: list[tuple[str, tuple[float, float, float, float]]] = []
+    assert not _neighbor_word_records_preserved(source, missing_neighbor)
