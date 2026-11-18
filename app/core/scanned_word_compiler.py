@@ -42,6 +42,8 @@ _SCRIPT_FONTS = {
     },
 }
 _VALIDATION_DPIS = (72, 144, 288)
+# Word boxes are quantized to hundredths of a point by _word_records.
+_NEIGHBOR_BBOX_TOLERANCE_POINTS = 0.01
 _NATIVE_FONT_ALIASES = {
     "Helvetica": "helv",
     "Helvetica-Bold": "hebo",
@@ -1317,6 +1319,36 @@ def _pixel_counts(before: Image.Image, after: Image.Image, allowed: list[fitz.Re
     return changed.histogram()[255], outside.histogram()[255]
 
 
+def _neighbor_word_records_preserved(
+    source_records: list[tuple[str, tuple[float, float, float, float]]],
+    candidate_records: list[tuple[str, tuple[float, float, float, float]]],
+) -> bool:
+    """Compare neighbor text exactly and tolerate one bbox quantization unit."""
+    source_counts = Counter(text for text, _ in source_records)
+    candidate_counts = Counter(text for text, _ in candidate_records)
+    if source_counts != candidate_counts:
+        return False
+
+    source_by_text: dict[str, list[tuple[float, float, float, float]]] = {}
+    candidate_by_text: dict[str, list[tuple[float, float, float, float]]] = {}
+    for text, bbox in source_records:
+        source_by_text.setdefault(text, []).append(bbox)
+    for text, bbox in candidate_records:
+        candidate_by_text.setdefault(text, []).append(bbox)
+
+    for text in source_counts:
+        source_boxes = sorted(source_by_text[text], key=lambda box: (box[1], box[0], box[3], box[2]))
+        candidate_boxes = sorted(candidate_by_text[text], key=lambda box: (box[1], box[0], box[3], box[2]))
+        for source_box, candidate_box in zip(source_boxes, candidate_boxes):
+            if any(
+                abs(source_box[index] - candidate_box[index])
+                > _NEIGHBOR_BBOX_TOLERANCE_POINTS + 1e-9
+                for index in range(4)
+            ):
+                return False
+    return True
+
+
 def _validate_candidate(source_path: Path, candidate_path: Path, plans: list[dict[str, Any]], page_count: int,
                         geometry: list[dict[str, Any]], original_words: list[list[tuple[str, tuple[float, float, float, float]]]],
                         image_hashes: set[str], cancellation_check: Callable[[], None] | None) -> dict[str, Any]:
@@ -1440,7 +1472,7 @@ def _validate_candidate(source_path: Path, candidate_path: Path, plans: list[dic
                     if source_box != candidate_box:
                         neighbor_bbox_mismatch_count += 1
                     neighbor_max_bbox_delta = max(neighbor_max_bbox_delta, *deltas)
-            neighbors_preserved &= Counter(source_neighbors) == Counter(candidate_neighbors)
+            neighbors_preserved &= _neighbor_word_records_preserved(source_neighbors, candidate_neighbors)
         checks["neighbors_preserved"] = neighbors_preserved
         checks["neighbor_diagnostics"] = {
             "source_word_count": neighbor_source_word_count,
