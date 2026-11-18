@@ -1042,17 +1042,33 @@ def compile_document(
                             page.draw_rect(native_rect, color=None, fill=hex_to_rgb(bg_hex))
 
                             replacement_text = str(element.get("text", "") or "")
+                            font_info = {
+                                "name": element.get("font", "helv"),
+                                "size": element.get("size", 10.0),
+                                "color": element.get("text_color", "#000000"),
+                            }
+                            effective_style = compute_effective_style(element, font_info)
+                            try:
+                                font_metrics = fitz.Font(fontname=effective_style["font_code"])
+                                font_size = float(effective_style["font_size"])
+                                font_descender = float(font_metrics.descender)
+                            except (RuntimeError, ValueError, TypeError) as exc:
+                                raise ValueError("Studio scanned edit has unavailable font metrics") from exc
+                            if not math.isfinite(font_size) or font_size <= 0:
+                                raise ValueError("Studio scanned edit has invalid font size")
+
+                            # Studio OCR boxes describe visible ink bounds, while
+                            # insert_text expects a baseline.  Using the box's
+                            # lower edge directly lets descenders spill below the
+                            # source-derived edit region.  Place the baseline so
+                            # this PDF font's descender ends at the OCR box edge.
                             target = {
                                 "operation": "replace",
                                 "original_substring": str(element.get("original_text", "") or ""),
                                 "replacement_substring": replacement_text,
                                 "target_bbox": [native_rect.x0, native_rect.y0, native_rect.x1, native_rect.y1],
-                                "baseline_y": native_rect.y1,
-                                "font_info": {
-                                    "name": element.get("font", "helv"),
-                                    "size": element.get("size", 10.0),
-                                    "color": element.get("text_color", "#000000"),
-                                },
+                                "baseline_y": native_rect.y1 + font_descender * font_size,
+                                "font_info": font_info,
                                 "max_width": native_rect.width,
                             }
                             render_surgical_replacement(
