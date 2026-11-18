@@ -6,6 +6,7 @@ include source text, word IDs, storage keys, or PDF content.
 from __future__ import annotations
 
 import hashlib
+import math
 import re
 from typing import Any
 
@@ -70,10 +71,26 @@ def summarize_candidate_validation_failure(job_id: str, result: Any) -> dict[str
             })
 
     job_digest = hashlib.sha256(str(job_id).encode("utf-8", errors="replace")).hexdigest()
-    return {
+    summary = {
         "schema_version": 1,
         "job_id_sha256_prefix": job_digest[:16],
         "failed_checks": sorted(set(failed_checks)),
         "outside_changed_pixels_by_dpi": pixel_counts,
         "target_summaries": targets,
     }
+    raw_neighbors = checks.get("neighbor_diagnostics")
+    if type(raw_neighbors) is dict and set(raw_neighbors) == {
+        "source_word_count", "candidate_word_count", "text_count_mismatch",
+        "bbox_mismatch_count", "max_bbox_delta_points",
+    }:
+        integer_fields = (
+            "source_word_count", "candidate_word_count",
+            "text_count_mismatch", "bbox_mismatch_count",
+        )
+        if all(type(raw_neighbors.get(key)) is int and 0 <= raw_neighbors[key] <= 1_000_000 for key in integer_fields):
+            delta = raw_neighbors.get("max_bbox_delta_points")
+            if type(delta) in (int, float) and math.isfinite(delta) and 0 <= delta <= 10_000:
+                summary["neighbor_diagnostics"] = {
+                    key: raw_neighbors[key] for key in integer_fields
+                } | {"max_bbox_delta_points": round(float(delta), 4)}
+    return summary

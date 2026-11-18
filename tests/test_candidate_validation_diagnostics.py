@@ -19,6 +19,15 @@ def test_candidate_validation_diagnostics_only_emits_allowlisted_summaries() -> 
             "outside_changed_pixels_by_dpi": {"72": 0, "144": 7, "288": 0, "evil": 99},
             "target_content_valid": False,
             "text_reading_order_preserved": True,
+            "neighbor_diagnostics": {
+                "source_word_count": 8,
+                "candidate_word_count": 8,
+                "text_count_mismatch": 0,
+                "bbox_mismatch_count": 2,
+                "max_bbox_delta_points": 0.125,
+                "source_text": "must not escape",
+                "source_boxes": [[1, 2, 3, 4]],
+            },
             "target_results": [{
                 "element_id": "private-element-id",
                 "word_id": "private-word-id",
@@ -46,6 +55,13 @@ def test_candidate_validation_diagnostics_only_emits_allowlisted_summaries() -> 
         "replacement_hits_at_target_count": 1,
         "old_target_hits_at_target": 2,
     }]
+    assert summary["neighbor_diagnostics"] == {
+        "source_word_count": 8,
+        "candidate_word_count": 8,
+        "text_count_mismatch": 0,
+        "bbox_mismatch_count": 2,
+        "max_bbox_delta_points": 0.125,
+    }
     serialized = json.dumps(summary)
     for secret in (
         "secret-job-id",
@@ -55,6 +71,7 @@ def test_candidate_validation_diagnostics_only_emits_allowlisted_summaries() -> 
         "private-word-id",
         "/private/source.pdf",
         "private/object/key",
+        "source_boxes",
     ):
         assert secret not in serialized
 
