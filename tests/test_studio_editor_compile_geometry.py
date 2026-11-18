@@ -295,7 +295,9 @@ def _outside_mask_changed_pixels(source_page: fitz.Page, candidate_page: fitz.Pa
     channels = difference.split()
     maximum = ImageChops.lighter(ImageChops.lighter(channels[0], channels[1]), channels[2])
     changed = maximum.point(lambda value: 255 if value > 2 else 0)
-    allowed = fitz.Rect(mask.x0 - 4.0, mask.y0 - 4.0, mask.x1 + 4.0, mask.y1 + 4.0)
+    # The mask is already source-derived with the declared four-point margin;
+    # keep only the independent one-raster-pixel antialiasing band here.
+    allowed = fitz.Rect(mask)
     scale = dpi / 72.0
     x0 = max(0, int(allowed.x0 * scale) - 1)
     y0 = max(0, int(allowed.y0 * scale) - 1)
@@ -355,11 +357,19 @@ def test_studio_visible_scanned_layout_edit_preserves_pixels_outside_frozen_line
         source_page = source_document[0]
         # This source-derived OCR box and its four-point repair margin are fixed
         # before compilation; candidate pixels never influence the mask.
+        visible_target_mask = fitz.Rect(
+            target_mask.x0 - 12.0,
+            target_mask.y0 - 16.0,
+            target_mask.x1 - 12.0,
+            target_mask.y1 - 16.0,
+        )
+        # Source OCR text bounds are transformed into visible CropBox-relative
+        # coordinates, then fixed with the established four-point margin.
         frozen_mask = fitz.Rect(
-            target_mask.x0 - 4.0,
-            target_mask.y0 - 4.0,
-            target_mask.x1 + 4.0,
-            target_mask.y1 + 4.0,
+            visible_target_mask.x0 - 4.0,
+            visible_target_mask.y0 - 4.0,
+            visible_target_mask.x1 + 4.0,
+            visible_target_mask.y1 + 4.0,
         )
         source_geometry = (source_page.mediabox, source_page.cropbox, source_page.rotation)
         source_images = _image_stream_sha256s(source_page)
@@ -379,10 +389,10 @@ def test_studio_visible_scanned_layout_edit_preserves_pixels_outside_frozen_line
                 "id": "studio-scanned-line-1",
                 "text": replacement_line,
                 "original_text": original_line,
-                "x": target_mask.x0 - 12,
-                "y": target_mask.y0 - 16,
-                "width": target_mask.width + 24,
-                "height": target_mask.height + 32,
+                "x": visible_target_mask.x0,
+                "y": visible_target_mask.y0,
+                "width": visible_target_mask.width,
+                "height": visible_target_mask.height,
                 "size": 27,
                 "font": "helv",
                 "bg_color": "#f8f7f3",
@@ -401,9 +411,16 @@ def test_studio_visible_scanned_layout_edit_preserves_pixels_outside_frozen_line
         assert (candidate_page.mediabox, candidate_page.cropbox, candidate_page.rotation) == source_geometry
         assert "Studio scanned Alpha Charlie" in candidate_page.get_text("text")
         assert "Studio scanned Alpha Bravo" not in candidate_page.get_text("text")
-        assert source_images.issubset(_image_stream_sha256s(candidate_page))
+        source_image_streams_preserved = source_images.issubset(_image_stream_sha256s(candidate_page))
+        outside_changed_pixels = {
+            dpi: _outside_mask_changed_pixels(source_document[0], candidate_page, frozen_mask, dpi)
+            for dpi in (72, 144, 288)
+        }
+        assert source_image_streams_preserved and all(value == 0 for value in outside_changed_pixels.values()), (
+            f"source_image_streams_preserved={source_image_streams_preserved}; "
+            f"outside_changed_pixels_by_dpi={outside_changed_pixels}"
+        )
         for dpi in (72, 144, 288):
-            assert _outside_mask_changed_pixels(source_document[0], candidate_page, frozen_mask, dpi) == 0
             source_control = source_document[1].get_pixmap(dpi=dpi, colorspace=fitz.csRGB, alpha=False)
             candidate_control = candidate_document[1].get_pixmap(dpi=dpi, colorspace=fitz.csRGB, alpha=False)
             assert source_control.samples == candidate_control.samples
