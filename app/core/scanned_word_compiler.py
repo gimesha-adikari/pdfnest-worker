@@ -414,10 +414,12 @@ def _prepare_scan_target(
             semantic_fontname = script_font["fontname"]
         else:
             measured_width = fitz.get_text_length(replacement, fontname="tibo", fontsize=font_size)
-            if measured_width > target_rect.width * 0.96:
+            # Keep the semantic advance within the selected word. In the last
+            # four percent, require the actual raster ink to fit there too.
+            if measured_width > target_rect.width:
                 return None, "REPLACEMENT_DOES_NOT_FIT"
             try:
-                patch = _render_replacement_patch(
+                replacement_patch = _render_replacement_patch(
                     patch,
                     allowed_px,
                     context_origin_x,
@@ -427,9 +429,13 @@ def _prepare_scan_target(
                     replacement,
                     font_size,
                     ink_color,
+                    ink_fit_rect=allowed_rect if measured_width > target_rect.width * 0.96 else None,
                 )
             except Exception:
                 return None, "REPLACEMENT_RENDER_UNSUPPORTED"
+            if replacement_patch is None:
+                return None, "REPLACEMENT_DOES_NOT_FIT"
+            patch = replacement_patch
     insertion_slot = source_word_index
     if insertion_slot is None:
         insertion_slot, order_error = _scan_insertion_slot(page, target_rect)
@@ -847,15 +853,23 @@ def _render_replacement_patch(
     replacement: str,
     font_size: float,
     color: tuple[float, float, float],
-) -> Image.Image:
+    *,
+    ink_fit_rect: fitz.Rect | None = None,
+) -> Image.Image | None:
     scale = _PATCH_DPI / 72.0
     patch_origin_x = (context_origin_x + allowed_px[0]) / scale
     patch_origin_y = (context_origin_y + allowed_px[1]) / scale
+    # Render with padding when checking the ink, so the patch edge cannot
+    # hide overflow. The measured pixels are mapped through the exact PDF
+    # image placement, which may differ from the rounded source raster clip.
+    padding = math.ceil(font_size * scale) if ink_fit_rect is not None else 0
     overlay_doc = fitz.open()
     try:
-        page = overlay_doc.new_page(width=patch.width / scale, height=patch.height / scale)
+        page = overlay_doc.new_page(width=(patch.width + 2 * padding) / scale,
+                                    height=(patch.height + 2 * padding) / scale)
         page.insert_text(
-            fitz.Point(target_rect.x0 - patch_origin_x, baseline - patch_origin_y),
+            fitz.Point(target_rect.x0 - patch_origin_x + padding / scale,
+                       baseline - patch_origin_y + padding / scale),
             replacement,
             fontname="tibo",
             fontsize=font_size,
@@ -864,6 +878,20 @@ def _render_replacement_patch(
         )
         pixmap = page.get_pixmap(matrix=fitz.Matrix(scale, scale), colorspace=fitz.csRGB, alpha=True)
         overlay = Image.frombytes("RGBA", (pixmap.width, pixmap.height), pixmap.samples)
+        if ink_fit_rect is not None:
+            bounds = overlay.getchannel("A").getbbox()
+            if bounds is None:
+                return None
+            x0, y0, x1, y1 = bounds
+            dx = ink_fit_rect.width / patch.width
+            dy = ink_fit_rect.height / patch.height
+            positioned_ink = fitz.Rect(
+                ink_fit_rect.x0 + (x0 - padding) * dx, ink_fit_rect.y0 + (y0 - padding) * dy,
+                ink_fit_rect.x0 + (x1 - padding) * dx, ink_fit_rect.y0 + (y1 - padding) * dy,
+            )
+            if not target_rect.contains(positioned_ink):
+                return None
+            overlay = overlay.crop((padding, padding, padding + patch.width, padding + patch.height))
         if overlay.size != patch.size:
             aligned = Image.new("RGBA", patch.size, (0, 0, 0, 0))
             aligned.alpha_composite(overlay.crop((0, 0, min(overlay.width, patch.width), min(overlay.height, patch.height))))
