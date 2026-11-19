@@ -230,3 +230,55 @@ def test_markup_engine_failure_precedes_geometry_failure():
 
     assert code == "ENGINE_UNAVAILABLE"
     assert "unavailable" in message.lower()
+
+
+def test_editor_redelivery_does_not_run_an_already_claimed_extraction(monkeypatch):
+    from app.jobs import actors
+    from app.jobs.store import claim_job
+
+    job = create_job("editor_extract")
+    assert claim_job(job.id) is not None
+
+    def unexpected_lease(*_args):
+        pytest.fail("Duplicate delivery attempted to acquire execution capacity")
+
+    monkeypatch.setattr(actors, "acquire_lease", unexpected_lease)
+    editor_extract_job.fn(job.id, "synthetic.pdf", ocr_v2=True, consumer="general_editor")
+    assert get_job(job.id).status == JobState.running
+
+
+def test_editor_capacity_rejection_terminates_job(monkeypatch):
+    from app.jobs import actors
+
+    job = create_job("editor_extract")
+    monkeypatch.setattr(actors, "acquire_lease", lambda *_: (False, "GLOBAL_CAPACITY_EXHAUSTED"))
+    editor_extract_job.fn(job.id, "synthetic.pdf", ocr_v2=True, consumer="general_editor")
+    result = get_job(job.id)
+    assert result.status == JobState.failed
+    assert result.finished_at
+    assert result.error_code == "EDITOR_OCR_BUSY"
+    assert "retry" in result.error.lower()
+    assert not result.result
+
+
+def test_editor_native_timeout_is_terminal_and_actionable(monkeypatch):
+    from app.core.ocr_v2.errors import OCRTimeoutError
+    from app.jobs import actors
+    from app.jobs.limiter import LEASE_KEY_PREFIX
+
+    job = create_job("editor_extract")
+    monkeypatch.setattr(actors, "download_to_path", lambda *_: None)
+
+    def timed_out(*_args, **_kwargs):
+        raise OCRTimeoutError("private details must not reach the client")
+
+    monkeypatch.setattr(actors, "execute_editor_ocr", timed_out)
+    editor_extract_job.fn(job.id, "synthetic.pdf", ocr_v2=True, consumer="general_editor",
+                          language_mode="AUTO", languages=["eng", "sin", "tam"])
+    result = get_job(job.id)
+    assert result.status == JobState.failed
+    assert result.error_code == "EDITOR_OCR_TIMEOUT"
+    assert "choose" in result.error.lower()
+    assert "private details" not in result.error
+    assert not result.result
+    assert not redis_client.exists(f"{LEASE_KEY_PREFIX}{job.id}")

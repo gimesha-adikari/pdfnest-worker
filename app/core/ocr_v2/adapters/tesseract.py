@@ -7,23 +7,100 @@ import io
 import os
 import shutil
 import tempfile
-from collections import defaultdict
+import time
+import unicodedata
+from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+
+import pymupdf as fitz
 from PIL import Image
 
 from ..contracts import UnnormalizedPageOutput
-from ..errors import ConfigurationError, EngineUnavailableError
+from ..errors import ConfigurationError, EngineUnavailableError, OCRTimeoutError
 from ..geometry import PreparedRaster
 from ..language_policy import (
     LanguagePolicyError,
     LanguageProbe,
     OCRLanguagePolicy,
+    script_counts,
+    scripts_for_languages,
 )
 from ..table_ocr import prepare_table_ocr_image
 from ...subprocess_runner import run_hardened_subprocess
 from ...tesseract_capacity import acquire_tesseract_capacity
 from .base import EngineAdapter, EngineAvailability, provenance_from_description
+
+
+def _tsv_words(tsv: str) -> dict[tuple[str, str, str], list[dict[str, Any]]]:
+    grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    for row in csv.DictReader(io.StringIO(tsv), delimiter="\t"):
+        text = str(row.get("text", "")).strip()
+        try:
+            confidence = float(row.get("conf", "-1"))
+            left, top, width, height = (float(row.get(name, "0")) for name in ("left", "top", "width", "height"))
+        except (TypeError, ValueError):
+            continue
+        if not text or width <= 0 or height <= 0 or confidence < 0:
+            continue
+        line = tuple(row.get(name, "0") for name in ("block_num", "par_num", "line_num"))
+        grouped[line].append({"text": text, "bbox": [left, top, left + width, top + height], "confidence": confidence})
+    return grouped
+
+
+def _recover_minority_words(
+    primary: dict[tuple[str, str, str], list[dict[str, Any]]],
+    combined: dict[tuple[str, str, str], list[dict[str, Any]]],
+    minority_scripts: set[str],
+    cancellation_check: Callable[[], None] | None,
+) -> None:
+    # The pair owns the layout and reading order. A third-script word may
+    # replace a contiguous, weaker span on one line if its box aligns.
+    # Reject insertions without an anchor, cross-line matches and partial
+    # overlaps with neighboring text.
+    bounds = {
+        key: fitz.Rect(
+            min(word["bbox"][0] for word in words), min(word["bbox"][1] for word in words),
+            max(word["bbox"][2] for word in words), max(word["bbox"][3] for word in words),
+        )
+        for key, words in primary.items()
+    }
+    single_scripts = [{script} for script in minority_scripts]
+    for words in combined.values():
+        if cancellation_check:
+            cancellation_check()
+        for word in words:
+            letters = "".join(char for char in word["text"] if unicodedata.category(char)[0] in {"L", "M"})
+            if (
+                word["confidence"] < 70
+                or len(letters) < 2
+                or not any(char.isalpha() for char in letters)
+                or set(script_counts(letters)) not in single_scripts
+            ):
+                continue
+            box = fitz.Rect(word["bbox"])
+            conflicts = []
+            for key, line in bounds.items():
+                if not line.intersects(box):
+                    continue
+                for index, old_word in enumerate(primary[key]):
+                    old_box = fitz.Rect(old_word["bbox"])
+                    area = (box & old_box).get_area()
+                    if area > 0:
+                        conflicts.append((key, index, area, old_box, old_word))
+            if not conflicts or len({key for key, *_ in conflicts}) != 1:
+                continue
+            key, first, *_ = conflicts[0]
+            last = conflicts[-1][1]
+            if last - first + 1 != len(conflicts) or any(
+                area < 0.5 * min(box.get_area(), old_box.get_area())
+                or word["confidence"] <= old_word["confidence"]
+                or old_word.get("recovered")
+                for _, _, area, old_box, old_word in conflicts
+            ):
+                continue
+            primary[key][first:last + 1] = [{**word, "recovered": True}]
+            bounds[key] |= box
 
 
 class TesseractAdapter(EngineAdapter):
@@ -105,6 +182,7 @@ class TesseractAdapter(EngineAdapter):
             rows = list(csv.DictReader(io.StringIO(completed.stdout), delimiter="\t"))
             words = [str(row.get("text", "")).strip() for row in rows if str(row.get("text", "")).strip()]
             confidences = []
+            confident_script_words: Counter[str] = Counter()
             for row in rows:
                 try:
                     confidence = float(row.get("conf", "-1"))
@@ -112,8 +190,26 @@ class TesseractAdapter(EngineAdapter):
                     continue
                 if confidence >= 0:
                     confidences.append(confidence)
+                if confidence >= 70:
+                    # Ignore punctuation and digits, and exclude mixed-script
+                    # words. A stray character is insufficient evidence.
+                    letters_and_marks = "".join(
+                        char for char in (row.get("text") or "")
+                        if unicodedata.category(char)[0] in {"L", "M"}
+                    )
+                    scripts = script_counts(letters_and_marks)
+                    if (
+                        len(letters_and_marks) >= 2
+                        and any(char.isalpha() for char in letters_and_marks)
+                        and len(scripts) == 1
+                        and "OTHER" not in scripts
+                    ):
+                        confident_script_words.update(scripts.keys())
             average = sum(confidences) / len(confidences) if confidences else -1.0
-            return LanguageProbe(languages, " ".join(words), average)
+            return LanguageProbe(
+                languages, " ".join(words), average,
+                confident_script_words=dict(confident_script_words),
+            )
         finally:
             try:
                 Path(image_path).unlink()
@@ -121,6 +217,31 @@ class TesseractAdapter(EngineAdapter):
                 pass
 
     def recognize_page(self, page_id: str, raster: PreparedRaster) -> UnnormalizedPageOutput:
+        return self._recognize_page(page_id, raster)
+
+    def recognize_page_with_minority(
+        self,
+        page_id: str,
+        raster: PreparedRaster,
+        primary_languages: tuple[str, ...],
+        *,
+        cancellation_check: Callable[[], None] | None = None,
+        deadline: float | None = None,
+    ) -> UnnormalizedPageOutput:
+        local_deadline = time.monotonic() + self.timeout
+        return self._recognize_page(
+            page_id, raster, primary_languages, cancellation_check,
+            min(deadline, local_deadline) if deadline is not None else local_deadline,
+        )
+
+    def _recognize_page(
+        self,
+        page_id: str,
+        raster: PreparedRaster,
+        primary_languages: tuple[str, ...] = (),
+        cancellation_check: Callable[[], None] | None = None,
+        deadline: float | None = None,
+    ) -> UnnormalizedPageOutput:
         if not self.readiness():
             self.initialize()
         ocr_image = raster.image
@@ -146,39 +267,44 @@ class TesseractAdapter(EngineAdapter):
             data_dir = self._data_dir()
             if data_dir:
                 env["TESSDATA_PREFIX"] = str(data_dir)
-            command = ["tesseract", image_path, "stdout", "-l", self.languages]
-            if table_grid is not None:
-                command.extend(["--psm", "6"])
-            command.append("tsv")
-            with acquire_tesseract_capacity(timeout=self.timeout):
-                completed = run_hardened_subprocess(command, timeout=self.timeout, env=env)
-            if completed.returncode != 0:
-                raise EngineUnavailableError(completed.stderr.strip() or "Tesseract returned a non-zero status")
-            rows = list(csv.DictReader(io.StringIO(completed.stdout), delimiter="\t"))
-            grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
+            def remaining() -> float:
+                if deadline is None:
+                    return self.timeout
+                seconds = deadline - time.monotonic()
+                if seconds <= 0:
+                    raise OCRTimeoutError("OCR exceeded the page recognition deadline")
+                return seconds
+
+            def recognize(languages: str) -> str:
+                if cancellation_check:
+                    cancellation_check()
+                command = ["tesseract", image_path, "stdout", "-l", languages]
+                if table_grid is not None:
+                    command.extend(["--psm", "6"])
+                command.append("tsv")
+                with acquire_tesseract_capacity(timeout=remaining()):
+                    completed = run_hardened_subprocess(command, timeout=remaining(), env=env)
+                if completed.returncode != 0:
+                    raise EngineUnavailableError(completed.stderr.strip() or "Tesseract returned a non-zero status")
+                return completed.stdout
+
+            primary_tsv = recognize("+".join(primary_languages) if primary_languages else self.languages)
+            grouped = _tsv_words(primary_tsv)
+            raw = {"tsv": primary_tsv}
+            if primary_languages:
+                combined_tsv = recognize(self.languages)
+                minority = scripts_for_languages(self.policy.languages) - scripts_for_languages(primary_languages)
+                _recover_minority_words(grouped, _tsv_words(combined_tsv), minority, cancellation_check)
+                raw["supplemental_tsv"] = combined_tsv
             items: list[dict[str, Any]] = []
-            for index, row in enumerate(rows):
-                text = str(row.get("text", "")).strip()
-                try:
-                    confidence = float(row.get("conf", "-1"))
-                    box = [float(row.get(name, "0")) for name in ("left", "top", "left", "top")]
-                    box[2] = box[0] + float(row.get("width", "0"))
-                    box[3] = box[1] + float(row.get("height", "0"))
-                except (TypeError, ValueError):
-                    continue
-                if not text or box[2] <= box[0] or box[3] <= box[1] or confidence < 0:
-                    continue
-                item = {
-                    "id": f"{page_id}-token-{len(items)}",
-                    "text": text,
-                    "bbox": box,
-                    "confidence": confidence,
-                    "confidence_scale": "0_100",
-                    "block_id": str(row.get("block_num", "0")),
-                    "line_id": f"{row.get('block_num', '0')}:{row.get('par_num', '0')}:{row.get('line_num', '0')}",
-                }
-                items.append(item)
-                grouped[(item["block_id"], str(row.get("par_num", "0")), str(row.get("line_num", "0")))].append(item)
+            for key, words in grouped.items():
+                for word in words:
+                    word.pop("recovered", None)
+                    word.update(
+                        id=f"{page_id}-token-{len(items)}", confidence_scale="0_100",
+                        block_id=key[0], line_id=":".join(key),
+                    )
+                    items.append(word)
             lines = []
             for key, words in grouped.items():
                 lines.append({
@@ -196,7 +322,7 @@ class TesseractAdapter(EngineAdapter):
                 items=tuple(items),
                 coordinate_space="pixel_top_left",
                 provenance=provenance_from_description(description),
-                raw_output={"tsv": completed.stdout},
+                raw_output=raw,
                 metadata={"pixel_width": raster.image.width, "pixel_height": raster.image.height, "requested_languages": self.languages},
             )
         finally:

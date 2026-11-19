@@ -236,8 +236,8 @@ def _capacity(check, timeout):
                     break
             if descriptor is None:
                 if time.monotonic() >= deadline:
-                    from app.core.ocr_v2.errors import OCRTimeoutError
-                    raise OCRTimeoutError('Native processing capacity wait timed out')
+                    from app.core.ocr_v2.errors import NativeCapacityTimeoutError
+                    raise NativeCapacityTimeoutError('Native processing capacity wait timed out')
                 time.sleep(.05)
         yield
     finally:
@@ -248,7 +248,7 @@ def _capacity(check, timeout):
 def execute(operation, *args, **kwargs):
     from app.core.native_operations import OPERATIONS
     from app.core.ocr_v2.geometry import _raster_context
-    from app.core.ocr_v2.errors import EngineUnavailableError, OCRTimeoutError
+    from app.core.ocr_v2.errors import EngineUnavailableError, NativeCapacityTimeoutError, OCRTimeoutError
     if operation not in OPERATIONS:
         raise ValueError('Unsupported isolated native operation')
     options = dict(kwargs)
@@ -358,7 +358,7 @@ def execute(operation, *args, **kwargs):
             os.replace(pending, output)
         return result
     except DomainBusy as exc:
-        raise OCRTimeoutError('Native processing capacity wait timed out') from exc
+        raise NativeCapacityTimeoutError('Native processing capacity wait timed out') from exc
     except DomainUnavailable as exc:
         raise EngineUnavailableError('Native execution domain is unavailable') from exc
     finally:

@@ -10,7 +10,7 @@ from PIL import Image, ImageDraw
 import pytest
 
 from app.core import native_isolation as boundary, native_operations as operations
-from app.core.ocr_v2.errors import EngineUnavailableError, OCRTimeoutError, RasterAdmissionError
+from app.core.ocr_v2.errors import EngineUnavailableError, NativeCapacityTimeoutError, OCRTimeoutError, RasterAdmissionError
 from app.core.ocr_v2.geometry import raster_policy
 from app.jobs.cancellation import JobCancelledException
 
@@ -260,6 +260,10 @@ def test_capacity_is_shared_across_processes_and_cancellable(tmp_path):
             assert holder.poll() is None
             assert time.monotonic() < deadline
             time.sleep(.02)
+        with pytest.raises(NativeCapacityTimeoutError, match="capacity wait timed out"):
+            with boundary._capacity(lambda: None, .1):
+                pytest.fail('Second process bypassed document capacity')
+
         calls = 0
         def check():
             nonlocal calls
@@ -470,3 +474,10 @@ def test_explicit_exports_match_the_operation_allowlist():
         metadata = {attribute: getattr(wrapper, attribute) for attribute in ('func', 'args')}
         assert metadata['func'] is boundary.execute
         assert metadata['args'] == (name,)
+
+
+def test_native_child_enforces_openmp_limit(child_probe, monkeypatch, tmp_path):
+    monkeypatch.setenv("OMP_THREAD_LIMIT", "8")
+    report = operations.inspect_pdf(tmp_path, "valid")
+    assert report["omp_thread_limit"] == "1"
+    assert os.environ["OMP_THREAD_LIMIT"] == "8"

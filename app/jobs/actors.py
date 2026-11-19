@@ -23,7 +23,7 @@ from app.core.native_operations import convert_pdf_to_markdown
 from app.core.broker import broker  # noqa: F401
 from app.core.config import validate_runtime_config
 from app.core.ocr_v2.diagnostics import emit_searchable_diagnostic, retain_failed_render_artifacts, safe_exception_message
-from app.core.ocr_v2.errors import EngineUnavailableError, OCRTimeoutError, RenderingNotEligibleError
+from app.core.ocr_v2.errors import EngineUnavailableError, NativeCapacityTimeoutError, OCRTimeoutError, RenderingNotEligibleError
 from app.core.ocr_v2.errors import MarkupError, TextNotFoundError, WordGeometryUnavailableError, AnnotationWriteError
 from app.core.ocr_text_engine import (
     OCRTextEngineConfigurationError,
@@ -815,29 +815,43 @@ def editor_extract_job(
         update_job(job_id, status=JobState.cancelled, finished_at=datetime.now(timezone.utc), message="Job cancelled")
         return
 
-    owner_identity = (job.payload or {}).get("ownerIdentity") or "guest:anonymous"
-    acquired, reason = acquire_lease(job_id, owner_identity)
-    if not acquired:
-        logger.warning("Execution capacity full (%s) for job %s. Retrying...", reason, job_id)
-        raise Retry(message=f"Execution capacity full: {reason}", delay=5000)
-
-    input_suffix = Path(source_name or source_key).suffix or ".pdf"
-    input_path = temp_file_path(prefix="pdfnest-source-", suffix=input_suffix)
-
-    update_job(
-        job_id,
-        status=JobState.running,
-        started_at=datetime.now(timezone.utc),
-        progress=0,
-        message="Editor extraction started",
-    )
-
+    owner_identity = job.owner_identity or (job.payload or {}).get("ownerIdentity") or "guest:anonymous"
+    acquired = False
+    input_path = None
+    stage = "admission"
+    started = time.monotonic()
+    pages_completed = 0
     try:
+        if claim_job(job_id) is None:
+            # A cancellation can arrive between the initial check and claim.
+            check_cancellation(job_id)
+            return
+        check_cancellation(job_id)
+        acquired, reason = acquire_lease(job_id, owner_identity)
+        if not acquired:
+            storage_unavailable = reason == "REDIS_ERROR"
+            update_job(
+                job_id,
+                status=JobState.failed,
+                finished_at=datetime.now(timezone.utc),
+                error="Editor job storage is temporarily unavailable. Please retry."
+                if storage_unavailable else "Editor extraction capacity is busy. Please retry shortly.",
+                error_code="TASK_STORAGE_UNAVAILABLE" if storage_unavailable else "EDITOR_OCR_BUSY",
+                message="Editor extraction could not start",
+            )
+            return
+
+        input_suffix = Path(source_name or source_key).suffix or ".pdf"
+        input_path = temp_file_path(prefix="pdfnest-source-", suffix=input_suffix)
+        update_job(job_id, progress=0, message="Editor extraction started")
+        stage = "source_download"
         check_cancellation(job_id)
         download_to_path(source_key, input_path)
         source_sha256 = _sha256_file(input_path)
         check_cancellation(job_id)
         def report_editor_page(done: int, total: int, _page: object) -> None:
+            nonlocal pages_completed
+            pages_completed = done
             if not ocr_v2:
                 return
             progress = min(90, 20 + int((done / max(1, total)) * 70))
@@ -867,6 +881,7 @@ def editor_extract_job(
             extractor_kwargs["page_progress_callback"] = report_editor_page
             extractor_kwargs["language_mode"] = language_mode
             extractor_kwargs["languages"] = languages or ["eng"]
+        stage = "layout_extraction"
         result = extractor(input_path, password, **extractor_kwargs)
         check_cancellation(job_id)
         if ocr_v2:
@@ -877,6 +892,7 @@ def editor_extract_job(
             )
             color_probe = native_editor_color_probe(result)
             if color_probe["pages"]:
+                stage = "native_color_sampling"
                 color_result = editor_colors(
                     color_probe, input_path, password,
                     visible_geometry=consumer != EDITOR_OCR_CONSUMER_GENERAL_EDITOR,
@@ -952,6 +968,26 @@ def editor_extract_job(
             message="Editor OCR engine configuration is invalid",
         )
         return
+    except OCRTimeoutError as exc:
+        busy = isinstance(exc, NativeCapacityTimeoutError)
+        error = "Editor extraction capacity is busy. Please retry shortly."
+        if not busy:
+            error = "Editor extraction reached its processing time limit. Try a smaller page range or split the PDF."
+            if ocr_v2 and language_mode == "AUTO":
+                error = "Editor extraction reached its processing time limit. Choose the OCR languages explicitly or split the PDF."
+        logger.warning(
+            "Editor native extraction deadline job=%s stage=%s busy=%s completed_pages=%d elapsed_seconds=%.2f",
+            job_id, stage, busy, pages_completed, time.monotonic() - started,
+        )
+        update_job(
+            job_id,
+            status=JobState.failed,
+            finished_at=datetime.now(timezone.utc),
+            error=error,
+            error_code="EDITOR_OCR_BUSY" if busy else "EDITOR_OCR_TIMEOUT",
+            message="Editor extraction could not start" if busy else "Editor extraction timed out",
+        )
+        return
     except Exception as exc:
         update_job(
             job_id,
@@ -966,8 +1002,10 @@ def editor_extract_job(
             return
         raise
     finally:
-        release_lease(job_id, owner_identity)
-        cleanup_paths(input_path)
+        if acquired:
+            release_lease(job_id, owner_identity)
+        if input_path is not None:
+            cleanup_paths(input_path)
 
 
 @dramatiq.actor(queue_name="editor", max_retries=3, time_limit=600_000)
