@@ -2,6 +2,7 @@
 from __future__ import annotations
 import importlib
 import inspect
+import os
 from pathlib import Path
 import resource
 import sys
@@ -25,6 +26,9 @@ def apply_resource_limits():
 def main():
     from app.core import native_isolation as boundary
     apply_resource_limits()
+    # Tesseract requests explicit OpenMP teams. OMP_NUM_THREADS=1 alone
+    # leaves those teams able to oversubscribe the isolated CPU allocation.
+    os.environ["OMP_THREAD_LIMIT"] = "1"
     boundary.IN_CHILD = True
     root = Path(sys.argv[1])
     try:

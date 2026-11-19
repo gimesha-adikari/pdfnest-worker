@@ -208,6 +208,7 @@ def _patch_editor_actor_io(
         ),
     )
     monkeypatch.setattr(actors, "check_cancellation", lambda _job_id: None)
+    monkeypatch.setattr(actors, "claim_job", actors.get_job)
     monkeypatch.setattr(actors, "acquire_lease", lambda _job_id, _owner: (True, ""))
     monkeypatch.setattr(actors, "release_lease", lambda _job_id, _owner: None)
     monkeypatch.setattr(

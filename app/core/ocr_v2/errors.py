@@ -54,6 +54,10 @@ class OCRTimeoutError(OCRV2Error):
     pass
 
 
+class NativeCapacityTimeoutError(OCRTimeoutError):
+    """The bounded wait expired before native execution began."""
+
+
 class LanguageDetectionUncertainError(OCRV2Error):
     """AUTO mode could not choose a safe language set within its budget."""
     pass

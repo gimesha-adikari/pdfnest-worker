@@ -44,4 +44,5 @@ def probe(directory, mode, **kwargs):
         os._exit(17)
     if mode == 'flood':
         print('x' * (128 * 1024), flush=True)
-    return {'pid': os.getpid(), 'memory': CHILD_MEMORY, 'cpu': CHILD_CPU}
+    return {'pid': os.getpid(), 'memory': CHILD_MEMORY, 'cpu': CHILD_CPU,
+            'omp_thread_limit': os.getenv('OMP_THREAD_LIMIT')}
