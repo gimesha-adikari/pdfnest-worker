@@ -1,6 +1,6 @@
 # General Editor OCR reliability evidence
 
-**Status — REAL-PDF OCR PARTIAL.** The original document completed OCR and the browser edit workflow on the candidate. AUTO language routing still omits script content on two verified pages.
+**Status — REAL-PDF OCR PARTIAL.** The latest AUTO correction recovered the two reported omissions. The independent OCR comparison found lower English and Tamil agreement on page 5, which blocks release qualification.
 
 ## Observed incident
 
@@ -90,3 +90,42 @@ The ordinary synthetic comparison helper did not account for a new logical word 
 ### Regression and release position
 
 A fresh focused worker run passed 55 tests, covering duplicate delivery, terminal states, capacity contention, cancellation, native wall deadlines, process group cleanup and recovery. No application source changed during the original-document qualification. PR #20 remains an unmerged correction for review. Original-document timeout recovery is verified, and complete real-PDF acceptance remains partial because of the demonstrated AUTO omissions.
+
+## AUTO minority script correction and original-document retest
+
+**Verdict — REAL-PDF OCR PARTIAL.** The routing correction recovered the two reported omissions within the original resource limits. The independent OCR cross-check shows an accuracy tradeoff on another page. This draft is not qualified for release.
+
+### Root cause and change
+
+The SDK renders each scanned page, samples three bands and runs single-language Tesseract probes. The detector aggregates the probe mean confidence, script counts and whole-sample score, ranks the singles, then examines the best pair. The third script on page 6 (Sinhala) and page 13 (Tamil) had probe means of 39.46 and 29.77 despite well-recognized words. The preferred pair's score was 33.84 and 25.32 points higher, respectively. Both gaps exceeded the 25-point material-alt margin. The three-language check never ran. Final recognition therefore received a pair with one needed model absent. Normalization and word projection did not drop the script.
+
+The SDK correction is `c80456de5aadba07826ec932c6f96c3d01cd1c6c` in [SDK PR #8](https://github.com/gimesha-adikari/platen-document/pull/8). The worker lock pins that commit and the worker's internal engine implements the same rule. A probe carries counts of high-confidence, single-script words, including combining marks. An otherwise accepted pair gains at most one confirmation probe when the excluded single already has three such words. The detector switches to all three models only if the combined probe confirms at least three words per supported script and matches or exceeds the pair's mean confidence and aggregate score. This branch uses the existing probe ceiling. A failed confirmation keeps the prior pair. Explicit language requests, native extraction, source binding, word identity format, isolation, thread limits, cancellation and the document deadline remain in force.
+
+### Original-document result
+
+The production SDK path completed 13/13 pages in **145.487 s worker time** and **146.832 s from browser upload to observed terminal result**. The previous timeout-only candidate took 133.25 s. The retest ran with one CPU, a 1 GB cgroup and the 300-second native deadline. It used 142.93 aggregate CPU seconds and peaked at 631,382,016 bytes with zero OOM events. The 58 probes took 82.57 s and 13 final recognitions took 31.95 s. The former candidate made 55 probes. The result had 437 lines and 2,658 usable word boxes, with matching page geometry and zero boxes outside their page. The private SHA-256 of the original remained unchanged and matched the frozen baseline. The source and output PDFs, original hashes, rendered pages and word records stayed in the private local environment.
+
+| Pages | Languages used for recognition | Evidence |
+| --- | --- | --- |
+| 1 | English and Tamil | Latin output only. Word text and geometry identical to the preceding AUTO candidate |
+| 2–3, 7–9 | English | Word text and geometry identical |
+| 4 | English and Sinhala | Word text and geometry identical |
+| 5–6 | English, Sinhala and Tamil | Sinhala recovered. Each page's complete word text and geometry matched its targeted explicit trilingual run |
+| 10–12 | English, Sinhala and Tamil | Word text and geometry identical |
+| 13 | English, Sinhala and Tamil | Tamil recovered. Complete word text and geometry matched the targeted explicit trilingual run |
+
+A second comparison used a separate 220 DPI Poppler render, explicit trilingual recognition, and spatially matched words at confidence 85 or higher. Counts below are exact word-and-location matches, not a human transcription score.
+
+| Page | English matches before → after | Sinhala matches before → after | Tamil matches before → after |
+| --- | --- | --- | --- |
+| 5 | 15 → 9 of 16 | 0 → 5 of 7 | 10 → 7 of 11 |
+| 6 | 16 → 16 of 18 | 0 → 10 of 10 | 12 → 12 of 12 |
+| 13 | 75 → 75 of 80 | 50 → 49 of 55 | 0 → 26 of 30 |
+
+In the targeted 200 DPI SDK reference, pages 6 and 13 recovered 81 high-confidence Sinhala and 306 high-confidence Tamil characters, respectively. The confirmation probe improved page 5's sample score, but did not predict the drop in full-page English and Tamil agreement. This is a concrete remaining preservation gap. Exact agreement with explicit OCR does not establish linguistic accuracy, and the lower independent-reference agreement on page 5 prevents a full pass.
+
+### Browser, recovery and tests
+
+The same local browser uploaded, extracted and opened the original. A genuine baseline-bound `platen_word_edits.v1` request compiled, rendered a verified preview and completed both download controls. Artifact, preview and actual download SHA-256 matched. The candidate passed qpdf, MuPDF and Poppler target-local logical text, original image stream retention and page geometry checks. All 78 render comparisons at 72, 144 and 288 DPI passed with zero changed pixels outside the frozen mask and on untouched pages under the established policy. A concurrent job returned `EDITOR_OCR_BUSY` and the next native extraction succeeded on the same worker. Before the final rerun, cancellation of the earlier candidate released the slot and the waiting extraction succeeded.
+
+Fresh local results were **443 SDK tests passed, 1 skipped**, and **182 focused worker tests passed**. The tests cover the minority decision, false-positive confirmation refusal, the probe budget, combining marks, Editor and Studio routing, word baselines, native timeout, cleanup and cancellation. Native, English-only scanned, separate-language scanned and same-page trilingual synthetic inputs also completed through the internal engine. No production deployment occurred.

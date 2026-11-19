@@ -7,7 +7,8 @@ import io
 import os
 import shutil
 import tempfile
-from collections import defaultdict
+import unicodedata
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 from PIL import Image
@@ -19,6 +20,7 @@ from ..language_policy import (
     LanguagePolicyError,
     LanguageProbe,
     OCRLanguagePolicy,
+    script_counts,
 )
 from ..table_ocr import prepare_table_ocr_image
 from ...subprocess_runner import run_hardened_subprocess
@@ -105,6 +107,7 @@ class TesseractAdapter(EngineAdapter):
             rows = list(csv.DictReader(io.StringIO(completed.stdout), delimiter="\t"))
             words = [str(row.get("text", "")).strip() for row in rows if str(row.get("text", "")).strip()]
             confidences = []
+            confident_script_words: Counter[str] = Counter()
             for row in rows:
                 try:
                     confidence = float(row.get("conf", "-1"))
@@ -112,8 +115,26 @@ class TesseractAdapter(EngineAdapter):
                     continue
                 if confidence >= 0:
                     confidences.append(confidence)
+                if confidence >= 70:
+                    # Ignore punctuation and digits, and exclude mixed-script
+                    # words. A stray character is insufficient evidence.
+                    letters_and_marks = "".join(
+                        char for char in (row.get("text") or "")
+                        if unicodedata.category(char)[0] in {"L", "M"}
+                    )
+                    scripts = script_counts(letters_and_marks)
+                    if (
+                        len(letters_and_marks) >= 2
+                        and any(char.isalpha() for char in letters_and_marks)
+                        and len(scripts) == 1
+                        and "OTHER" not in scripts
+                    ):
+                        confident_script_words.update(scripts.keys())
             average = sum(confidences) / len(confidences) if confidences else -1.0
-            return LanguageProbe(languages, " ".join(words), average)
+            return LanguageProbe(
+                languages, " ".join(words), average,
+                confident_script_words=dict(confident_script_words),
+            )
         finally:
             try:
                 Path(image_path).unlink()

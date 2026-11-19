@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable, Iterable, Mapping, Sequence
 
@@ -147,6 +147,7 @@ class LanguageProbe:
     text: str
     confidence: float
     samples: int = 1
+    confident_script_words: Mapping[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -585,6 +586,35 @@ class FusedLanguageDetector:
                 and pair_tokens >= self.min_linguistic_tokens
                 and pair_score >= best_single[0] + required_pair_gain
             ):
+                # A whole-sample score favors the dominant scripts. A lower
+                # ranked single can still have several well-recognized words.
+                # Verify that evidence with one combined probe before omitting
+                # the script. Retain the established pair if it is not confirmed.
+                minimum_words = 3
+                extra_scripts = {
+                    script for script in supported_scripts[2:]
+                    if best_for_script[script][2].confident_script_words.get(script, 0) >= minimum_words
+                }
+                complete = ("eng", "sin", "tam")
+                if extra_scripts and set(complete) <= set(canonical) and len(scored) < self.expanded_max_probes:
+                    evaluate(complete)
+                    complete_score, complete_probe, complete_counts, _ = scored[complete]
+                    if (
+                        complete_probe.confidence >= pair_probe.confidence
+                        and complete_score >= pair_score
+                        and all(
+                            complete_probe.confident_script_words.get(script, 0) >= minimum_words
+                            for script in set(primary_scripts) | extra_scripts
+                        )
+                    ):
+                        return LanguageDetection(
+                            OCRLanguagePolicy(OCRLanguageMode.EXPLICIT, complete),
+                            LanguageDecisionStatus.MULTILINGUAL_DETECTED,
+                            max(0.0, min(100.0, complete_score)),
+                            self._script_tuple(complete_counts),
+                            len(scored),
+                            "corroborated minority script words",
+                        )
                 return LanguageDetection(
                     OCRLanguagePolicy(OCRLanguageMode.EXPLICIT, pair_candidate),
                     LanguageDecisionStatus.MULTILINGUAL_DETECTED,
