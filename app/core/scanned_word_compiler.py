@@ -414,12 +414,19 @@ def _prepare_scan_target(
             semantic_fontname = script_font["fontname"]
         else:
             measured_width = fitz.get_text_length(replacement, fontname="tibo", fontsize=font_size)
+<<<<<<< codex/preserve-main-before-github-sync-mrc4xb4k
+            if measured_width > target_rect.width * 0.96:
+                return None, "REPLACEMENT_DOES_NOT_FIT"
+            try:
+                patch = _render_replacement_patch(
+=======
             # Keep the semantic advance within the selected word. In the last
             # four percent, require the actual raster ink to fit there too.
             if measured_width > target_rect.width:
                 return None, "REPLACEMENT_DOES_NOT_FIT"
             try:
                 replacement_patch = _render_replacement_patch(
+>>>>>>> main
                     patch,
                     allowed_px,
                     context_origin_x,
@@ -853,6 +860,17 @@ def _render_replacement_patch(
     replacement: str,
     font_size: float,
     color: tuple[float, float, float],
+<<<<<<< codex/preserve-main-before-github-sync-mrc4xb4k
+) -> Image.Image:
+    scale = _PATCH_DPI / 72.0
+    patch_origin_x = (context_origin_x + allowed_px[0]) / scale
+    patch_origin_y = (context_origin_y + allowed_px[1]) / scale
+    overlay_doc = fitz.open()
+    try:
+        page = overlay_doc.new_page(width=patch.width / scale, height=patch.height / scale)
+        page.insert_text(
+            fitz.Point(target_rect.x0 - patch_origin_x, baseline - patch_origin_y),
+=======
     *,
     ink_fit_rect: fitz.Rect | None = None,
 ) -> Image.Image | None:
@@ -870,6 +888,7 @@ def _render_replacement_patch(
         page.insert_text(
             fitz.Point(target_rect.x0 - patch_origin_x + padding / scale,
                        baseline - patch_origin_y + padding / scale),
+>>>>>>> main
             replacement,
             fontname="tibo",
             fontsize=font_size,
@@ -878,6 +897,8 @@ def _render_replacement_patch(
         )
         pixmap = page.get_pixmap(matrix=fitz.Matrix(scale, scale), colorspace=fitz.csRGB, alpha=True)
         overlay = Image.frombytes("RGBA", (pixmap.width, pixmap.height), pixmap.samples)
+<<<<<<< codex/preserve-main-before-github-sync-mrc4xb4k
+=======
         if ink_fit_rect is not None:
             bounds = overlay.getchannel("A").getbbox()
             if bounds is None:
@@ -892,6 +913,7 @@ def _render_replacement_patch(
             if not target_rect.contains(positioned_ink):
                 return None
             overlay = overlay.crop((padding, padding, padding + patch.width, padding + patch.height))
+>>>>>>> main
         if overlay.size != patch.size:
             aligned = Image.new("RGBA", patch.size, (0, 0, 0, 0))
             aligned.alpha_composite(overlay.crop((0, 0, min(overlay.width, patch.width), min(overlay.height, patch.height))))
