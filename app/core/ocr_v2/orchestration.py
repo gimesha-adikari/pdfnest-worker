@@ -194,7 +194,14 @@ class OCRV2Worker:
                             adapter.initialize()
                         if not adapter.readiness():
                             raise RuntimeError(f"adapter {route.engine_id} did not reach readiness")
-                        output = adapter.recognize_page(page_id, raster)
+                        if detection and detection.primary_languages and isinstance(adapter, TesseractAdapter):
+                            output = adapter.recognize_page_with_minority(
+                                page_id, raster, detection.primary_languages,
+                                cancellation_check=cancellation_check,
+                                deadline=started + page_timeout_seconds if page_timeout_seconds is not None else None,
+                            )
+                        else:
+                            output = adapter.recognize_page(page_id, raster)
                         geometry = raster.geometry
                         normalized = normalize_page_output(
                             output,

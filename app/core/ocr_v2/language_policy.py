@@ -158,6 +158,7 @@ class LanguageDetection:
     scripts: tuple[str, ...]
     probes: int
     reason: str
+    primary_languages: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -614,6 +615,7 @@ class FusedLanguageDetector:
                             self._script_tuple(complete_counts),
                             len(scored),
                             "corroborated minority script words",
+                            primary_languages=pair_candidate,
                         )
                 return LanguageDetection(
                     OCRLanguagePolicy(OCRLanguageMode.EXPLICIT, pair_candidate),

@@ -61,10 +61,11 @@ def _minority_script_probes(third_language: str, combined_words: int = 5):
 
 def test_fused_detector_confirms_minority_script_despite_aggregate_score_gap() -> None:
     for minority in ("sin", "tam"):
-        _, triple, calls, probe = _minority_script_probes(minority)
+        pair, triple, calls, probe = _minority_script_probes(minority)
         result = FusedLanguageDetector().detect(triple, probe)
         assert result.policy is not None
         assert result.policy.languages == triple
+        assert result.primary_languages == pair
         assert calls.count(triple) == 1
         assert len(calls) == 5
 
@@ -74,12 +75,14 @@ def test_fused_detector_rejects_unconfirmed_third_script_and_respects_budget() -
     result = FusedLanguageDetector().detect(triple, probe)
     assert result.policy is not None
     assert result.policy.languages == pair
+    assert not result.primary_languages
     assert calls.count(triple) == 1
 
     pair, triple, calls, probe = _minority_script_probes("sin")
     result = FusedLanguageDetector(normal_max_probes=4, expanded_max_probes=4).detect(triple, probe)
     assert result.policy is not None
     assert result.policy.languages == pair
+    assert not result.primary_languages
     assert len(calls) == 4
 
 
