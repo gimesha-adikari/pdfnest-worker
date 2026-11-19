@@ -506,6 +506,7 @@ def test_only_general_editor_ocr_v2_extraction_freezes_word_baseline(monkeypatch
     job = SimpleNamespace(status=JobState.queued, owner_identity="owner", payload={})
     monkeypatch.setattr(actors, "get_job", lambda _job_id: job)
     monkeypatch.setattr(actors, "check_cancellation", lambda _job_id: None)
+    monkeypatch.setattr(actors, "claim_job", actors.get_job)
     monkeypatch.setattr(actors, "acquire_lease", lambda *_args: (True, ""))
     monkeypatch.setattr(actors, "release_lease", lambda *_args: None)
     monkeypatch.setattr(actors, "temp_file_path", lambda **_kwargs: str(tmp_path / "source.pdf"))

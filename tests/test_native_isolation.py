@@ -10,7 +10,7 @@ from PIL import Image, ImageDraw
 import pytest
 
 from app.core import native_isolation as boundary, native_operations as operations
-from app.core.ocr_v2.errors import EngineUnavailableError, OCRTimeoutError, RasterAdmissionError
+from app.core.ocr_v2.errors import EngineUnavailableError, NativeCapacityTimeoutError, OCRTimeoutError, RasterAdmissionError
 from app.core.ocr_v2.geometry import raster_policy
 from app.jobs.cancellation import JobCancelledException
 
@@ -164,6 +164,38 @@ def test_protocol_limits_and_no_arbitrary_import(tmp_path, monkeypatch):
         boundary.execute('os.system')
 
 
+def test_large_result_frame_round_trips_without_raising_request_frame_limit(tmp_path):
+    value = {'result': {'text': 'x' * (boundary.MAX_FRAME + 1)}}
+    path = tmp_path / 'result.frame'
+
+    boundary.write_result_frame(path, value)
+
+    assert path.stat().st_size < boundary.MAX_FRAME
+    assert boundary.read_result_frame(path) == value
+
+
+def test_controller_result_validation_accepts_compressed_editor_layout_frames(tmp_path):
+    from app.controller.profiles import validate_frame
+    value = {'result': boundary.encode({'layout': 'x' * (boundary.MAX_FRAME + 1)})}
+    path = tmp_path / 'result.frame'
+    boundary.write_result_frame(path, value)
+
+    assert validate_frame(path.read_bytes()) == value
+
+
+def test_result_frame_enforces_uncompressed_limit_on_write_and_read(tmp_path, monkeypatch):
+    path = tmp_path / 'result.frame'
+    monkeypatch.setattr(boundary, 'MAX_RESULT_FRAME', 512)
+    with pytest.raises(ValueError, match='result frame limit'):
+        boundary.write_result_frame(path, {'result': {'text': 'x' * 1024}})
+    assert not path.exists()
+
+    boundary.write_result_frame(path, {'result': {'text': 'x' * 256}})
+    monkeypatch.setattr(boundary, 'MAX_RESULT_FRAME', 128)
+    with pytest.raises(ValueError, match='result frame limit'):
+        boundary.read_result_frame(path)
+
+
 @pytest.mark.anyio
 async def test_async_cancellation_joins_child_before_cleanup(child_probe, tmp_path):
     task = asyncio.create_task(boundary.execute_async('inspect_pdf', tmp_path, 'hang'))
@@ -228,6 +260,10 @@ def test_capacity_is_shared_across_processes_and_cancellable(tmp_path):
             assert holder.poll() is None
             assert time.monotonic() < deadline
             time.sleep(.02)
+        with pytest.raises(NativeCapacityTimeoutError, match="capacity wait timed out"):
+            with boundary._capacity(lambda: None, .1):
+                pytest.fail('Second process bypassed document capacity')
+
         calls = 0
         def check():
             nonlocal calls
@@ -438,3 +474,10 @@ def test_explicit_exports_match_the_operation_allowlist():
         metadata = {attribute: getattr(wrapper, attribute) for attribute in ('func', 'args')}
         assert metadata['func'] is boundary.execute
         assert metadata['args'] == (name,)
+
+
+def test_native_child_enforces_openmp_limit(child_probe, monkeypatch, tmp_path):
+    monkeypatch.setenv("OMP_THREAD_LIMIT", "8")
+    report = operations.inspect_pdf(tmp_path, "valid")
+    assert report["omp_thread_limit"] == "1"
+    assert os.environ["OMP_THREAD_LIMIT"] == "8"

@@ -157,6 +157,7 @@ def test_store_failure_has_no_memory_fallback_or_secret_error():
     ('POST', '/internal/ocr/v2/jobs', RouteKind.PROCESSING),
     ('POST', '/api/v1/editor/extract', RouteKind.PROCESSING),
     ('POST', '/api/v1/editor/compile', RouteKind.PROCESSING),
+    ('POST', '/api/v1/editor/compile-word-edits', RouteKind.PROCESSING),
     ('POST', '/api/v1/markup/highlight', RouteKind.PROCESSING),
     ('POST', '/api/v1/markup/underline', RouteKind.PROCESSING),
     ('POST', '/api/v1/markup/strikeout', RouteKind.PROCESSING),

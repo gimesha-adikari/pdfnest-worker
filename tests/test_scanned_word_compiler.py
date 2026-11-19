@@ -9,7 +9,10 @@ import pymupdf as fitz
 from PIL import Image, ImageDraw, ImageFont
 import pytest
 
-from app.core.scanned_word_compiler import compile_scanned_word_edits
+from app.core.scanned_word_compiler import (
+    _neighbor_word_records_preserved,
+    compile_scanned_word_edits,
+)
 
 
 PROTOCOL = "platen_word_edits.v1"
@@ -277,6 +280,57 @@ def test_removes_aligned_hidden_ocr_and_rejects_visible_text_conflict(tmp_path):
     result = compile_scanned_word_edits(visible_source, visible_output, envelope, resolved, source_sha)
     assert result == {"status": "REFUSED", "error_code": "VISIBLE_TEXT_LAYER_CONFLICT"}
     assert not visible_output.exists()
+
+
+@pytest.mark.parametrize("hidden_ocr", [False, True])
+@pytest.mark.parametrize("original,replacement,ink_fits", [
+    ("ministry", "Minister", True),
+    ("Ministr", "Minister", True),
+    ("Ministr", "Ministry", False),  # The descender crosses the target bottom.
+])
+def test_scanned_replacement_uses_actual_ink_past_nominal_width_gate(tmp_path, hidden_ocr, original, replacement, ink_fits):
+    source = tmp_path / "source.pdf"
+    output = tmp_path / "candidate.pdf"
+    target = fitz.Rect(135.70, 45.36, 188.25, 57.96)
+    baseline = target.y0 + target.height * 0.80
+    size = target.height * 1.10
+    advance = fitz.get_text_length(replacement, fontname="tibo", fontsize=size)
+    assert target.width * 0.96 < advance < target.width
+    assert advance > fitz.get_text_length(original, fontname="tibo", fontsize=size)
+    with fitz.open() as raster_source:
+        page = raster_source.new_page(width=240, height=100)
+        page.insert_text((target.x0, baseline), original, fontname="tibo", fontsize=size)
+        page.insert_text((193, baseline), "Next", fontname="tibo", fontsize=size)
+        image = page.get_pixmap(dpi=288, alpha=False).tobytes("png")
+    with fitz.open() as document:
+        page = document.new_page(width=240, height=100)
+        page.insert_image(page.rect, stream=image)
+        if hidden_ocr:
+            page.insert_text((target.x0, baseline), original, fontsize=9, render_mode=3)
+            page.insert_text((193, baseline), "Next", fontsize=9, render_mode=3)
+        document.save(source)
+    envelope, resolved, _ = _request(list(target), replacement, expected=original, page_size=(240, 100))
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    resolved[0]["source_sha256"] = digest
+
+    result = compile_scanned_word_edits(source, output, envelope, resolved, digest)
+
+    if not ink_fits:
+        assert result == {"status": "REFUSED", "error_code": "REPLACEMENT_DOES_NOT_FIT"}
+        assert not output.exists()
+        return
+    assert result["status"] == "EDITED", result
+    assert result["outside_changed_pixels_by_dpi"] == {"72": 0, "144": 0, "288": 0}
+    assert result["image_streams_preserved"]
+    with fitz.open(source) as before, fitz.open(output) as after:
+        page = after[0]
+        assert [word[4] for word in page.get_text("words")] == ([replacement, "Next"] if hidden_ocr else [replacement])
+        assert len(page.search_for(replacement)) == 1
+        replacement_span = next(span for span in page.get_texttrace() if span["chars"][0][2][0] < target.x1)
+        assert replacement_span["type"] == 3
+        assert replacement_span["size"] == pytest.approx(size, abs=0.01)
+        assert replacement_span["chars"][0][2] == pytest.approx((target.x0, baseline), abs=0.01)
+        assert _render(before[0]).tobytes() != _render(page).tobytes()
 
 
 def test_searchable_scan_replacement_keeps_unsorted_copy_order_and_removes_stale_word(tmp_path):
@@ -866,3 +920,19 @@ def test_multiple_repeated_word_edits_are_all_or_nothing(tmp_path):
     refusal = compile_scanned_word_edits(stamped_source, refused_output, envelope, stamped_resolved, stamped_sha)
     assert refusal == {"status": "REFUSED", "error_code": "BACKGROUND_COLORED_OVERLAP"}
     assert not refused_output.exists()
+
+
+def test_neighbor_boxes_allow_one_quantization_unit_but_reject_larger_changes():
+    source = [("of", (12.12, 30.0, 22.22, 40.0))]
+
+    one_quantized_unit = [("of", (12.13, 30.0, 22.22, 40.0))]
+    assert _neighbor_word_records_preserved(source, one_quantized_unit)
+
+    larger_shift = [("of", (12.14, 30.0, 22.22, 40.0))]
+    assert not _neighbor_word_records_preserved(source, larger_shift)
+
+    changed_text = [("off", (12.12, 30.0, 22.22, 40.0))]
+    assert not _neighbor_word_records_preserved(source, changed_text)
+
+    missing_neighbor: list[tuple[str, tuple[float, float, float, float]]] = []
+    assert not _neighbor_word_records_preserved(source, missing_neighbor)

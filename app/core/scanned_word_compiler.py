@@ -42,6 +42,8 @@ _SCRIPT_FONTS = {
     },
 }
 _VALIDATION_DPIS = (72, 144, 288)
+# Word boxes are quantized to hundredths of a point by _word_records.
+_NEIGHBOR_BBOX_TOLERANCE_POINTS = 0.01
 _NATIVE_FONT_ALIASES = {
     "Helvetica": "helv",
     "Helvetica-Bold": "hebo",
@@ -412,10 +414,19 @@ def _prepare_scan_target(
             semantic_fontname = script_font["fontname"]
         else:
             measured_width = fitz.get_text_length(replacement, fontname="tibo", fontsize=font_size)
+<<<<<<< codex/preserve-main-before-github-sync-mrc4xb4k
             if measured_width > target_rect.width * 0.96:
                 return None, "REPLACEMENT_DOES_NOT_FIT"
             try:
                 patch = _render_replacement_patch(
+=======
+            # Keep the semantic advance within the selected word. In the last
+            # four percent, require the actual raster ink to fit there too.
+            if measured_width > target_rect.width:
+                return None, "REPLACEMENT_DOES_NOT_FIT"
+            try:
+                replacement_patch = _render_replacement_patch(
+>>>>>>> main
                     patch,
                     allowed_px,
                     context_origin_x,
@@ -425,9 +436,13 @@ def _prepare_scan_target(
                     replacement,
                     font_size,
                     ink_color,
+                    ink_fit_rect=allowed_rect if measured_width > target_rect.width * 0.96 else None,
                 )
             except Exception:
                 return None, "REPLACEMENT_RENDER_UNSUPPORTED"
+            if replacement_patch is None:
+                return None, "REPLACEMENT_DOES_NOT_FIT"
+            patch = replacement_patch
     insertion_slot = source_word_index
     if insertion_slot is None:
         insertion_slot, order_error = _scan_insertion_slot(page, target_rect)
@@ -845,6 +860,7 @@ def _render_replacement_patch(
     replacement: str,
     font_size: float,
     color: tuple[float, float, float],
+<<<<<<< codex/preserve-main-before-github-sync-mrc4xb4k
 ) -> Image.Image:
     scale = _PATCH_DPI / 72.0
     patch_origin_x = (context_origin_x + allowed_px[0]) / scale
@@ -854,6 +870,25 @@ def _render_replacement_patch(
         page = overlay_doc.new_page(width=patch.width / scale, height=patch.height / scale)
         page.insert_text(
             fitz.Point(target_rect.x0 - patch_origin_x, baseline - patch_origin_y),
+=======
+    *,
+    ink_fit_rect: fitz.Rect | None = None,
+) -> Image.Image | None:
+    scale = _PATCH_DPI / 72.0
+    patch_origin_x = (context_origin_x + allowed_px[0]) / scale
+    patch_origin_y = (context_origin_y + allowed_px[1]) / scale
+    # Render with padding when checking the ink, so the patch edge cannot
+    # hide overflow. The measured pixels are mapped through the exact PDF
+    # image placement, which may differ from the rounded source raster clip.
+    padding = math.ceil(font_size * scale) if ink_fit_rect is not None else 0
+    overlay_doc = fitz.open()
+    try:
+        page = overlay_doc.new_page(width=(patch.width + 2 * padding) / scale,
+                                    height=(patch.height + 2 * padding) / scale)
+        page.insert_text(
+            fitz.Point(target_rect.x0 - patch_origin_x + padding / scale,
+                       baseline - patch_origin_y + padding / scale),
+>>>>>>> main
             replacement,
             fontname="tibo",
             fontsize=font_size,
@@ -862,6 +897,23 @@ def _render_replacement_patch(
         )
         pixmap = page.get_pixmap(matrix=fitz.Matrix(scale, scale), colorspace=fitz.csRGB, alpha=True)
         overlay = Image.frombytes("RGBA", (pixmap.width, pixmap.height), pixmap.samples)
+<<<<<<< codex/preserve-main-before-github-sync-mrc4xb4k
+=======
+        if ink_fit_rect is not None:
+            bounds = overlay.getchannel("A").getbbox()
+            if bounds is None:
+                return None
+            x0, y0, x1, y1 = bounds
+            dx = ink_fit_rect.width / patch.width
+            dy = ink_fit_rect.height / patch.height
+            positioned_ink = fitz.Rect(
+                ink_fit_rect.x0 + (x0 - padding) * dx, ink_fit_rect.y0 + (y0 - padding) * dy,
+                ink_fit_rect.x0 + (x1 - padding) * dx, ink_fit_rect.y0 + (y1 - padding) * dy,
+            )
+            if not target_rect.contains(positioned_ink):
+                return None
+            overlay = overlay.crop((padding, padding, padding + patch.width, padding + patch.height))
+>>>>>>> main
         if overlay.size != patch.size:
             aligned = Image.new("RGBA", patch.size, (0, 0, 0, 0))
             aligned.alpha_composite(overlay.crop((0, 0, min(overlay.width, patch.width), min(overlay.height, patch.height))))
@@ -1317,6 +1369,36 @@ def _pixel_counts(before: Image.Image, after: Image.Image, allowed: list[fitz.Re
     return changed.histogram()[255], outside.histogram()[255]
 
 
+def _neighbor_word_records_preserved(
+    source_records: list[tuple[str, tuple[float, float, float, float]]],
+    candidate_records: list[tuple[str, tuple[float, float, float, float]]],
+) -> bool:
+    """Compare neighbor text exactly and tolerate one bbox quantization unit."""
+    source_counts = Counter(text for text, _ in source_records)
+    candidate_counts = Counter(text for text, _ in candidate_records)
+    if source_counts != candidate_counts:
+        return False
+
+    source_by_text: dict[str, list[tuple[float, float, float, float]]] = {}
+    candidate_by_text: dict[str, list[tuple[float, float, float, float]]] = {}
+    for text, bbox in source_records:
+        source_by_text.setdefault(text, []).append(bbox)
+    for text, bbox in candidate_records:
+        candidate_by_text.setdefault(text, []).append(bbox)
+
+    for text in source_counts:
+        source_boxes = sorted(source_by_text[text], key=lambda box: (box[1], box[0], box[3], box[2]))
+        candidate_boxes = sorted(candidate_by_text[text], key=lambda box: (box[1], box[0], box[3], box[2]))
+        for source_box, candidate_box in zip(source_boxes, candidate_boxes):
+            if any(
+                abs(source_box[index] - candidate_box[index])
+                > _NEIGHBOR_BBOX_TOLERANCE_POINTS + 1e-9
+                for index in range(4)
+            ):
+                return False
+    return True
+
+
 def _validate_candidate(source_path: Path, candidate_path: Path, plans: list[dict[str, Any]], page_count: int,
                         geometry: list[dict[str, Any]], original_words: list[list[tuple[str, tuple[float, float, float, float]]]],
                         image_hashes: set[str], cancellation_check: Callable[[], None] | None) -> dict[str, Any]:
@@ -1401,20 +1483,54 @@ def _validate_candidate(source_path: Path, candidate_path: Path, plans: list[dic
             )
 
         neighbors_preserved = True
+        neighbor_source_word_count = 0
+        neighbor_candidate_word_count = 0
+        neighbor_text_count_mismatch = 0
+        neighbor_bbox_mismatch_count = 0
+        neighbor_max_bbox_delta = 0.0
         for page_index in range(page_count):
             if cancellation_check:
                 cancellation_check()
             allowed = [plan["allowed_rect"] for plan in plans if plan["page_index"] == page_index]
-            source_neighbors = Counter(
+            source_neighbors = [
                 record for record in original_words[page_index]
                 if not any(fitz.Rect(record[1]).intersects(rect) for rect in allowed)
-            )
-            candidate_neighbors = Counter(
+            ]
+            candidate_neighbors = [
                 record for record in _word_records(candidate[page_index])
                 if not any(fitz.Rect(record[1]).intersects(rect) for rect in allowed)
+            ]
+            neighbor_source_word_count += len(source_neighbors)
+            neighbor_candidate_word_count += len(candidate_neighbors)
+            source_text_counts = Counter(record[0] for record in source_neighbors)
+            candidate_text_counts = Counter(record[0] for record in candidate_neighbors)
+            neighbor_text_count_mismatch += sum(
+                abs(source_text_counts.get(text, 0) - candidate_text_counts.get(text, 0))
+                for text in source_text_counts.keys() | candidate_text_counts.keys()
             )
-            neighbors_preserved &= source_neighbors == candidate_neighbors
+            source_boxes: dict[str, list[tuple[float, float, float, float]]] = {}
+            candidate_boxes: dict[str, list[tuple[float, float, float, float]]] = {}
+            for text, bbox in source_neighbors:
+                source_boxes.setdefault(text, []).append(bbox)
+            for text, bbox in candidate_neighbors:
+                candidate_boxes.setdefault(text, []).append(bbox)
+            for text in source_boxes.keys() & candidate_boxes.keys():
+                source_text_boxes = sorted(source_boxes[text], key=lambda box: (box[1], box[0], box[3], box[2]))
+                candidate_text_boxes = sorted(candidate_boxes[text], key=lambda box: (box[1], box[0], box[3], box[2]))
+                for source_box, candidate_box in zip(source_text_boxes, candidate_text_boxes):
+                    deltas = [abs(source_box[index] - candidate_box[index]) for index in range(4)]
+                    if source_box != candidate_box:
+                        neighbor_bbox_mismatch_count += 1
+                    neighbor_max_bbox_delta = max(neighbor_max_bbox_delta, *deltas)
+            neighbors_preserved &= _neighbor_word_records_preserved(source_neighbors, candidate_neighbors)
         checks["neighbors_preserved"] = neighbors_preserved
+        checks["neighbor_diagnostics"] = {
+            "source_word_count": neighbor_source_word_count,
+            "candidate_word_count": neighbor_candidate_word_count,
+            "text_count_mismatch": neighbor_text_count_mismatch,
+            "bbox_mismatch_count": neighbor_bbox_mismatch_count,
+            "max_bbox_delta_points": round(neighbor_max_bbox_delta, 4),
+        }
         checks["outside_pixels_clear"] = all(value == 0 for value in outside_by_dpi.values())
         checks["target_content_valid"] = target_content_valid
         checks["valid"] = all((checks["page_count"], checks["geometry"], checks["image_streams_preserved"],

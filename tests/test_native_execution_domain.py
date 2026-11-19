@@ -230,7 +230,7 @@ def file_result(controller):
         request = boundary.read_frame(root / 'request.json')
         args = boundary.decode(request['args'])
         Path(args[1]).write_bytes(b'SYNTHETIC OUTPUT')
-        boundary.write_frame(root / 'result.json', {'result': boundary.encode({'done': True})})
+        boundary.write_result_frame(root / 'result.json', {'result': boundary.encode({'done': True})})
         return subprocess.CompletedProcess(launch.command, 0, '', '')
     controller.run = fake_run
     return controller

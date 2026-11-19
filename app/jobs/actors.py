@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
+import hashlib
+import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,7 +23,7 @@ from app.core.native_operations import convert_pdf_to_markdown
 from app.core.broker import broker  # noqa: F401
 from app.core.config import validate_runtime_config
 from app.core.ocr_v2.diagnostics import emit_searchable_diagnostic, retain_failed_render_artifacts, safe_exception_message
-from app.core.ocr_v2.errors import EngineUnavailableError, OCRTimeoutError, RenderingNotEligibleError
+from app.core.ocr_v2.errors import EngineUnavailableError, NativeCapacityTimeoutError, OCRTimeoutError, RenderingNotEligibleError
 from app.core.ocr_v2.errors import MarkupError, TextNotFoundError, WordGeometryUnavailableError, AnnotationWriteError
 from app.core.ocr_text_engine import (
     OCRTextEngineConfigurationError,
@@ -46,6 +48,7 @@ from app.core.ocr_markup_engine import (
 from app.core.editor_ocr_engine import (
     EDITOR_OCR_CONSUMER_GENERAL_EDITOR,
     EditorOcrEngineConfigurationError,
+    configured_editor_ocr_engine,
 )
 from app.core.studio_editor_extraction_engine import (
     STUDIO_EDITOR_EXTRACTION_CONSUMER,
@@ -71,6 +74,8 @@ from app.jobs.limiter import acquire_lease, release_lease
 from app.jobs.models import JobState
 from app.jobs.store import claim_job, get_job, update_job
 
+from app.core.candidate_validation_diagnostics import summarize_candidate_validation_failure
+
 from app.core.native_operations import (
     execute_ocr_text,
     execute_searchable_pdf,
@@ -82,6 +87,19 @@ from app.core.native_operations import (
     execute_studio_markup_region_ocr,
     execute_legacy_editor_ocr,
     execute_legacy_markup,
+    validate_word_edit_transport,
+    compile_scanned_word_edits,
+    inspect_candidate_selection,
+)
+
+from app.core.word_edits import (
+    WORD_EDIT_PROTOCOL,
+    WordEditProtocolError,
+    build_word_edit_baseline,
+    editor_engine_fingerprint,
+    native_transport_digest,
+    resolve_word_edit_targets,
+    validate_word_edit_request,
 )
 
 logger = logging.getLogger(__name__)
@@ -123,6 +141,14 @@ def _cleanup_input_objects(keys: list[str]) -> None:
             delete_object(key)
         except Exception:
             logger.warning("OCR V2 input cleanup failed for key %s", key, exc_info=True)
+
+
+def _sha256_file(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _record_raster_failure(job_id: str, exc: Exception) -> None:
@@ -789,28 +815,43 @@ def editor_extract_job(
         update_job(job_id, status=JobState.cancelled, finished_at=datetime.now(timezone.utc), message="Job cancelled")
         return
 
-    owner_identity = (job.payload or {}).get("ownerIdentity") or "guest:anonymous"
-    acquired, reason = acquire_lease(job_id, owner_identity)
-    if not acquired:
-        logger.warning("Execution capacity full (%s) for job %s. Retrying...", reason, job_id)
-        raise Retry(message=f"Execution capacity full: {reason}", delay=5000)
-
-    input_suffix = Path(source_name or source_key).suffix or ".pdf"
-    input_path = temp_file_path(prefix="pdfnest-source-", suffix=input_suffix)
-
-    update_job(
-        job_id,
-        status=JobState.running,
-        started_at=datetime.now(timezone.utc),
-        progress=0,
-        message="Editor extraction started",
-    )
-
+    owner_identity = job.owner_identity or (job.payload or {}).get("ownerIdentity") or "guest:anonymous"
+    acquired = False
+    input_path = None
+    stage = "admission"
+    started = time.monotonic()
+    pages_completed = 0
     try:
+        if claim_job(job_id) is None:
+            # A cancellation can arrive between the initial check and claim.
+            check_cancellation(job_id)
+            return
+        check_cancellation(job_id)
+        acquired, reason = acquire_lease(job_id, owner_identity)
+        if not acquired:
+            storage_unavailable = reason == "REDIS_ERROR"
+            update_job(
+                job_id,
+                status=JobState.failed,
+                finished_at=datetime.now(timezone.utc),
+                error="Editor job storage is temporarily unavailable. Please retry."
+                if storage_unavailable else "Editor extraction capacity is busy. Please retry shortly.",
+                error_code="TASK_STORAGE_UNAVAILABLE" if storage_unavailable else "EDITOR_OCR_BUSY",
+                message="Editor extraction could not start",
+            )
+            return
+
+        input_suffix = Path(source_name or source_key).suffix or ".pdf"
+        input_path = temp_file_path(prefix="pdfnest-source-", suffix=input_suffix)
+        update_job(job_id, progress=0, message="Editor extraction started")
+        stage = "source_download"
         check_cancellation(job_id)
         download_to_path(source_key, input_path)
+        source_sha256 = _sha256_file(input_path)
         check_cancellation(job_id)
         def report_editor_page(done: int, total: int, _page: object) -> None:
+            nonlocal pages_completed
+            pages_completed = done
             if not ocr_v2:
                 return
             progress = min(90, 20 + int((done / max(1, total)) * 70))
@@ -840,14 +881,42 @@ def editor_extract_job(
             extractor_kwargs["page_progress_callback"] = report_editor_page
             extractor_kwargs["language_mode"] = language_mode
             extractor_kwargs["languages"] = languages or ["eng"]
+        stage = "layout_extraction"
         result = extractor(input_path, password, **extractor_kwargs)
         check_cancellation(job_id)
         if ocr_v2:
             from app.core.native_operations import editor_colors
-            result = editor_colors(
-                result, input_path, password,
-                visible_geometry=consumer != EDITOR_OCR_CONSUMER_GENERAL_EDITOR,
-                cancellation_check=lambda: check_cancellation(job_id),
+            from app.core.editor_ocr_projection import (
+                merge_native_editor_colors,
+                native_editor_color_probe,
+            )
+            color_probe = native_editor_color_probe(result)
+            if color_probe["pages"]:
+                stage = "native_color_sampling"
+                color_result = editor_colors(
+                    color_probe, input_path, password,
+                    visible_geometry=consumer != EDITOR_OCR_CONSUMER_GENERAL_EDITOR,
+                    cancellation_check=lambda: check_cancellation(job_id),
+                )
+                result = merge_native_editor_colors(result, color_result)
+            if _sha256_file(input_path) != source_sha256:
+                raise ValueError("source changed during extraction")
+
+        if (
+            ocr_v2
+            and consumer == EDITOR_OCR_CONSUMER_GENERAL_EDITOR
+            and type(result) is dict
+            and result.get("schema_version") == "ocr_v2_editor_layout.v1"
+            and type(result.get("pages")) is list
+        ):
+            language_mode = str(result.get("language_mode") or language_mode or "EXPLICIT")
+            selected_languages = result.get("languages") or languages or ["eng"]
+            engine_fingerprint = editor_engine_fingerprint(
+                configured_editor_ocr_engine(), language_mode, list(selected_languages)
+            )
+            result["word_edit_protocols"] = [WORD_EDIT_PROTOCOL]
+            result["word_edit_baseline"] = build_word_edit_baseline(
+                job_id, source_sha256, engine_fingerprint, result
             )
 
         # The extract layout is public editor data. Storage keys remain inside
@@ -899,6 +968,26 @@ def editor_extract_job(
             message="Editor OCR engine configuration is invalid",
         )
         return
+    except OCRTimeoutError as exc:
+        busy = isinstance(exc, NativeCapacityTimeoutError)
+        error = "Editor extraction capacity is busy. Please retry shortly."
+        if not busy:
+            error = "Editor extraction reached its processing time limit. Try a smaller page range or split the PDF."
+            if ocr_v2 and language_mode == "AUTO":
+                error = "Editor extraction reached its processing time limit. Choose the OCR languages explicitly or split the PDF."
+        logger.warning(
+            "Editor native extraction deadline job=%s stage=%s busy=%s completed_pages=%d elapsed_seconds=%.2f",
+            job_id, stage, busy, pages_completed, time.monotonic() - started,
+        )
+        update_job(
+            job_id,
+            status=JobState.failed,
+            finished_at=datetime.now(timezone.utc),
+            error=error,
+            error_code="EDITOR_OCR_BUSY" if busy else "EDITOR_OCR_TIMEOUT",
+            message="Editor extraction could not start" if busy else "Editor extraction timed out",
+        )
+        return
     except Exception as exc:
         update_job(
             job_id,
@@ -913,8 +1002,10 @@ def editor_extract_job(
             return
         raise
     finally:
-        release_lease(job_id, owner_identity)
-        cleanup_paths(input_path)
+        if acquired:
+            release_lease(job_id, owner_identity)
+        if input_path is not None:
+            cleanup_paths(input_path)
 
 
 @dramatiq.actor(queue_name="editor", max_retries=3, time_limit=600_000)
@@ -1009,6 +1100,201 @@ def editor_compile_job(
     finally:
         release_lease(job_id, owner_identity)
         cleanup_paths(input_path, pages_json_path, output_pdf_path)
+
+
+@dramatiq.actor(queue_name="editor", max_retries=0, time_limit=600_000)
+def editor_word_edit_compile_job(job_id: str, envelope: dict[str, Any]) -> None:
+    """Validate frozen intent, compile supported scans, and publish a verified PDF."""
+    job = get_job(job_id)
+    if job is None:
+        return
+
+    payload = job.payload or {}
+    owner_identity = job.owner_identity or payload.get("ownerIdentity") or "guest:anonymous"
+    acquired, reason = acquire_lease(job_id, owner_identity)
+    if not acquired:
+        logger.warning("Execution capacity full (%s) for word edit job %s. Retrying...", reason, job_id)
+        raise Retry(message=f"Execution capacity full: {reason}", delay=5000)
+
+    source_path = temp_file_path(prefix="pdfnest-word-source-", suffix=".pdf")
+    output_pdf_path = temp_file_path(prefix="pdfnest-word-output-", suffix=".pdf")
+    update_job(
+        job_id,
+        status=JobState.running,
+        started_at=datetime.now(timezone.utc),
+        progress=0,
+        message="Word edit request validation started",
+    )
+    try:
+        check_cancellation(job_id)
+        extraction_id = envelope.get("extraction_job_id") if type(envelope) is dict else None
+        extraction = get_job(extraction_id) if type(extraction_id) is str else None
+        validated = validate_word_edit_request(envelope, extraction)
+        source_key = validated["source_tracker"]
+        download_to_path(source_key, source_path)
+        check_cancellation(job_id)
+
+        extraction_result = extraction.result or {}
+        expected_source_sha = extraction_result["word_edit_baseline"]["source_sha256"]
+        if _sha256_file(source_path) != expected_source_sha:
+            raise WordEditProtocolError("source bytes no longer match the extraction baseline")
+        resolved_targets = resolve_word_edit_targets(validated, extraction_result)
+
+        update_job(job_id, progress=50, message="Word edit request validated against frozen extraction")
+        expected_transport_digest = native_transport_digest(validated)
+        receipt = validate_word_edit_transport(input_path=str(source_path), envelope=validated)
+        if (
+            type(receipt) is not dict
+            or receipt.get("protocol") != WORD_EDIT_PROTOCOL
+            or receipt.get("extraction_job_id") != validated["extraction_job_id"]
+            or receipt.get("baseline_digest") != validated["baseline_digest"]
+            or receipt.get("operation_count") != len(validated["edits"])
+            or receipt.get("transport_digest") != expected_transport_digest
+            or receipt.get("source_sha256") != expected_source_sha
+        ):
+            raise WordEditProtocolError("isolated word edit transport receipt did not match the validated request")
+
+        update_job(job_id, progress=60, message="Compiling localized scanned-word corrections")
+        # temp_file_path creates an empty file; the isolated compiler requires
+        # a fresh destination so it can atomically publish a verified PDF.
+        cleanup_paths(output_pdf_path)
+        compiled = compile_scanned_word_edits(
+            str(source_path),
+            str(output_pdf_path),
+            validated,
+            resolved_targets,
+            expected_source_sha,
+            cancellation_check=lambda: check_cancellation(job_id),
+        )
+        check_cancellation(job_id)
+        if type(compiled) is not dict or compiled.get("status") != "EDITED":
+            cleanup_paths(output_pdf_path)
+            diagnostic = summarize_candidate_validation_failure(job_id, compiled)
+            if diagnostic is not None:
+                logger.warning(
+                    "word_edit_candidate_validation_failed %s",
+                    json.dumps(diagnostic, sort_keys=True, separators=(",", ":")),
+                )
+            error_code = compiled.get("error_code") if type(compiled) is dict else None
+            if type(error_code) is not str or not error_code:
+                error_code = "WORD_EDIT_CANDIDATE_INVALID"
+            update_job(
+                job_id,
+                status=JobState.failed,
+                finished_at=datetime.now(timezone.utc),
+                progress=100,
+                result={
+                    "transport_receipt": receipt,
+                    "validated_operation_count": len(validated["edits"]),
+                },
+                error="The selected-word edit could not be applied safely to this PDF. No downloadable PDF was produced.",
+                error_code=error_code,
+                message="The scanned-word edit was refused by the compiler",
+            )
+            return
+
+        if not Path(output_pdf_path).is_file() or _sha256_file(output_pdf_path) != compiled.get("artifact_sha256"):
+            cleanup_paths(output_pdf_path)
+            update_job(
+                job_id,
+                status=JobState.failed,
+                finished_at=datetime.now(timezone.utc),
+                result={"transport_receipt": receipt},
+                error="The compiled candidate did not pass artifact identity checks.",
+                error_code="WORD_EDIT_CANDIDATE_INVALID",
+                message="Compiled artifact validation failed",
+            )
+            return
+        with fitz.open(output_pdf_path) as candidate:
+            if len(candidate) != len(extraction_result.get("pages", [])):
+                cleanup_paths(output_pdf_path)
+                update_job(
+                    job_id,
+                    status=JobState.failed,
+                    finished_at=datetime.now(timezone.utc),
+                    result={"transport_receipt": receipt},
+                    error="The compiled candidate page count did not match the validated source.",
+                    error_code="WORD_EDIT_CANDIDATE_INVALID",
+                    message="Compiled artifact validation failed",
+                )
+                return
+
+        candidate_selection = None
+        if os.getenv("ENABLE_CANDIDATE_WORD_SELECTION", "").strip().lower() == "true":
+            try:
+                candidate_selection = inspect_candidate_selection(
+                    input_path=str(output_pdf_path), artifact_sha256=compiled["artifact_sha256"],
+                    cancellation_check=lambda: check_cancellation(job_id),
+                )
+                if (
+                    type(candidate_selection) is not dict
+                    or candidate_selection.get("version") != "platen_candidate_words.v1"
+                    or candidate_selection.get("artifact_sha256") != compiled["artifact_sha256"]
+                ):
+                    candidate_selection = None
+            except JobCancelledException:
+                raise
+            except Exception:
+                # Selection is optional; an unqualified text layer must not
+                # replace or invalidate the independently verified PDF image.
+                logger.warning("Candidate text selection unavailable; image-only preview retained")
+        check_cancellation(job_id)
+        if _sha256_file(output_pdf_path) != compiled["artifact_sha256"]:
+            cleanup_paths(output_pdf_path)
+            raise WordEditProtocolError("candidate changed during read-only inspection")
+        output_key = build_key("jobs/editor/word-edit/output", suffix=".pdf")
+        upload_path(output_pdf_path, output_key, content_type="application/pdf")
+        source_name = (extraction.payload or {}).get("source_name") or "document.pdf"
+        download_name = f"edited_{Path(source_name).stem}.pdf"
+        update_job(
+            job_id,
+            status=JobState.succeeded,
+            finished_at=datetime.now(timezone.utc),
+            progress=100,
+            total_pages=compiled["page_count"],
+            completed_pages=compiled["page_count"],
+            result={
+                "transport_receipt": receipt,
+                "validated_operation_count": len(validated["edits"]),
+                "artifact_key": output_key,
+                "artifact_name": download_name,
+                "artifact_sha256": compiled["artifact_sha256"],
+                "page_count": compiled["page_count"],
+                "compiler_protocol": compiled["protocol"],
+                "source_sha256": expected_source_sha,
+                "baseline_digest": validated["baseline_digest"],
+                "target_results": compiled["target_results"],
+                "candidate_selection": candidate_selection,
+                "outside_changed_pixels_144dpi": compiled["outside_changed_pixels_144dpi"],
+                "outside_changed_pixels_by_dpi": compiled["outside_changed_pixels_by_dpi"],
+            },
+            message="Scanned-word edit compilation completed",
+        )
+    except JobCancelledException:
+        update_job(job_id, status=JobState.cancelled, finished_at=datetime.now(timezone.utc), message="Word edit request cancelled")
+    except WordEditProtocolError as exc:
+        logger.warning("Rejected word edit request for job %s: %s", job_id, exc)
+        update_job(
+            job_id,
+            status=JobState.failed,
+            finished_at=datetime.now(timezone.utc),
+            error="The word edit request did not match its trusted extraction baseline.",
+            error_code="WORD_EDIT_BASELINE_MISMATCH",
+            message="Word edit baseline validation failed",
+        )
+    except Exception:
+        logger.exception("Word edit transport failed for job %s", job_id)
+        update_job(
+            job_id,
+            status=JobState.failed,
+            finished_at=datetime.now(timezone.utc),
+            error="The word edit request could not cross the isolated worker boundary.",
+            error_code="WORD_EDIT_TRANSPORT_FAILED",
+            message="Word edit transport failed",
+        )
+    finally:
+        release_lease(job_id, owner_identity)
+        cleanup_paths(source_path, output_pdf_path)
 
 
 def _markup_public_error(exc: Exception) -> tuple[str, str]:

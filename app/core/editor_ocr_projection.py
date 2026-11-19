@@ -48,6 +48,67 @@ def preserve_native_editor_colors(layout: dict[str, Any], source_path: str, pass
                     element["text_color"] = f"#{max(colors, key=colors.get):06x}"
 
 
+def native_editor_color_probe(layout: dict[str, Any]) -> dict[str, Any]:
+    """Project only page/line geometry needed for isolated native color lookup."""
+    pages = []
+    for page in layout.get("pages", []):
+        if page.get("source") != "NATIVE_EXTRACTION" or not page.get("elements"):
+            continue
+        pages.append({
+            "page_num": page["page_num"],
+            "source": page["source"],
+            "elements": [
+                {key: element[key] for key in ("id", "x", "y", "width", "height")}
+                for element in page["elements"]
+            ],
+        })
+    return {"pages": pages}
+
+
+def merge_native_editor_colors(layout: dict[str, Any], color_result: dict[str, Any]) -> dict[str, Any]:
+    """Apply only returned colors to the matching original native lines."""
+    allowed: set[tuple[int, str]] = set()
+    expected_pages: set[int] = set()
+    for page in native_editor_color_probe(layout)["pages"]:
+        page_num = page["page_num"]
+        if type(page_num) is not int or page_num in expected_pages:
+            raise ValueError("Invalid native editor color probe page identity")
+        expected_pages.add(page_num)
+        for element in page["elements"]:
+            key = (page_num, element["id"])
+            if key in allowed:
+                raise ValueError("Ambiguous native editor color probe element identity")
+            allowed.add(key)
+
+    returned: set[tuple[int, str]] = set()
+    colors: dict[tuple[int, str], str] = {}
+    for page in color_result.get("pages", []):
+        page_num = page.get("page_num")
+        if type(page_num) is not int or page_num not in expected_pages:
+            raise ValueError("Native editor color result page identity mismatch")
+        for element in page.get("elements", []):
+            key = (page_num, element.get("id"))
+            if key not in allowed or key in returned:
+                raise ValueError("Native editor color result element identity mismatch")
+            returned.add(key)
+            color = element.get("text_color")
+            if color is None:
+                continue
+            if (type(color) is not str or len(color) != 7 or color[0] != "#"
+                    or any(char not in "0123456789abcdefABCDEF" for char in color[1:])):
+                raise ValueError("Invalid native editor color result")
+            colors[key] = color
+
+    for page in layout.get("pages", []):
+        if page.get("source") != "NATIVE_EXTRACTION":
+            continue
+        for element in page.get("elements", []):
+            key = (page["page_num"], element["id"])
+            if key in colors:
+                element["text_color"] = colors[key]
+    return layout
+
+
 def _value(value: object) -> object:
     return getattr(value, "value", value)
 
@@ -138,6 +199,7 @@ def project_editor_result(result: Any) -> dict[str, Any]:
                 "page_num": page.page_index + 1,
                 "width": page.geometry.width,
                 "height": page.geometry.height,
+                "rotation": int(getattr(page.geometry, "rotation", 0) or 0),
                 "elements": elements,
                 "kind": editor_page_kind(classification),
                 "is_ocr": processing_source == "OCR_RECOGNITION",

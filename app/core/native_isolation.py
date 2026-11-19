@@ -16,12 +16,18 @@ import subprocess
 import sys
 import tempfile
 import time
+import zlib
 from contextlib import contextmanager
 
 from app.core.subprocess_runner import run_hardened_subprocess
 
 # Mandatory ceilings; configuration can only tighten them.
 MAX_FRAME = 16 * 1024 * 1024
+# Large editor layouts can exceed the request/event frame without exceeding
+# the native child's 1 GiB memory ceiling. Results use a compressed frame with
+# a strict expanded-JSON budget; requests and callback frames remain unchanged.
+MAX_RESULT_FRAME = 32 * 1024 * 1024
+RESULT_FRAME_MAGIC = b'P5RF1:'
 MAX_EVENTS = 1000
 CHILD_MEMORY = 1024 * 1024 * 1024
 CHILD_CPU = 180
@@ -128,6 +134,54 @@ def read_frame(path: Path):
     return json.loads(data)
 
 
+def write_result_frame(path: Path, value):
+    """Write a compressed result, bounded both before and after compression."""
+    staging = path.with_suffix('.writing')
+    compressor = zlib.compressobj(level=3)
+    expanded = 0
+    stored = len(RESULT_FRAME_MAGIC)
+    try:
+        with staging.open('wb') as output:
+            output.write(RESULT_FRAME_MAGIC)
+            encoder = json.JSONEncoder(allow_nan=False, ensure_ascii=True)
+            for chunk in encoder.iterencode(value):
+                data = chunk.encode('ascii')
+                expanded += len(data)
+                if expanded > MAX_RESULT_FRAME:
+                    raise ValueError('Native IPC result frame limit exceeded')
+                packed = compressor.compress(data)
+                stored += len(packed)
+                if stored > MAX_FRAME:
+                    raise ValueError('Native IPC result frame limit exceeded')
+                output.write(packed)
+            packed = compressor.flush()
+            stored += len(packed)
+            if stored > MAX_FRAME:
+                raise ValueError('Native IPC result frame limit exceeded')
+            output.write(packed)
+        os.replace(staging, path)
+    except BaseException:
+        staging.unlink(missing_ok=True)
+        raise
+
+
+def read_result_frame(path: Path):
+    """Read one compressed result while bounding disk and expanded JSON size."""
+    with path.open('rb') as source:
+        data = source.read(MAX_FRAME + 1)
+    if len(data) > MAX_FRAME or not data.startswith(RESULT_FRAME_MAGIC):
+        raise ValueError('Invalid native IPC result frame')
+    decompressor = zlib.decompressobj()
+    try:
+        expanded = decompressor.decompress(data[len(RESULT_FRAME_MAGIC):], MAX_RESULT_FRAME + 1)
+    except zlib.error as exc:
+        raise ValueError('Invalid native IPC result frame') from exc
+    if (len(expanded) > MAX_RESULT_FRAME or decompressor.unconsumed_tail
+            or decompressor.unused_data or not decompressor.eof):
+        raise ValueError('Native IPC result frame limit exceeded')
+    return json.loads(expanded)
+
+
 def error_frame(exc):
     from fastapi import HTTPException
     if isinstance(exc, HTTPException):
@@ -182,8 +236,8 @@ def _capacity(check, timeout):
                     break
             if descriptor is None:
                 if time.monotonic() >= deadline:
-                    from app.core.ocr_v2.errors import OCRTimeoutError
-                    raise OCRTimeoutError('Native processing capacity wait timed out')
+                    from app.core.ocr_v2.errors import NativeCapacityTimeoutError
+                    raise NativeCapacityTimeoutError('Native processing capacity wait timed out')
                 time.sleep(.05)
         yield
     finally:
@@ -194,7 +248,7 @@ def _capacity(check, timeout):
 def execute(operation, *args, **kwargs):
     from app.core.native_operations import OPERATIONS
     from app.core.ocr_v2.geometry import _raster_context
-    from app.core.ocr_v2.errors import EngineUnavailableError, OCRTimeoutError
+    from app.core.ocr_v2.errors import EngineUnavailableError, NativeCapacityTimeoutError, OCRTimeoutError
     if operation not in OPERATIONS:
         raise ValueError('Unsupported isolated native operation')
     options = dict(kwargs)
@@ -270,7 +324,7 @@ def execute(operation, *args, **kwargs):
                 domain.drain()
                 if completed.returncode != 0 or not (root / 'result.json').is_file():
                     raise EngineUnavailableError('Isolated native processing failed or exceeded resource limits')
-                frame = read_frame(root / 'result.json')
+                frame = read_result_frame(root / 'result.json')
                 if 'error' in frame:
                     raise_error(frame['error'])
                 result = decode(frame['result'])
@@ -304,7 +358,7 @@ def execute(operation, *args, **kwargs):
             os.replace(pending, output)
         return result
     except DomainBusy as exc:
-        raise OCRTimeoutError('Native processing capacity wait timed out') from exc
+        raise NativeCapacityTimeoutError('Native processing capacity wait timed out') from exc
     except DomainUnavailable as exc:
         raise EngineUnavailableError('Native execution domain is unavailable') from exc
     finally:

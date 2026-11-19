@@ -165,6 +165,7 @@ def test_editor_projection_is_engine_neutral() -> None:
 
     assert projected["schema_version"] == "ocr_v2_editor_layout.v1"
     assert projected["pages"][0]["kind"] == "scanned"
+    assert projected["pages"][0]["rotation"] == 0
     assert projected["pages"][0]["is_ocr"] is True
     assert projected["pages"][0]["elements"][0]["word_geometry"][0]["id"] == "w1"
 
@@ -180,6 +181,7 @@ def _patch_editor_actor_io(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, upda
         ),
     )
     monkeypatch.setattr(actors, "check_cancellation", lambda _job_id: None)
+    monkeypatch.setattr(actors, "claim_job", actors.get_job)
     monkeypatch.setattr(actors, "acquire_lease", lambda _job_id, _owner: (True, ""))
     monkeypatch.setattr(actors, "release_lease", lambda _job_id, _owner: None)
     monkeypatch.setattr(actors, "temp_file_path", lambda **_kwargs: str(tmp_path / "input.pdf"))

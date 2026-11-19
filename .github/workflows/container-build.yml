@@ -64,8 +64,10 @@ jobs:
           unset PYTHONPATH F11_SDK_CANDIDATE_ROOT
           timeout 120s prlimit --as=1073741824 --cpu=90 -- "$UV_PROJECT_ENVIRONMENT/bin/python" - <<'PY'
           import importlib.metadata
+          import json
           import os
           from pathlib import Path
+          import re
           import sys
           import sysconfig
           import tomllib
@@ -76,16 +78,30 @@ jobs:
           assert sys.version_info[:2] == (3, 12)
           assert Path(sys.prefix).resolve() == Path(os.environ["F11_INSTALLED_ENV_ROOT"]).resolve()
           sdk_version = "0.1.10rc1"
-          sdk_commit = "83132f538cd296ad292cb4b9627cb0ebf2d6237a"
-          assert importlib.metadata.version("platen-document") == sdk_version
+          sdk_origin = "https://github.com/gimesha-adikari/platen-document.git"
+          project = tomllib.loads(Path("pyproject.toml").read_text())
+          sdk_requirement, = (
+              requirement for requirement in project["project"]["dependencies"]
+              if requirement.startswith("platen-document @ ")
+          )
+          prefix = f"platen-document @ git+{sdk_origin}@"
+          assert sdk_requirement.startswith(prefix)
+          sdk_commit = sdk_requirement.removeprefix(prefix)
+          assert re.fullmatch(r"[0-9a-f]{40}", sdk_commit)
+          installed = importlib.metadata.distribution("platen-document")
+          assert installed.version == sdk_version
+          origin = json.loads(installed.read_text("direct_url.json"))
+          assert origin["url"] == sdk_origin
+          assert origin["vcs_info"]["vcs"] == "git"
+          assert origin["vcs_info"]["commit_id"] == sdk_commit
           expected = Path(sysconfig.get_path("purelib")) / "platen_document/__init__.py"
           assert Path(platen_document.__file__).resolve() == expected.resolve()
           assert expected.resolve().is_relative_to(Path(sys.prefix).resolve())
           lock = tomllib.loads(Path("uv.lock").read_text())
           sdk = next(package for package in lock["package"] if package["name"] == "platen-document")
           assert sdk["version"] == sdk_version
-          assert sdk["source"]["git"] == f"https://github.com/gimesha-adikari/platen-document.git?rev={sdk_commit}#{sdk_commit}"
-          print("Installed SDK:", importlib.metadata.version("platen-document"), platen_document.__file__)
+          assert sdk["source"]["git"] == f"{sdk_origin}?rev={sdk_commit}#{sdk_commit}"
+          print("Installed SDK:", installed.version, sdk_commit, platen_document.__file__)
 
           class NoMandatorySkips:
               def __init__(self):
@@ -110,6 +126,8 @@ jobs:
               "tests/test_raster_geometry_contract.py",
               "tests/test_raster_public_contract.py",
               "tests/test_ocr_v2_worker_core.py",
+              "tests/test_editor_auto_minorities.py",
+              "tests/test_auto_minority_recognition.py",
               "tests/test_structured_ocr.py",
               "tests/test_ocr_v2_markup.py",
               "tests/test_ocr_text_engine_boundary.py",

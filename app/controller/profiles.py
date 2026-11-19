@@ -11,12 +11,15 @@ import os
 from pathlib import Path
 import re
 import stat
+import zlib
 from dataclasses import dataclass
 from app.core.native_domain import DomainUnavailable
 
 VERSION = 'native-operations-v1'
 MAX_BYTES = 16 * 1024 * 1024
 MAX_ARTIFACT_BYTES = 12 * 1024 * 1024
+RESULT_FRAME_MAGIC = b'P5RF1:'
+MAX_RESULT_FRAME_BYTES = 32 * 1024 * 1024
 MAX_EVENTS = 1000
 ROOT = '/work/job'
 CALLBACKS = frozenset(('cancellation_check', 'page_progress_callback', 'progress_callback', 'progress_cb', 'after_ocr'))
@@ -60,6 +63,9 @@ PROFILES.update({
  'inspect_pdf': profile('path max_pages', 'path max_pages', 'path'),
  'preview_source': profile('input_path output_path page_index', 'input_path output_path page_index', 'input_path', 'output_path'),
  'structured_document': profile('input_path ' + LANGUAGE, 'input_path', 'input_path', callbacks=('cancellation_check','page_progress_callback')),
+ 'validate_word_edit_transport': profile('input_path envelope', 'input_path envelope', 'input_path'),
+ 'compile_scanned_word_edits': profile('input_path output_pdf_path envelope resolved_targets expected_source_sha256', 'input_path output_pdf_path envelope resolved_targets expected_source_sha256', 'input_path', 'output_pdf_path', callbacks=('cancellation_check',)),
+ 'inspect_candidate_selection': profile('input_path artifact_sha256', 'input_path artifact_sha256', 'input_path'),
 })
 
 def plain(value, depth=0):
@@ -121,8 +127,11 @@ def options_valid(values, p):
                 raise DomainUnavailable()
             if key == 'color' and (len(value)!=3 or any(type(v) not in (int,float) or not 0<=v<=1 for v in value)):
                 raise DomainUnavailable()
-        elif key in ('layout', 'selection', 'language_usage'):
+        elif key in ('layout', 'selection', 'language_usage', 'envelope'):
             if value is not None and type(value) is not dict:
+                raise DomainUnavailable()
+        elif key == 'resolved_targets':
+            if type(value) is not list or len(value) > 1000 or any(type(item) is not dict for item in value):
                 raise DomainUnavailable()
         elif key in ('page_index','max_pages','dpi'):
             if type(value) is not int or not (0 if key == 'page_index' else 1) <= value <= (1200 if key == 'dpi' else 10000):
@@ -262,6 +271,20 @@ def validate_result(result):
 
 def validate_frame(data):
     """Validate untrusted result structure without importing a native type."""
+    if type(data) is not bytes or not 0 < len(data) <= MAX_ARTIFACT_BYTES:
+        raise DomainUnavailable()
+    if data.startswith(RESULT_FRAME_MAGIC):
+        decompressor = zlib.decompressobj()
+        try:
+            expanded = decompressor.decompress(data[len(RESULT_FRAME_MAGIC):], MAX_RESULT_FRAME_BYTES + 1)
+        except zlib.error as exc:
+            raise DomainUnavailable() from exc
+        if (len(expanded) > MAX_RESULT_FRAME_BYTES or decompressor.unconsumed_tail
+                or decompressor.unused_data or not decompressor.eof):
+            raise DomainUnavailable()
+        data = expanded
+    elif len(data) > MAX_RESULT_FRAME_BYTES:
+        raise DomainUnavailable()
     def bad_constant(_): raise DomainUnavailable()
     try: frame=json.loads(data,parse_constant=bad_constant)
     except (ValueError,UnicodeError,RecursionError) as exc: raise DomainUnavailable() from exc

@@ -2,6 +2,7 @@
 from __future__ import annotations
 import importlib
 import inspect
+import os
 from pathlib import Path
 import resource
 import sys
@@ -25,6 +26,9 @@ def apply_resource_limits():
 def main():
     from app.core import native_isolation as boundary
     apply_resource_limits()
+    # Tesseract requests explicit OpenMP teams. OMP_NUM_THREADS=1 alone
+    # leaves those teams able to oversubscribe the isolated CPU allocation.
+    os.environ["OMP_THREAD_LIMIT"] = "1"
     boundary.IN_CHILD = True
     root = Path(sys.argv[1])
     try:
@@ -52,11 +56,11 @@ def main():
                 options[name] = callback
         with raster_policy(request['raster_limit']):
             result = target(*boundary.decode(request['args']), **options)
-        boundary.write_frame(root / 'result.json', {'result': boundary.encode(result)})
+        boundary.write_result_frame(root / 'result.json', {'result': boundary.encode(result)})
     except BaseException as exc:
         # Resource exhaustion may prevent even the error frame: the parent
         # treats absent/truncated output or abnormal exit as failure.
-        boundary.write_frame(root / 'result.json', {'error': boundary.error_frame(exc)})
+        boundary.write_result_frame(root / 'result.json', {'error': boundary.error_frame(exc)})
 
 
 if __name__ == '__main__':

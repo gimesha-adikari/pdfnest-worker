@@ -17,6 +17,7 @@ PROCESSING_POSTS = frozenset({
     '/api/v1/ocr/extract-text', '/api/v1/ocr/to-text-pdf', '/api/v1/ocr/to-text-pdf-r2',
     '/api/v1/markdown/convert', '/internal/ocr/v2/text', '/internal/ocr/v2/markup/preview',
     '/internal/ocr/v2/jobs', '/api/v1/editor/extract', '/api/v1/editor/compile',
+    '/api/v1/editor/compile-word-edits',
     '/api/v1/markup/highlight', '/api/v1/markup/underline', '/api/v1/markup/strikeout',
     '/api/v1/jobs/test', '/api/v1/jobs/submit', '/api/v1/render/page', '/api/v1/render/sessions',
     '/api/v1/analyzer/python-ast', '/api/v1/analyzer/analyze', '/api/v1/metadata/read',

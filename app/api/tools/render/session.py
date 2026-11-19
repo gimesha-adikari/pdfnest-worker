@@ -260,7 +260,15 @@ class _PendingStorageDeletion:
 
 
 class SessionStorageLimitError(RuntimeError):
-    """A render upload would exceed a hard in-process storage budget."""
+    """A render operation would exceed a hard in-process storage budget."""
+
+
+class SessionStorageBusyError(SessionStorageLimitError):
+    """Another in-flight storage reservation prevents otherwise valid admission."""
+
+
+class SessionFileLimitError(SessionStorageLimitError):
+    """The staged file exceeds the configured per-file limit."""
 
 
 class SessionStorageReservation:
@@ -270,8 +278,8 @@ class SessionStorageReservation:
         self.bytes_reserved = 0
         self.active = True
 
-    def extend(self, amount: int) -> None:
-        self.manager._extend_reservation(self, amount)
+    def extend(self, amount: int, *, companion_bytes: int = 0) -> None:
+        self.manager._extend_reservation(self, amount, companion_bytes)
 
     def release(self) -> None:
         self.manager._release_reservation(self)
@@ -297,13 +305,16 @@ class RenderSessionManager:
         with self._lock:
             return self._committed_bytes + self._reserved_bytes
 
-    def reserve_storage(self, scope: str) -> SessionStorageReservation:
+    def reserve_storage(self, scope: str, *, expire_sessions: bool = False) -> SessionStorageReservation:
         assert_render_process_owner()
         with self._lock:
-            self._retry_pending_deletions_locked()
+            if expire_sessions:
+                self._cleanup_expired_locked()
+            else:
+                self._retry_pending_deletions_locked()
             return SessionStorageReservation(self, scope)
 
-    def _extend_reservation(self, reservation: SessionStorageReservation, amount: int) -> None:
+    def _extend_reservation(self, reservation: SessionStorageReservation, amount: int, companion_bytes: int) -> None:
         assert_render_process_owner()
         if type(amount) is not int or amount < 0:
             raise SessionStorageLimitError("invalid render-session storage reservation")
@@ -320,11 +331,21 @@ class RenderSessionManager:
                 + amount
             )
             if next_file > MAX_SESSION_FILE_BYTES:
-                raise SessionStorageLimitError("render-session file exceeds its byte limit")
-            if next_total > MAX_SESSION_TOTAL_BYTES:
-                raise SessionStorageLimitError("render-session aggregate storage budget is full")
-            if reservation.scope != "global" and next_owner > MAX_SESSION_OWNER_BYTES:
-                raise SessionStorageLimitError("render-session owner storage budget is full")
+                raise SessionFileLimitError("render-session file exceeds its byte limit")
+            aggregate_full = next_total > MAX_SESSION_TOTAL_BYTES
+            owner_full = reservation.scope != "global" and next_owner > MAX_SESSION_OWNER_BYTES
+            if aggregate_full or owner_full:
+                # Exclude other live staging allocations to tell temporary
+                # contention apart from retained source or cleanup liability.
+                required = next_file + companion_bytes
+                fits_without_other_reservations = (
+                    self._committed_bytes + required <= MAX_SESSION_TOTAL_BYTES
+                    and (reservation.scope == "global"
+                         or self._committed_by_scope.get(reservation.scope, 0) + required <= MAX_SESSION_OWNER_BYTES)
+                )
+                limit = "aggregate" if aggregate_full else "owner"
+                error = SessionStorageBusyError if fits_without_other_reservations else SessionStorageLimitError
+                raise error(f"render-session {limit} storage budget is full")
             reservation.bytes_reserved = next_file
             self._reserved_bytes += amount
             self._reserved_by_scope[reservation.scope] = self._reserved_by_scope.get(reservation.scope, 0) + amount
