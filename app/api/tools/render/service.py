@@ -17,7 +17,7 @@ from .persistent_pool import (
     get_persistent_render_pool,
 )
 from .renderer import validate_preview_dpi
-from .session import RenderSession, session_manager, sha256_file
+from .session import RenderSession, SessionStorageBusyError, session_manager, sha256_file
 from .session_metadata import session_file_io
 from .child_limits import MAX_RENDER_CHILD_FILE_BYTES
 
@@ -25,6 +25,7 @@ from .child_limits import MAX_RENDER_CHILD_FILE_BYTES
 MAX_RENDER_CHILD_CAPTURE_BYTES = 64 * 1024
 MAX_RENDER_INPUT_BYTES = 64 * 1024 * 1024
 MAX_RENDER_OUTPUT_BYTES = MAX_RENDER_CHILD_FILE_BYTES
+OUTPUT_CAPACITY_WAIT_SECONDS = 2.0
 
 
 async def _read_render_upload(file: UploadFile) -> bytes:
@@ -67,7 +68,19 @@ async def render_page_to_jpeg_bytes_subprocess(
         # Input, output, sessions and failed removals consume the same atomic
         # budget. Reserve the maximum output before permitting native work.
         input_reservation.extend(len(pdf_bytes) if pdf_path is None else 0)
-        output_reservation.extend(MAX_RENDER_OUTPUT_BYTES)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + OUTPUT_CAPACITY_WAIT_SECONDS
+        while True:
+            try:
+                output_reservation.extend(MAX_RENDER_OUTPUT_BYTES, companion_bytes=input_reservation.bytes_reserved)
+                break
+            except SessionStorageBusyError:
+                remaining = deadline - loop.time()
+                if pdf_path is None or remaining <= 0:
+                    raise
+                # The render limiter already bounds this wait and the number
+                # of waiters. No child or staging file exists until admission.
+                await asyncio.sleep(min(0.05, remaining))
         directory = Path(tempfile.mkdtemp(prefix="pdfnest-render-job-", dir=SESSION_ROOT))
         in_path = directory / "input.pdf"
         out_path = directory / "output.jpg"
@@ -265,7 +278,7 @@ async def _create_render_session(
         dedup_scope: str = "global",
 ) -> RenderSession:
     from .session import SESSION_ROOT
-    reservation = session_manager.reserve_storage(dedup_scope)
+    reservation = session_manager.reserve_storage(dedup_scope, expire_sessions=True)
     temp_file = None
     temp_path: Path | None = None
 

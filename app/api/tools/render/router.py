@@ -13,12 +13,19 @@ from .service import (
     get_render_session_page,
     render_page_to_jpeg_bytes,
 )
-from .session import SessionStorageLimitError
+from .session import SessionFileLimitError, SessionStorageBusyError, SessionStorageLimitError
 
 router = APIRouter(
     prefix="/api/v1/render",
     tags=["render"],
 )
+
+
+def storage_busy() -> HTTPException:
+    return HTTPException(429, detail={
+        "code": "RENDER_SESSION_STORAGE_BUSY",
+        "message": "Preview rendering is temporarily busy. Retry shortly.",
+    }, headers={"Retry-After": "1"})
 
 
 async def render_until_disconnect(request: Request, operation):
@@ -126,10 +133,19 @@ async def render_page(
     except HTTPException:
         raise
 
+    except SessionStorageBusyError as exc:
+        raise storage_busy() from exc
+
+    except SessionFileLimitError as exc:
+        raise HTTPException(413, detail={
+            "code": "RENDER_INPUT_TOO_LARGE",
+            "message": "PDF exceeds the supported preview size.",
+        }) from exc
+
     except SessionStorageLimitError as exc:
         raise HTTPException(413, detail={
             "code": "RENDER_SESSION_STORAGE_LIMIT",
-            "message": "Preview storage capacity is full. Retry shortly.",
+            "message": "Preview storage limit reached. Close unused documents or try a smaller PDF.",
         }) from exc
 
     except ValueError as exc:
@@ -203,10 +219,19 @@ async def create_session(
             "code": "SESSION_METADATA_UNAVAILABLE", "message": "PDF metadata processing is temporarily unavailable.",
         }) from exc
 
+    except SessionStorageBusyError as exc:
+        raise storage_busy() from exc
+
+    except SessionFileLimitError as exc:
+        raise HTTPException(413, detail={
+            "code": "RENDER_INPUT_TOO_LARGE",
+            "message": "PDF exceeds the supported preview size.",
+        }) from exc
+
     except SessionStorageLimitError as exc:
         raise HTTPException(413, detail={
             "code": "RENDER_SESSION_STORAGE_LIMIT",
-            "message": "Render-session storage capacity is full or this PDF exceeds the supported size.",
+            "message": "Preview storage limit reached. Close unused documents or try a smaller PDF.",
         }) from exc
 
     except ValueError as exc:
@@ -257,10 +282,13 @@ async def render_session_page(
     except HTTPException:
         raise
 
+    except SessionStorageBusyError as exc:
+        raise storage_busy() from exc
+
     except SessionStorageLimitError as exc:
         raise HTTPException(413, detail={
             "code": "RENDER_SESSION_STORAGE_LIMIT",
-            "message": "Preview storage capacity is full. Retry shortly.",
+            "message": "Preview storage limit reached. Close unused documents or try a smaller PDF.",
         }) from exc
 
     except KeyError as exc:

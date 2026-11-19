@@ -1048,3 +1048,128 @@ def test_fifo_root_protocol_marker_is_rejected_without_blocking_or_mutation(tmp_
     assert marker.lstat().st_ino == marker_inode
     assert stat.S_ISFIFO(marker.lstat().st_mode)
     assert set(root.iterdir()) == {marker}, "rejection must precede manager-lock or version initialization"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("scope", ["owner", "aggregate", "owner-timeout", "owner-cancel"])
+async def test_session_pages_resume_after_concurrent_output_reservation(monkeypatch, tmp_path, scope):
+    from io import BytesIO
+
+    import httpx
+    from fastapi import FastAPI
+    from PIL import Image
+    from app.api.tools.render import router
+    from app.api.tools.render.limiter import RenderConcurrencyLimiter
+    from app.core import subprocess_runner
+
+    root = tmp_path / "render"
+    root.mkdir()
+    manager = session.RenderSessionManager()
+    monkeypatch.setattr(session, "SESSION_ROOT", root)
+    monkeypatch.setattr(service, "session_manager", manager)
+    monkeypatch.setattr(router, "render_limiter", RenderConcurrencyLimiter(max_concurrency=2))
+    if scope == "owner-timeout":
+        monkeypatch.setattr(service, "OUTPUT_CAPACITY_WAIT_SECONDS", 0.3)
+    app = FastAPI()
+    app.include_router(router.router)
+
+    jpeg = BytesIO()
+    Image.new("RGB", (420, 595), (245, 243, 239)).save(jpeg, "JPEG")
+    with fitz.open() as pdf:
+        for _ in range(13):
+            page = pdf.new_page()
+            page.insert_image(page.rect, stream=jpeg.getvalue())
+        source = pdf.tobytes()
+
+    started, release = threading.Event(), threading.Event()
+    original = subprocess_runner.run_hardened_subprocess
+
+    def hold_first_page(command, *args, **kwargs):
+        if "app.api.tools.render.render_cli" in command and command[command.index("--page") + 1] == "2":
+            started.set()
+            assert release.wait(8), "test did not release first render"
+        return original(command, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess_runner, "run_hardened_subprocess", hold_first_page)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://worker") as client:
+        create = await client.post("/api/v1/render/sessions", params={"dedup_scope": "a" * 64}, files={"file": ("scan.pdf", source)})
+        assert create.status_code == 200, create.text
+        assert create.json()["page_count"] == 13
+        first_session = create.json()["session_id"]
+        second_session = first_session
+        other_reservations = []
+        if scope == "aggregate":
+            create_other = await client.post("/api/v1/render/sessions", params={"dedup_scope": "b" * 64}, files={"file": ("scan.pdf", source)})
+            assert create_other.status_code == 200, create_other.text
+            second_session = create_other.json()["session_id"]
+            for owner in ("c" * 64, "d" * 64):
+                reservation = manager.reserve_storage(owner)
+                reservation.extend(service.MAX_RENDER_OUTPUT_BYTES)
+                other_reservations.append(reservation)
+        before = manager.used_bytes
+        first = asyncio.create_task(client.get(f"/api/v1/render/sessions/{first_session}/page/2?dpi=144"))
+        second = None
+        try:
+            assert await asyncio.to_thread(started.wait, 5)
+            assert manager.used_bytes == before + service.MAX_RENDER_OUTPUT_BYTES
+            second = asyncio.create_task(client.get(f"/api/v1/render/sessions/{second_session}/page/3?dpi=72"))
+            await asyncio.sleep(0.15)
+            assert not second.done(), second.result().text if second.done() else None
+            if scope == "owner-timeout":
+                busy = await second
+                assert busy.status_code == 429
+                assert busy.json()["detail"]["code"] == "RENDER_SESSION_STORAGE_BUSY"
+                assert busy.headers["Retry-After"] == "1"
+                second = None
+            if scope == "owner-cancel":
+                second.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await second
+                assert manager.get(first_session).active_renders == 1
+                second = None
+            assert manager.used_bytes == before + service.MAX_RENDER_OUTPUT_BYTES
+            release.set()
+            first_result = await first
+            second_result = await second if second else await client.get(
+                f"/api/v1/render/sessions/{second_session}/page/3?dpi=72"
+            )
+            assert first_result.status_code == second_result.status_code == 200
+            assert all(res.content.startswith(b"\xff\xd8") and len(res.content) < service.MAX_RENDER_OUTPUT_BYTES
+                       for res in (first_result, second_result))
+            assert manager.used_bytes == before
+        finally:
+            release.set()
+            await asyncio.gather(first, *([second] if second else []), return_exceptions=True)
+            for reservation in other_reservations:
+                reservation.release()
+        assert manager.used_bytes == len(source) * (2 if scope == "aggregate" else 1)
+
+@pytest.mark.anyio
+async def test_upload_reclaims_expired_source_before_reserving_bytes(monkeypatch, tmp_path):
+    from io import BytesIO
+
+    from starlette.datastructures import UploadFile
+
+    root = tmp_path / "render"
+    root.mkdir()
+    manager = session.RenderSessionManager()
+    monkeypatch.setattr(session, "SESSION_ROOT", root)
+    monkeypatch.setattr(service, "session_manager", manager)
+
+    with fitz.open() as document:
+        document.new_page()
+        payload = document.tobytes()
+    monkeypatch.setattr(session, "MAX_SESSION_OWNER_BYTES", len(payload))
+    expired = _register_synthetic_session(manager, root, "e" * 32, "owner-a", payload)
+    expired.last_accessed_at -= session.SESSION_TTL_SECONDS + 1
+
+    uploaded = await service._create_render_session(UploadFile(BytesIO(payload), filename="source.pdf"), "owner-a")
+    assert uploaded.session_id != expired.session_id
+    assert not expired.file_path.exists()
+    assert manager.used_bytes == len(payload)
+
+    monkeypatch.setattr(session, "MAX_SESSION_FILE_BYTES", len(payload))
+    with pytest.raises(session.SessionFileLimitError):
+        await service._create_render_session(UploadFile(BytesIO(payload + b" "), filename="large.pdf"), "owner-a")
+    assert manager.used_bytes == len(payload)
+    assert uploaded.file_path.is_file()
